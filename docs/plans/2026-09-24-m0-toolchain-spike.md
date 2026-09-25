@@ -28,6 +28,12 @@ Requesting `Limits::downlevel_webgl2_defaults()` keeps every backend on the WebG
 
 **Native live-resize artifacts (observed 2026-09-25, Windows + Vulkan):** while dragging a window edge, the newly exposed strip flashes black when growing and white when shrinking; dragging the left edge shows it on the right side. No crash, correct final image. Likely cause: presented frames lag the window size by the swapchain's frame latency. Revisit in M1 when the depth buffer also needs resize handling. Candidates to test (unverified): render+present synchronously inside `WindowEvent::Resized`; `desired_maximum_frame_latency = 1`; compare the DX12 backend (DXGI flip model).
 
+**Browser findings from Task 10 (2026-09-25):**
+- A *hidden* browser tab reports a 1x1 drawing buffer: hidden documents skip the rendering steps, so winit's `ResizeObserver` never fires. It corrects itself when the tab becomes visible. A suspected init/resize race was tested (fix applied, then reverted and re-tested visible) and does **not** exist. Always verify canvas size with the page visible.
+- In the pane's mobile emulation (`devicePixelRatio=2`) the buffer matched CSS pixels (375x812), not physical pixels (750x1624). This may be an emulation artifact. **Verify on a real high-DPI device in M1** before changing anything; if real, the scene renders at half resolution.
+- Without the `impulse-canvas` element, winit renders into a detached canvas: the console logs an error but the status still reads "Running on …". This only happens if our own `index.html` is broken, so it was left alone.
+- The release `.wasm` is ~4.0 MB uncompressed (wgpu with both WebGPU and WebGL backends plus naga). Measure the compressed transfer size after deploying; `wasm-opt` or LTO are options if load time matters.
+
 ## Unverified points (confirm during execution; stop and report if wrong)
 
 1. `rustup toolchain install` with no arguments installs the toolchain named in `rust-toolchain.toml` (rustup ≥ 1.28). Fallback: `rustup toolchain install 1.98.1 --component rustfmt clippy --target wasm32-unknown-unknown`.
