@@ -14,4 +14,5 @@ mod world;
 pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};
 pub use collider::{Collider, Material};
 pub use contact::{Contact, find_contacts};
+pub use solver::SolverSettings;
 pub use world::{BodyHandle, DEFAULT_GRAVITY, World};

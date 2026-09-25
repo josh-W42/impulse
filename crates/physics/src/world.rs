@@ -2,7 +2,7 @@ use glam::Vec3;
 
 use crate::body::{BodyDesc, BodyError, RigidBody};
 use crate::contact::find_contacts;
-use crate::solver;
+use crate::solver::{self, ContactCache, SolverSettings};
 
 pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 
@@ -26,6 +26,9 @@ pub struct World {
     gravity: Vec3,
     slots: Vec<Slot>,
     free: Vec<u32>,
+    settings: SolverSettings,
+    /// Last step's contact impulses, for warm starting.
+    cache: ContactCache,
 }
 
 impl Default for World {
@@ -40,11 +43,27 @@ impl World {
             gravity,
             slots: Vec::new(),
             free: Vec::new(),
+            settings: SolverSettings::default(),
+            cache: ContactCache::default(),
         }
     }
 
     pub fn gravity(&self) -> Vec3 {
         self.gravity
+    }
+
+    pub fn solver_settings(&self) -> SolverSettings {
+        self.settings
+    }
+
+    pub fn set_solver_settings(&mut self, settings: SolverSettings) {
+        self.settings = SolverSettings {
+            iterations: settings.iterations.max(1),
+            ..settings
+        };
+        if !settings.warm_starting {
+            self.cache.clear();
+        }
     }
 
     pub fn add_body(&mut self, desc: BodyDesc) -> Result<BodyHandle, BodyError> {
@@ -108,6 +127,7 @@ impl World {
 
     /// Removes every body; all existing handles become stale.
     pub fn clear(&mut self) {
+        self.cache.clear();
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if slot.body.take().is_some() {
                 slot.generation = slot.generation.wrapping_add(1);
@@ -118,9 +138,9 @@ impl World {
 
     /// Advances the simulation by `dt` seconds.
     ///
-    /// Order: gravity → find contacts → solve contact velocities → move →
-    /// push remaining overlap apart. (Semi-implicit Euler with the contact solve
-    /// between the velocity and position updates.)
+    /// Order: gravity → find contacts → solve contact velocities (warm-started,
+    /// with position error fed back as a velocity bias) → move. Semi-implicit Euler
+    /// with the contact solve between the velocity and position updates.
     pub fn step(&mut self, dt: f32) {
         debug_assert!(dt.is_finite() && dt >= 0.0, "invalid timestep {dt}");
         let gravity = self.gravity;
@@ -128,11 +148,12 @@ impl World {
             body.apply_gravity(gravity, dt);
         }
         let contacts = find_contacts(self);
-        solver::solve_velocities(self, &contacts);
+        let mut cache = std::mem::take(&mut self.cache);
+        solver::solve(self, &contacts, &mut cache, dt);
+        self.cache = cache;
         for body in self.bodies_mut() {
             body.advance(dt);
         }
-        solver::correct_positions(self);
     }
 
     fn bodies_mut(&mut self) -> impl Iterator<Item = &mut RigidBody> {
