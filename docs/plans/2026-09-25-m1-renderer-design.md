@@ -127,3 +127,4 @@ Plan sketch (lean plan still to write): Gpu refactor to `acquire()/present()`; r
   - egui warns on sRGB targets → surface configured with the non-sRGB format when supported; the scene renders through an sRGB view, egui through a surface-format `ui_view`.
 - Floor plane made double-sided (user: seeing below the floor is useful for editing); orbit is not clamped.
 - Release `.wasm` grew to ~9.8 MB raw with egui (measure the transfer size after deploy).
+- **Regression shipped and fixed (2026-09-25):** the non-sRGB surface change broke WebGL2 live (`SURFACE_VIEW_FORMATS` unsupported on GL; views can't differ from the surface format). WebGL2 had been checked *before* that change, not after. Fix: gate format reinterpretation on `DownlevelFlags::SURFACE_VIEW_FORMATS`; otherwise use an sRGB surface for everything. Lesson: re-run the full backend matrix (WebGPU, WebGL2, native) after *any* render/surface change, before pushing.

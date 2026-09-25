@@ -83,15 +83,31 @@ impl Gpu {
         let mut config = surface
             .get_default_config(&adapter, width, height)
             .ok_or(GpuInitError::SurfaceUnsupported)?;
-        // Configure the surface non-sRGB when possible (egui wants that for its own
-        // gamma handling) and render the scene through an sRGB view, so scene colors
-        // are gamma-correct either way.
-        let linear = config.format.remove_srgb_suffix();
-        if surface.get_capabilities(&adapter).formats.contains(&linear) {
-            config.format = linear;
+        // The scene renders through an sRGB view so its colors are gamma-correct.
+        // Where views may differ from the surface format, the surface itself is
+        // non-sRGB (egui prefers that). WebGL2 can't reinterpret formats, so there
+        // the surface itself must be sRGB and every view uses that one format.
+        let formats = surface.get_capabilities(&adapter).formats;
+        let view_formats_supported = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
+        let preferred = if view_formats_supported {
+            config.format.remove_srgb_suffix()
+        } else {
+            config.format.add_srgb_suffix()
+        };
+        if formats.contains(&preferred) {
+            config.format = preferred;
         }
-        let view_format = config.format.add_srgb_suffix();
-        config.view_formats.push(view_format);
+        let view_format = if view_formats_supported {
+            config.format.add_srgb_suffix()
+        } else {
+            config.format
+        };
+        if view_format != config.format {
+            config.view_formats.push(view_format);
+        }
         surface.configure(&device, &config);
 
         Ok(Self {
