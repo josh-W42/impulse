@@ -11,6 +11,8 @@ mod app;
 #[allow(dead_code)]
 mod camera;
 #[allow(dead_code)]
+mod egui_input;
+#[allow(dead_code)]
 mod input;
 #[allow(dead_code)]
 mod pose;
