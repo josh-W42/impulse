@@ -8,3 +8,7 @@ pub use wgpu;
 mod size;
 
 pub use size::clamp_surface_size;
+
+mod backend;
+
+pub use backend::backend_name;
