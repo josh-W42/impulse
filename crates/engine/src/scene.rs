@@ -48,9 +48,85 @@ fn pit_planes() -> [(Vec3, Vec3); 5] {
     ]
 }
 
-/// Replaces everything in `world` with the pit and its balls. Deterministic.
-pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
+/// The demo scenes offered in the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Demo {
+    /// Spheres and boxes tumbling into the pit.
+    Pit,
+    /// Ten cubes stacked in a column (M4's stability showcase).
+    Tower,
+    /// Fifteen cubes in a five-row pyramid.
+    Pyramid,
+}
+
+impl Demo {
+    pub const ALL: [Demo; 3] = [Demo::Pit, Demo::Tower, Demo::Pyramid];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Demo::Pit => "Pit",
+            Demo::Tower => "Tower",
+            Demo::Pyramid => "Pyramid",
+        }
+    }
+}
+
+pub const TOWER_HEIGHT: usize = 10;
+pub const PYRAMID_BASE: usize = 5;
+const STACK_COLORS: [[f32; 4]; 3] = [
+    [0.80, 0.35, 0.25, 1.0],
+    [0.90, 0.75, 0.40, 1.0],
+    [0.30, 0.55, 0.75, 1.0],
+];
+
+/// Replaces everything in `world` with `demo`. Deterministic.
+pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
     world.clear();
+    add_pit(world);
+    match demo {
+        Demo::Pit => pit_bodies(world),
+        Demo::Tower => (0..TOWER_HEIGHT)
+            .map(|i| stack_cube(world, Vec3::new(0.0, 0.5 + i as f32, 0.0), i))
+            .collect(),
+        Demo::Pyramid => {
+            let mut objects = Vec::new();
+            for row in 0..PYRAMID_BASE {
+                let count = PYRAMID_BASE - row;
+                for i in 0..count {
+                    let x = (i as f32 - (count - 1) as f32 / 2.0) * 1.025;
+                    objects.push(stack_cube(world, Vec3::new(x, 0.5 + row as f32, 0.0), row));
+                }
+            }
+            objects
+        }
+    }
+}
+
+/// The pit demo (kept as the default scene).
+pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
+    build(world, Demo::Pit)
+}
+
+fn stack_cube(world: &mut World, position: Vec3, layer: usize) -> SceneObject {
+    let desc = BodyDesc::dynamic(1.0, position)
+        .with_collider(Collider::Box {
+            half_extents: Vec3::splat(0.5),
+        })
+        .with_material(Material {
+            restitution: 0.0,
+            friction: 0.6,
+        });
+    SceneObject {
+        handle: world.add_body(desc).expect("stack cubes are valid"),
+        color: STACK_COLORS[layer % STACK_COLORS.len()],
+        prev: Pose {
+            position,
+            orientation: desc.orientation,
+        },
+    }
+}
+
+fn add_pit(world: &mut World) {
     for (point, normal) in pit_planes() {
         world
             .add_body(
@@ -60,6 +136,9 @@ pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
             )
             .expect("pit planes are valid");
     }
+}
+
+fn pit_bodies(world: &mut World) -> Vec<SceneObject> {
     (0..BODY_COUNT)
         .map(|i| {
             let radius = 0.3 + 0.4 * spread(i, 0.37);
@@ -271,6 +350,20 @@ mod tests {
             );
             assert!(p.y - radius > 0.0, "starts in the floor: {p}");
         }
+    }
+
+    #[test]
+    fn stack_scenes_build_the_expected_bodies() {
+        let mut world = World::default();
+        assert_eq!(build(&mut world, Demo::Tower).len(), TOWER_HEIGHT);
+        assert_eq!(world.len(), 5 + TOWER_HEIGHT);
+        let pyramid = build(&mut world, Demo::Pyramid);
+        assert_eq!(pyramid.len(), PYRAMID_BASE * (PYRAMID_BASE + 1) / 2);
+        assert_eq!(
+            world.len(),
+            5 + pyramid.len(),
+            "switching scenes replaces the old bodies"
+        );
     }
 
     #[test]

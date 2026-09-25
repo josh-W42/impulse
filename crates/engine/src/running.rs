@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use glam::{Vec2, Vec3};
-use impulse_physics::World;
+use impulse_physics::{SolverSettings, World};
 use impulse_render::{CameraData, DrawList, FrameOutcome, Gpu, Renderer, UiFrame, backend_name};
 use web_time::Instant;
 use winit::event::{DeviceEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -13,7 +13,7 @@ use winit::window::{CursorGrabMode, Window};
 use crate::camera::{CameraMode, CameraRig, OrbitCamera};
 use crate::egui_input::EguiInput;
 use crate::input::InputState;
-use crate::scene::{self, SceneObject};
+use crate::scene::{self, Demo, SceneObject};
 use crate::timestep::FixedTimestep;
 
 const FIXED_STEP: f32 = 1.0 / 60.0;
@@ -30,6 +30,9 @@ struct Settings {
     show_axes: bool,
     step_requested: bool,
     reset_requested: bool,
+    scene: Demo,
+    warm_starting: bool,
+    iterations: usize,
 }
 
 pub enum FrameResult {
@@ -86,6 +89,9 @@ impl Running {
                 show_axes: false,
                 step_requested: false,
                 reset_requested: false,
+                scene: Demo::Pit,
+                warm_starting: SolverSettings::default().warm_starting,
+                iterations: SolverSettings::default().iterations,
             },
             start: now,
             last_frame: now,
@@ -243,9 +249,16 @@ impl Running {
 
     fn step_physics(&mut self, dt: f32) {
         let settings = &mut self.settings;
+        let solver = SolverSettings {
+            iterations: settings.iterations,
+            warm_starting: settings.warm_starting,
+        };
+        if self.world.solver_settings() != solver {
+            self.world.set_solver_settings(solver);
+        }
         if settings.reset_requested || scene::all_below(&self.world, &self.objects, RESET_HEIGHT) {
             settings.reset_requested = false;
-            self.objects = scene::demo_scene(&mut self.world);
+            self.objects = scene::build(&mut self.world, settings.scene);
             self.timestep.reset();
             self.alpha = 0.0;
         }
@@ -373,7 +386,22 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
                     s.reset_requested = true;
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("scene");
+                for demo in Demo::ALL {
+                    if ui
+                        .selectable_value(&mut s.scene, demo, demo.label())
+                        .changed()
+                    {
+                        s.reset_requested = true;
+                    }
+                }
+            });
             ui.add(egui::Slider::new(&mut s.time_scale, 0.1..=2.0).text("time scale"));
+            ui.separator();
+            ui.checkbox(&mut s.warm_starting, "warm starting");
+            ui.add(egui::Slider::new(&mut s.iterations, 1..=30).text("solver iterations"));
+            ui.separator();
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");
             ui.label(match stats.mode {
