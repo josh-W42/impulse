@@ -14,5 +14,7 @@ mod backend;
 pub use backend::backend_name;
 
 mod gpu;
+mod mesh;
 
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};
+pub use mesh::{MeshData, MeshKind, Vertex};
