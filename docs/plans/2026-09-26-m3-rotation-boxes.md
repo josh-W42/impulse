@@ -72,3 +72,18 @@ and settle without passing through each other → demo + verify + ship.
 - Verified: WebGPU + WebGL2 (pane visible, buffer = CSS, no errors) and native debug
   (user: spheres roll, boxes tumble/topple/settle, spheres rest on boxes).
 - As designed: boxes pass through each other until M3b.
+
+## M3b results (2026-09-25)
+
+- `box_box.rs`: 15-axis SAT (parallel edges skipped; face axis preferred unless an
+  edge axis is < 0.95·face − 0.01), face contacts by Sutherland–Hodgman clipping of
+  the incident face against the reference face's side planes, edge contacts from the
+  closest points of the two supporting edges.
+- Tests caught a real clipper bug: vertices exactly on a side plane (every aligned
+  stack) were emitted twice (12 points instead of 4). Fixed by one "inside"
+  definition (≤ 0) for both the keep and crossing checks.
+- Tests caught a self-referential test: pile penetration was measured with
+  `find_contacts`, so disabling box–box also hid the penetration. Added an
+  independent pile-height check; both new tests now fail with box–box disabled.
+- 96 workspace tests. Verified WebGPU + WebGL2 (pane visible) and native debug
+  (user: boxes land and rest on boxes, flush, piles stable, reset works).
