@@ -106,11 +106,11 @@ pub(crate) fn box_box(
 
     match feature {
         // Reference face on A faces B, i.e. along -normal.
-        Feature::FaceA(i) => clip_faces(&a, i, -normal, &b)
+        Feature::FaceA(i) => reduce_to_four(clip_faces(&a, i, -normal, &b), normal)
             .into_iter()
             .map(|(point, d)| (normal, d, point))
             .collect(),
-        Feature::FaceB(i) => clip_faces(&b, i, normal, &a)
+        Feature::FaceB(i) => reduce_to_four(clip_faces(&b, i, normal, &a), normal)
             .into_iter()
             .map(|(point, d)| (normal, d, point))
             .collect(),
@@ -202,6 +202,32 @@ fn clip_faces(reference: &Obb, axis: usize, face_normal: Vec3, incident: &Obb) -
         .collect()
 }
 
+/// Keeps at most 4 points: the deepest, the one farthest from it, then the two
+/// spanning the largest area on either side of that line. Clipping slightly twisted
+/// boxes yields clusters of near-duplicate points; redundant points let the solver
+/// shuffle impulse between them without converging (persistent stack jitter).
+fn reduce_to_four(points: Vec<(Vec3, f32)>, normal: Vec3) -> Vec<(Vec3, f32)> {
+    if points.len() <= 4 {
+        return points;
+    }
+    let argmax = |key: &dyn Fn(&(Vec3, f32)) -> f32| {
+        (0..points.len())
+            .max_by(|&i, &j| key(&points[i]).total_cmp(&key(&points[j])))
+            .expect("non-empty")
+    };
+    let first = argmax(&|p| p.1);
+    let p0 = points[first].0;
+    let second = argmax(&|p| p.0.distance_squared(p0));
+    let p1 = points[second].0;
+    let signed_area = |p: &(Vec3, f32)| normal.dot((p1 - p0).cross(p.0 - p0));
+    let third = argmax(&|p| signed_area(p));
+    let fourth = argmax(&|p| -signed_area(p));
+    let mut keep = vec![first, second, third, fourth];
+    keep.sort_unstable();
+    keep.dedup();
+    keep.into_iter().map(|i| points[i]).collect()
+}
+
 /// Sutherland–Hodgman: keeps the part of `polygon` where `normal·p <= offset`.
 fn clip_polygon(polygon: &[Vec3], normal: Vec3, offset: f32) -> Vec<Vec3> {
     let mut out = Vec::with_capacity(polygon.len() + 1);
@@ -281,15 +307,42 @@ mod tests {
     }
 
     #[test]
-    fn rotated_stack_clips_to_an_octagon() {
+    fn rotated_stack_reduces_its_octagon_to_four_spread_points() {
         let hits = contacts(
             Vec3::new(0.0, 0.9, 0.0),
             Quat::from_rotation_y(FRAC_PI_4),
             Vec3::ZERO,
             Quat::IDENTITY,
         );
-        assert_eq!(hits.len(), 8, "{hits:?}");
+        assert_eq!(hits.len(), 4, "{hits:?}");
         assert!(hits.iter().all(|h| (h.1 - 0.1).abs() < 1e-4));
+        // Well spread: the kept points span most of the ~1 m wide overlap.
+        let widest = hits
+            .iter()
+            .flat_map(|a| hits.iter().map(move |b| a.2.distance(b.2)))
+            .fold(0.0f32, f32::max);
+        assert!(widest > 0.9, "points bunched together: {hits:?}");
+    }
+
+    #[test]
+    fn slightly_twisted_stack_has_no_near_duplicate_points() {
+        let hits = contacts(
+            Vec3::new(0.0, 0.9, 0.0),
+            Quat::from_rotation_y(0.003),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        assert!(hits.len() <= 4, "{} points", hits.len());
+        for (i, a) in hits.iter().enumerate() {
+            for b in &hits[i + 1..] {
+                assert!(
+                    a.2.distance(b.2) > 0.05,
+                    "near-duplicates {:?} {:?}",
+                    a.2,
+                    b.2
+                );
+            }
+        }
     }
 
     #[test]
