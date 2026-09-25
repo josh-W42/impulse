@@ -8,7 +8,7 @@ pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 
 /// Refers to a body in a [`World`]. Stays safe after removal: a stale handle
 /// never reaches a different body that later reuses the same slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BodyHandle {
     index: u32,
     generation: u32,

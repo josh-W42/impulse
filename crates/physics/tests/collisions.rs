@@ -198,7 +198,9 @@ fn resting_ball_neither_sinks_nor_jitters() {
 }
 
 #[test]
-fn sliding_ball_decelerates_at_mu_g() {
+/// Only while slipping: once v = ω·r the ball rolls and friction stops acting.
+/// Slipping lasts 2·v₀/(7·μ·g) ≈ 0.29 s here, so measure at 0.2 s.
+fn slipping_ball_decelerates_at_mu_g() {
     let mut world = World::default();
     let m = material(0.0, 0.5);
     floor(&mut world, m);
@@ -210,8 +212,8 @@ fn sliding_ball_decelerates_at_mu_g() {
         Vec3::new(5.0, 0.0, 0.0),
         m,
     );
-    run(&mut world, 0.5, |_| {});
-    let expected = 5.0 - 0.5 * G * 0.5;
+    run(&mut world, 0.2, |_| {});
+    let expected = 5.0 - 0.5 * G * 0.2;
     let vx = vel(&world, h).x;
     assert!(
         (vx - expected).abs() < expected * 0.05,
@@ -278,4 +280,82 @@ fn contact_simulation_is_deterministic() {
             pos(&b, h).to_array().map(f32::to_bits)
         );
     }
+}
+
+fn angular_momentum(world: &World, bodies: &[BodyHandle]) -> Vec3 {
+    bodies
+        .iter()
+        .map(|&h| {
+            let b = world.body(h).unwrap();
+            let mass = 1.0 / b.inverse_mass();
+            let spin = b.inverse_inertia_world().inverse() * b.angular_velocity();
+            b.position().cross(b.velocity() * mass) + spin
+        })
+        .sum()
+}
+
+#[test]
+fn sliding_ball_ends_up_rolling_without_slipping() {
+    let mut world = World::default();
+    let m = material(0.0, 0.5);
+    floor(&mut world, m);
+    let radius = 0.5;
+    let h = ball(
+        &mut world,
+        1.0,
+        radius,
+        Vec3::new(0.0, radius, 0.0),
+        Vec3::new(5.0, 0.0, 0.0),
+        m,
+    );
+    run(&mut world, 2.0, |_| {});
+    let (v, w) = (vel(&world, h), world.body(h).unwrap().angular_velocity());
+    // Friction trades linear for angular momentum until v = ω·r: v = 5/7·v₀.
+    let expected = 5.0 / 7.0 * 5.0;
+    assert!(
+        (v.x - expected).abs() < expected * 0.03,
+        "v {} vs {expected}",
+        v.x
+    );
+    assert!(
+        (v.x + w.z * radius).abs() < 0.05,
+        "still slipping: v {} ω {}",
+        v.x,
+        w.z
+    );
+}
+
+#[test]
+fn glancing_collision_conserves_angular_momentum_and_induces_spin() {
+    let mut world = World::new(Vec3::ZERO);
+    let m = material(0.0, 0.8);
+    // Slow enough that penetration stays within the slop, so only impulses act
+    // (positional correction moves bodies and would perturb r × p).
+    let a = ball(
+        &mut world,
+        1.0,
+        0.5,
+        Vec3::new(-0.6, 0.3, 0.0),
+        Vec3::new(0.25, 0.0, 0.0),
+        m,
+    );
+    let b = ball(
+        &mut world,
+        2.0,
+        0.5,
+        Vec3::new(0.6, -0.3, 0.0),
+        Vec3::new(-0.25, 0.0, 0.0),
+        m,
+    );
+    let before = angular_momentum(&world, &[a, b]);
+    run(&mut world, 3.0, |_| {});
+    let after = angular_momentum(&world, &[a, b]);
+    assert!(
+        after.abs_diff_eq(before, 1e-4 * before.length().max(1.0)),
+        "{after} vs {before}"
+    );
+    assert!(
+        world.body(a).unwrap().angular_velocity().length() > 0.01,
+        "friction should spin a"
+    );
 }
