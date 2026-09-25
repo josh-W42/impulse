@@ -10,7 +10,6 @@ use winit::keyboard::KeyCode;
 #[derive(Debug, Default)]
 pub struct InputState {
     keys_held: HashSet<KeyCode>,
-    keys_pressed: HashSet<KeyCode>,
     buttons_held: HashSet<MouseButton>,
     cursor: Option<Vec2>,
     cursor_delta: Vec2,
@@ -31,9 +30,7 @@ impl InputState {
 
     pub fn on_key(&mut self, key: KeyCode, pressed: bool) {
         if pressed {
-            if self.keys_held.insert(key) {
-                self.keys_pressed.insert(key);
-            }
+            self.keys_held.insert(key);
         } else {
             self.keys_held.remove(&key);
         }
@@ -108,11 +105,6 @@ impl InputState {
         self.keys_held.contains(&key)
     }
 
-    /// True only on the frame the key went down (ignores OS key repeat).
-    pub fn key_pressed(&self, key: KeyCode) -> bool {
-        self.keys_pressed.contains(&key)
-    }
-
     pub fn button_held(&self, button: MouseButton) -> bool {
         self.buttons_held.contains(&button)
     }
@@ -147,7 +139,6 @@ impl InputState {
     }
 
     pub fn end_frame(&mut self) {
-        self.keys_pressed.clear();
         self.cursor_delta = Vec2::ZERO;
         self.raw_delta = Vec2::ZERO;
         self.wheel = 0.0;
@@ -161,13 +152,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_track_held_and_single_frame_presses() {
+    fn keys_track_held_state() {
         let mut input = InputState::new();
         input.on_key(KeyCode::KeyW, true);
-        assert!(input.key_held(KeyCode::KeyW) && input.key_pressed(KeyCode::KeyW));
-        input.end_frame();
         input.on_key(KeyCode::KeyW, true); // OS key repeat
-        assert!(input.key_held(KeyCode::KeyW) && !input.key_pressed(KeyCode::KeyW));
+        assert!(input.key_held(KeyCode::KeyW));
+        input.end_frame();
+        assert!(input.key_held(KeyCode::KeyW), "held keys survive the frame");
         input.on_key(KeyCode::KeyW, false);
         assert!(!input.key_held(KeyCode::KeyW));
     }

@@ -2,20 +2,14 @@
 
 use std::sync::Arc;
 
-use impulse_render::{FrameOutcome, Gpu, GpuInitError, backend_name, wgpu};
+use impulse_render::{Gpu, GpuInitError, wgpu};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::window::{Window, WindowId};
 
 use crate::platform;
-
-const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.02,
-    g: 0.03,
-    b: 0.06,
-    a: 1.0,
-};
+use crate::running::{FrameResult, Running};
 
 /// Delivered to the event loop when async GPU init finishes (immediately on
 /// desktop; later on the web, where init can't block).
@@ -26,8 +20,8 @@ enum UserEvent {
 enum State {
     Uninitialized,
     Loading,
-    // Boxed: Gpu is large next to the unit variants (clippy::large_enum_variant).
-    Running(Box<Gpu>),
+    // Boxed: Running is large next to the unit variants (clippy::large_enum_variant).
+    Running(Box<Running>),
     Failed,
 }
 
@@ -107,13 +101,15 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::GpuReady(Ok(gpu)) => {
-                let name = backend_name(gpu.backend());
+                let Some(window) = &self.window else {
+                    return;
+                };
+                let running = Running::new(gpu, window);
+                let name = running.backend();
                 platform::report_status(&format!("Running on {name}"));
-                if let Some(window) = &self.window {
-                    window.set_title(&format!("{} ({name})", self.title));
-                    window.request_redraw();
-                }
-                self.state = State::Running(Box::new(gpu));
+                window.set_title(&format!("{} ({name})", self.title));
+                window.request_redraw();
+                self.state = State::Running(Box::new(running));
             }
             UserEvent::GpuReady(Err(e)) => {
                 platform::report_error(&e.to_string());
@@ -129,31 +125,31 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                if let State::Running(gpu) = &mut self.state {
-                    gpu.resize(size.width, size.height);
+            WindowEvent::RedrawRequested => self.redraw(),
+            event => {
+                if let (State::Running(running), Some(window)) = (&mut self.state, &self.window) {
+                    running.on_window_event(window, &event);
                 }
             }
-            WindowEvent::RedrawRequested => self.redraw(),
-            _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let State::Running(running) = &mut self.state {
+            running.on_device_event(&event);
         }
     }
 }
 
 impl App {
     fn redraw(&mut self) {
-        let (State::Running(gpu), Some(window)) = (&mut self.state, &self.window) else {
+        let (State::Running(running), Some(window)) = (&mut self.state, &self.window) else {
             return;
         };
-        if gpu.render_clear(CLEAR_COLOR) == FrameOutcome::SurfaceLost {
-            match gpu.instance().create_surface(window.clone()) {
-                Ok(surface) => gpu.replace_surface(surface),
-                Err(e) => {
-                    platform::report_error(&format!("Lost the rendering surface: {e}"));
-                    self.state = State::Failed;
-                    return;
-                }
-            }
+        if let FrameResult::Failed(message) = running.frame(window) {
+            platform::report_error(&message);
+            self.state = State::Failed;
+            return;
         }
         window.request_redraw();
     }

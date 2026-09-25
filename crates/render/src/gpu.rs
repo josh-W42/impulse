@@ -176,36 +176,6 @@ impl Gpu {
     pub fn present(&self, frame: Frame) {
         self.queue.present(frame.texture);
     }
-
-    /// Clears the screen to `color` and presents it.
-    pub fn render_clear(&mut self, color: wgpu::Color) -> FrameOutcome {
-        let frame = match self.acquire() {
-            Ok(frame) => frame,
-            Err(outcome) => return outcome,
-        };
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-        self.queue.submit([encoder.finish()]);
-        self.present(frame);
-        FrameOutcome::Presented
-    }
 }
 
 /// A surface texture acquired for one frame, plus an sRGB view to draw into.
