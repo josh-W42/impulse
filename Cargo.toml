@@ -9,12 +9,18 @@ rust-version = "1.98"
 publish = false
 
 [workspace.dependencies]
+impulse-physics = { path = "crates/physics" }
 impulse-render = { path = "crates/render" }
 impulse-engine = { path = "crates/engine" }
 
 wgpu = { version = "30.0.1", features = ["webgl"] }
 winit = "0.30.13"
 log = "0.4.34"
+glam = "0.33.10"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+web-time = "1.1.0"
 
 # native only
 env_logger = "0.11.11"

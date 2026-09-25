@@ -634,6 +634,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928452f9c953e142b2f0973e4bd5f34445fcaa8069556ea97a3c9d34d15a4cf8"
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -732,6 +738,9 @@ dependencies = [
 [[package]]
 name = "impulse-physics"
 version = "0.1.0"
+dependencies = [
+ "glam",
+]
 
 [[package]]
 name = "impulse-render"

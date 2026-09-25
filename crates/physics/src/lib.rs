@@ -3,3 +3,9 @@
 //! Architecture rule: this crate depends on `glam` only, never on rendering,
 //! windowing, or engine crates, so it can be tested, benchmarked, and reused
 //! headless. `scripts/check-physics-deps.sh` enforces this in CI.
+
+mod body;
+mod world;
+
+pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};
+pub use world::{BodyHandle, DEFAULT_GRAVITY, World};
