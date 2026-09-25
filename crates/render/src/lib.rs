@@ -15,4 +15,4 @@ pub use backend::backend_name;
 
 mod gpu;
 
-pub use gpu::{FrameOutcome, Gpu, GpuInitError};
+pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};

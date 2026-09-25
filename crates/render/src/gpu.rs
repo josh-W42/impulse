@@ -124,39 +124,71 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Clears the screen to `color` and presents it.
-    pub fn render_clear(&mut self, color: wgpu::Color) -> FrameOutcome {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                drop(frame);
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Current surface size in physical pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// Format of the views returned by [`Gpu::acquire`] (sRGB); pipelines must target it.
+    pub fn view_format(&self) -> wgpu::TextureFormat {
+        self.view_format
+    }
+
+    /// Gets the next surface texture to draw into. `Err` means skip this frame
+    /// ([`FrameOutcome::Skipped`]) or recreate the surface ([`FrameOutcome::SurfaceLost`]).
+    pub fn acquire(&mut self) -> Result<Frame, FrameOutcome> {
+        let texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                drop(texture);
                 self.surface.configure(&self.device, &self.config);
-                return FrameOutcome::Skipped;
+                return Err(FrameOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return FrameOutcome::Skipped;
+                return Err(FrameOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
-                return FrameOutcome::Skipped;
+                return Err(FrameOutcome::Skipped);
             }
-            wgpu::CurrentSurfaceTexture::Lost => return FrameOutcome::SurfaceLost,
+            wgpu::CurrentSurfaceTexture::Lost => return Err(FrameOutcome::SurfaceLost),
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::error!("validation error while acquiring the surface texture");
-                return FrameOutcome::Skipped;
+                return Err(FrameOutcome::Skipped);
             }
         };
-
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.view_format),
             ..Default::default()
         });
+        Ok(Frame { texture, view })
+    }
+
+    /// Shows a frame. Submit all work that draws into it first.
+    pub fn present(&self, frame: Frame) {
+        self.queue.present(frame.texture);
+    }
+
+    /// Clears the screen to `color` and presents it.
+    pub fn render_clear(&mut self, color: wgpu::Color) -> FrameOutcome {
+        let frame = match self.acquire() {
+            Ok(frame) => frame,
+            Err(outcome) => return outcome,
+        };
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &frame.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -171,7 +203,13 @@ impl Gpu {
             });
         }
         self.queue.submit([encoder.finish()]);
-        self.queue.present(frame);
+        self.present(frame);
         FrameOutcome::Presented
     }
+}
+
+/// A surface texture acquired for one frame, plus an sRGB view to draw into.
+pub struct Frame {
+    texture: wgpu::SurfaceTexture,
+    pub view: wgpu::TextureView,
 }
