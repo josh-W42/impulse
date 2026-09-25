@@ -7,4 +7,10 @@ mod platform;
 
 mod app;
 
+// Pure-logic modules for M1; `allow(dead_code)` is removed when they are wired in (plan task C1).
+#[allow(dead_code)]
+mod pose;
+#[allow(dead_code)]
+mod timestep;
+
 pub use app::run;

@@ -9,6 +9,8 @@ publish.workspace = true
 impulse-render.workspace = true
 winit.workspace = true
 log.workspace = true
+glam.workspace = true
+impulse-physics.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger.workspace = true

@@ -726,6 +726,8 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "env_logger",
+ "glam",
+ "impulse-physics",
  "impulse-render",
  "log",
  "pollster",
