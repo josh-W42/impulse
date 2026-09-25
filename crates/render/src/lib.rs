@@ -12,3 +12,7 @@ pub use size::clamp_surface_size;
 mod backend;
 
 pub use backend::backend_name;
+
+mod gpu;
+
+pub use gpu::{FrameOutcome, Gpu, GpuInitError};
