@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>impulse</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #05080f; color: #cbd5e1;
+                   font: 14px system-ui, sans-serif; overflow: hidden; }
+      #impulse-canvas { display: block; width: 100vw; height: 100vh; }
+      #status { position: fixed; left: 12px; bottom: 12px; padding: 4px 8px;
+                background: rgba(0, 0, 0, 0.55); border-radius: 4px; }
+      #status.error { color: #fca5a5; }
+    </style>
+  </head>
+  <body>
+    <canvas id="impulse-canvas"></canvas>
+    <div id="status">Loading…</div>
+    <script type="module">
+      import init from "./impulse.js";
+      init().catch((err) => {
+        const status = document.getElementById("status");
+        status.textContent = `Failed to start: ${err}`;
+        status.className = "error";
+      });
+    </script>
+  </body>
+</html>
