@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+impulse-render = { path = "crates/render" }
+impulse-engine = { path = "crates/engine" }
+
+wgpu = { version = "30.0.1", features = ["webgl"] }
+winit = "0.30.13"
+log = "0.4.34"
+
+# native only
+env_logger = "0.11.11"
+pollster = "0.4"
+
+# wasm only
+wasm-bindgen = "0.2.128"
+wasm-bindgen-futures = "0.4.78"
+web-sys = "0.3.105"
+console_error_panic_hook = "0.1.7"
+console_log = "1.1.0"
