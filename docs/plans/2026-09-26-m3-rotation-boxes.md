@@ -58,3 +58,17 @@ orientation interpolated). Scene tests updated.
 SAT axis selection (face–face, edge–edge, rotated cases, parallel-edge guard) →
 reference/incident face clipping (point counts and positions) → box stacks tumble
 and settle without passing through each other → demo + verify + ship.
+
+## M3a results (2026-09-25)
+
+- 88 workspace tests. New: inertia formulas, torque-free spin, unit quaternions,
+  rolling without slipping (5/7·v₀, v = ω·r), angular-momentum conservation +
+  friction-induced spin, box–plane (4 / 1 contacts), sphere–box (face/edge/corner/
+  inside/rotated), box rests flat, tilted box topples onto a face, ball rests on a
+  box / rolls off its edge. Mutation: removing angular impulses fails 2 tests.
+- Two test premises corrected, not the physics: M2's "decelerates at μg" now holds
+  only during slipping (ball rolls after ≈0.29 s); "ball rolls off a box it lands
+  on" was wrong for a flat top — replaced by "rests on top" + "rolls off the edge".
+- Verified: WebGPU + WebGL2 (pane visible, buffer = CSS, no errors) and native debug
+  (user: spheres roll, boxes tumble/topple/settle, spheres rest on boxes).
+- As designed: boxes pass through each other until M3b.
