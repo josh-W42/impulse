@@ -32,7 +32,9 @@ Requesting `Limits::downlevel_webgl2_defaults()` keeps every backend on the WebG
 - A *hidden* browser tab reports a 1x1 drawing buffer: hidden documents skip the rendering steps, so winit's `ResizeObserver` never fires. It corrects itself when the tab becomes visible. A suspected init/resize race was tested (fix applied, then reverted and re-tested visible) and does **not** exist. Always verify canvas size with the page visible.
 - In the pane's mobile emulation (`devicePixelRatio=2`) the buffer matched CSS pixels (375x812), not physical pixels (750x1624). This may be an emulation artifact. **Verify on a real high-DPI device in M1** before changing anything; if real, the scene renders at half resolution.
 - Without the `impulse-canvas` element, winit renders into a detached canvas: the console logs an error but the status still reads "Running on …". This only happens if our own `index.html` is broken, so it was left alone.
-- The release `.wasm` is ~4.0 MB uncompressed (wgpu with both WebGPU and WebGL backends plus naga). Measure the compressed transfer size after deploying; `wasm-opt` or LTO are options if load time matters.
+- The release `.wasm` is ~4.0 MB uncompressed (wgpu with both WebGPU and WebGL backends plus naga) but **801 KB transferred** from Firebase Hosting (compressed), plus 15 KB JS. Acceptable; no `wasm-opt`/LTO needed yet.
+
+**M0 outcome (2026-09-25):** live at https://impulse-engine.web.app on WebGPU and forced WebGL2 (`?backend=webgl`). CI: 6m29s cold, 1m30s warm (rust-cache also keeps the wasm-bindgen CLI). The deploy secret is `FIREBASE_SERVICE_ACCOUNT_IMPULSE_ENGINE` (firebase-tools adds the project suffix); its generated PR-preview workflow was deleted because it deploys without building. GitHub notes `ubuntu-latest` moves to Ubuntu 26 from 2026-10-19; watch the first CI run after that date.
 
 ## Unverified points (confirm during execution; stop and report if wrong)
 
