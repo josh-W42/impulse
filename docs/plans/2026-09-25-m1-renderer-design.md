@@ -115,3 +115,15 @@ API facts (code from memory will get these wrong):
 - WebGL2 budget: ≤16 vertex attributes (plan uses 10: pos, normal + instance mat4, normal-mat3, color), use u16 indices, uniforms ≤16 KB (globals ~176 B), shadow map 2048².
 
 Plan sketch (lean plan still to write): Gpu refactor to `acquire()/present()`; render crate gets meshes (unit cube/sphere/plane with CCW-winding tests), `DrawList` + grouping (normal matrix = inverse-transpose, perpendicularity test), `Renderer` (lit+shadow+lines pipelines, lazy depth resize, growable instance buffers, egui pass); engine gets `FixedTimestep` (tests with dt=1/64 to avoid float ties), `Pose` interpolation, orbit/fly `CameraRig`, `InputState`, `egui_input`, demo scene (auto re-drop when all bodies below y=-30); physics `World`/`RigidBody`/`BodyHandle` + semi-implicit Euler. End with native resize-flicker retest and real high-DPI device check.
+
+## Verification results (2026-09-25)
+
+- Browser pane: WebGPU and `?backend=webgl` both render lit, shadowed scene + grid + egui panel at ~16.7 ms; canvas buffer == CSS size; no console errors. Shadows confirmed on WebGL2.
+- Native (Windows/Vulkan, user-checked): visuals, orbit, fly (Confined cursor + raw motion), panel (pause/step/reset/time scale/toggles), auto re-drop all pass.
+- **Deferred:** native live-resize edge flicker persists; user accepted for now (candidates in the M0 plan remain untested).
+- Pointer lock could not be verified in the embedded browser pane (`WrongDocumentError`, a pane sandbox limit). Check in a real browser after deploy.
+- Found during C3 (debug-build only, so the release web build hid them):
+  - **egui 0.36 `TexturesDelta` panics in debug if dropped unapplied** → the renderer takes `UiFrame` by value and `drain()`s `set`/`free`.
+  - egui warns on sRGB targets → surface configured with the non-sRGB format when supported; the scene renders through an sRGB view, egui through a surface-format `ui_view`.
+- Floor plane made double-sided (user: seeing below the floor is useful for editing); orbit is not clamped.
+- Release `.wasm` grew to ~9.8 MB raw with egui (measure the transfer size after deploy).

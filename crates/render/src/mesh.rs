@@ -86,14 +86,18 @@ pub fn cube() -> MeshData {
     mesh
 }
 
+/// Double-sided so the floor stays visible when the camera goes below it
+/// (useful for inspecting bodies that sink into it).
 pub fn plane() -> MeshData {
     let mut mesh = MeshData {
-        vertices: Vec::with_capacity(4),
-        indices: Vec::with_capacity(6),
+        vertices: Vec::with_capacity(8),
+        indices: Vec::with_capacity(12),
     };
     let (x, z) = (Vec3::X * 0.5, Vec3::Z * 0.5);
     // Seen from +Y, going -x+z → +x+z → +x-z → -x-z is counter-clockwise.
     push_quad(&mut mesh, [-x + z, x + z, x - z, -x - z], Vec3::Y);
+    // Same corners reversed: counter-clockwise seen from below.
+    push_quad(&mut mesh, [-x - z, x - z, x + z, -x + z], Vec3::NEG_Y);
     mesh
 }
 
@@ -177,6 +181,12 @@ mod tests {
         for v in &mesh.vertices {
             assert!(v.position.iter().all(|c| (c.abs() - 0.5).abs() < 1e-6));
         }
+    }
+
+    #[test]
+    fn plane_has_a_face_on_each_side() {
+        let normals: Vec<[f32; 3]> = plane().vertices.iter().map(|v| v.normal).collect();
+        assert!(normals.contains(&[0.0, 1.0, 0.0]) && normals.contains(&[0.0, -1.0, 0.0]));
     }
 
     #[test]
