@@ -15,7 +15,8 @@ pub struct SceneObject {
     pub prev: Pose,
 }
 
-pub const BALL_COUNT: usize = 30;
+/// Alternating spheres and boxes.
+pub const BODY_COUNT: usize = 30;
 /// Inner half-width of the pit (walls are planes at ±PIT).
 const PIT: f32 = 6.0;
 const WALL_HEIGHT: f32 = 2.0;
@@ -59,7 +60,7 @@ pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
             )
             .expect("pit planes are valid");
     }
-    (0..BALL_COUNT)
+    (0..BODY_COUNT)
         .map(|i| {
             let radius = 0.3 + 0.4 * spread(i, 0.37);
             let restitution = 0.1 + 0.8 * spread(i, 0.61);
@@ -73,14 +74,41 @@ pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
                 0.0,
                 spread(i, 0.79) * 4.0 - 2.0,
             );
-            let desc = BodyDesc::dynamic(8.0 * radius.powi(3), position)
-                .with_collider(Collider::Sphere { radius })
-                .with_material(Material {
-                    restitution,
-                    friction: 0.4,
-                })
-                .with_velocity(velocity);
-            let handle = world.add_body(desc).expect("demo balls are valid");
+            // Even: sphere. Odd: box of similar size, spawned tilted and spinning.
+            let (collider, mass, orientation, spin) = if i % 2 == 0 {
+                (
+                    Collider::Sphere { radius },
+                    8.0 * radius.powi(3),
+                    glam::Quat::IDENTITY,
+                    Vec3::ZERO,
+                )
+            } else {
+                let half_extents =
+                    Vec3::new(radius, radius * (0.6 + 0.6 * spread(i, 0.43)), radius * 0.8);
+                let axis = Vec3::new(spread(i, 0.17) - 0.5, 1.0, spread(i, 0.29) - 0.5).normalize();
+                (
+                    Collider::Box { half_extents },
+                    8.0 * half_extents.x * half_extents.y * half_extents.z,
+                    glam::Quat::from_axis_angle(axis, spread(i, 0.53) * std::f32::consts::TAU),
+                    Vec3::new(
+                        spread(i, 0.31) - 0.5,
+                        spread(i, 0.47) - 0.5,
+                        spread(i, 0.71) - 0.5,
+                    ) * 4.0,
+                )
+            };
+            let desc = BodyDesc {
+                orientation,
+                ..BodyDesc::dynamic(mass, position)
+            }
+            .with_collider(collider)
+            .with_angular_velocity(spin)
+            .with_material(Material {
+                restitution,
+                friction: 0.4,
+            })
+            .with_velocity(velocity);
+            let handle = world.add_body(desc).expect("demo bodies are valid");
             let t = (restitution - 0.1) / 0.8;
             let c = |k: usize| LOW_BOUNCE[k] + (HIGH_BOUNCE[k] - LOW_BOUNCE[k]) * t;
             SceneObject {
@@ -219,10 +247,10 @@ mod tests {
     const SCENERY: usize = 5; // floor + 4 walls
 
     #[test]
-    fn pit_has_five_static_planes_and_balls_start_inside() {
+    fn pit_has_five_static_planes_and_bodies_start_inside() {
         let mut world = World::default();
         let objects = demo_scene(&mut world);
-        assert_eq!(world.len(), 5 + BALL_COUNT);
+        assert_eq!(world.len(), 5 + BODY_COUNT);
         let statics = world
             .bodies()
             .filter(|(_, b)| b.inverse_mass() == 0.0)
@@ -230,8 +258,11 @@ mod tests {
         assert_eq!(statics, 5);
         for o in &objects {
             let body = world.body(o.handle).unwrap();
-            let Some(Collider::Sphere { radius }) = body.collider() else {
-                panic!("balls are spheres");
+            // Bounding radius: sphere radius, or the box's half-diagonal.
+            let radius = match body.collider() {
+                Some(Collider::Sphere { radius }) => radius,
+                Some(Collider::Box { half_extents }) => half_extents.length(),
+                other => panic!("unexpected collider {other:?}"),
             };
             let p = body.position();
             assert!(
@@ -247,7 +278,7 @@ mod tests {
         let mut world = World::default();
         let first = demo_scene(&mut world);
         let second = demo_scene(&mut world);
-        assert_eq!(world.len(), 5 + BALL_COUNT);
+        assert_eq!(world.len(), 5 + BODY_COUNT);
         let poses = |objs: &[SceneObject]| objs.iter().map(|o| o.prev).collect::<Vec<_>>();
         assert_eq!(poses(&first), poses(&second));
         assert!(
@@ -264,7 +295,7 @@ mod tests {
         world.step(0.1);
         let mut list = DrawList::default();
         build_draw_list(&mut list, &world, &objects, 0.0, true, false);
-        assert_eq!(list.instances.len(), SCENERY + BALL_COUNT);
+        assert_eq!(list.instances.len(), SCENERY + BODY_COUNT);
         assert_eq!(list.instances[0].mesh, MeshKind::Plane);
         // alpha 0 draws the pre-step pose, not the current one.
         assert_eq!(
@@ -275,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn balls_settle_inside_the_pit() {
+    fn bodies_settle_inside_the_pit() {
         let mut world = World::default();
         let objects = demo_scene(&mut world);
         for _ in 0..(8 * 60) {
