@@ -6,12 +6,14 @@
 
 mod body;
 mod box_box;
+mod broadphase;
 mod collider;
 mod contact;
 mod solver;
 mod world;
 
 pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};
+pub use broadphase::Aabb;
 pub use collider::{Collider, Material};
 pub use contact::{Contact, find_contacts};
 pub use solver::SolverSettings;
