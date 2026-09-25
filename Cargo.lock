@@ -927,6 +927,7 @@ dependencies = [
  "egui-wgpu",
  "glam",
  "log",
+ "naga",
  "wgpu",
 ]
 

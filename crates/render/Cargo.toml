@@ -12,3 +12,6 @@ glam.workspace = true
 bytemuck.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in", "glsl-out"] }
