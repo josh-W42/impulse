@@ -1,6 +1,7 @@
 use glam::Vec3;
 
 use crate::body::{BodyDesc, BodyError, RigidBody};
+use crate::broadphase::{Aabb, AabbTree};
 use crate::contact::find_contacts;
 use crate::solver::{self, ContactCache, SolverSettings};
 
@@ -18,6 +19,8 @@ pub struct BodyHandle {
 struct Slot {
     generation: u32,
     body: Option<RigidBody>,
+    /// Broadphase leaf, for bodies with bounded colliders.
+    proxy: Option<usize>,
 }
 
 /// All bodies plus global settings. Bodies live in a generational arena.
@@ -29,6 +32,7 @@ pub struct World {
     settings: SolverSettings,
     /// Last step's contact impulses, for warm starting.
     cache: ContactCache,
+    tree: AabbTree,
 }
 
 impl Default for World {
@@ -45,6 +49,7 @@ impl World {
             free: Vec::new(),
             settings: SolverSettings::default(),
             cache: ContactCache::default(),
+            tree: AabbTree::default(),
         }
     }
 
@@ -68,23 +73,28 @@ impl World {
 
     pub fn add_body(&mut self, desc: BodyDesc) -> Result<BodyHandle, BodyError> {
         let body = RigidBody::new(desc)?;
-        if let Some(index) = self.free.pop() {
+        let handle = if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.body = Some(body);
-            return Ok(BodyHandle {
+            BodyHandle {
                 index,
                 generation: slot.generation,
+            }
+        } else {
+            let index = u32::try_from(self.slots.len()).expect("more than u32::MAX bodies");
+            self.slots.push(Slot {
+                generation: 0,
+                body: Some(body),
+                proxy: None,
             });
-        }
-        let index = u32::try_from(self.slots.len()).expect("more than u32::MAX bodies");
-        self.slots.push(Slot {
-            generation: 0,
-            body: Some(body),
-        });
-        Ok(BodyHandle {
-            index,
-            generation: 0,
-        })
+            BodyHandle {
+                index,
+                generation: 0,
+            }
+        };
+        self.slots[handle.index as usize].proxy =
+            body_aabb(&body).map(|aabb| self.tree.insert(aabb, handle));
+        Ok(handle)
     }
 
     pub fn remove_body(&mut self, handle: BodyHandle) -> Option<RigidBody> {
@@ -94,6 +104,9 @@ impl World {
         }
         let body = slot.body.take()?;
         slot.generation = slot.generation.wrapping_add(1);
+        if let Some(proxy) = slot.proxy.take() {
+            self.tree.remove(proxy);
+        }
         self.free.push(handle.index);
         Some(body)
     }
@@ -128,7 +141,9 @@ impl World {
     /// Removes every body; all existing handles become stale.
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.tree = AabbTree::default();
         for (index, slot) in self.slots.iter_mut().enumerate() {
+            slot.proxy = None;
             if slot.body.take().is_some() {
                 slot.generation = slot.generation.wrapping_add(1);
                 self.free.push(index as u32);
@@ -154,6 +169,56 @@ impl World {
         for body in self.bodies_mut() {
             body.advance(dt);
         }
+        self.sync_broadphase();
+    }
+
+    /// Refits broadphase leaves after bodies moved (cheap when they stay in their margin).
+    fn sync_broadphase(&mut self) {
+        for slot in &self.slots {
+            if let (Some(body), Some(proxy)) = (&slot.body, slot.proxy)
+                && let Some(aabb) = body_aabb(body)
+            {
+                self.tree.update(proxy, aabb);
+            }
+        }
+    }
+
+    /// Pairs that might touch, sorted: tree overlaps between bounded shapes plus every
+    /// (plane, bounded dynamic body) pair. Static–static pairs are skipped.
+    pub(crate) fn candidate_pairs(&self) -> Vec<(BodyHandle, BodyHandle)> {
+        let mut pairs = Vec::new();
+        let mut planes = Vec::new();
+        for (handle, body) in self.bodies() {
+            let Some(collider) = body.collider() else {
+                continue;
+            };
+            if matches!(collider, crate::collider::Collider::Plane { .. }) {
+                planes.push(handle);
+                continue;
+            }
+            let proxy = self.slots[handle.index as usize]
+                .proxy
+                .expect("bounded bodies have proxies");
+            let dynamic = body.inverse_mass() != 0.0;
+            self.tree.query(self.tree.fat_aabb(proxy), |other| {
+                // Each pair once (from its lower handle); skip static–static.
+                if other > handle {
+                    let other_dynamic = self.body(other).is_some_and(|b| b.inverse_mass() != 0.0);
+                    if dynamic || other_dynamic {
+                        pairs.push((handle, other));
+                    }
+                }
+            });
+        }
+        for plane in planes {
+            for (handle, body) in self.bodies() {
+                if body.inverse_mass() != 0.0 && self.slots[handle.index as usize].proxy.is_some() {
+                    pairs.push((plane.min(handle), plane.max(handle)));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs
     }
 
     fn bodies_mut(&mut self) -> impl Iterator<Item = &mut RigidBody> {
@@ -167,6 +232,10 @@ impl World {
         }
         slot.body.as_mut()
     }
+}
+
+fn body_aabb(body: &RigidBody) -> Option<Aabb> {
+    Aabb::of(body.collider()?, body.position(), body.orientation())
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 
 use glam::{Quat, Vec3};
 
+use crate::body::RigidBody;
 use crate::box_box::box_box;
 use crate::collider::Collider;
 use crate::world::{BodyHandle, World};
@@ -121,67 +122,92 @@ pub(crate) fn sphere_box(
     ))
 }
 
-/// Every overlapping pair in the world (O(n²)).
+/// Every overlapping pair in the world. The broadphase proposes candidate pairs;
+/// the exact tests below confirm them.
 pub fn find_contacts(world: &World) -> Vec<Contact> {
+    let mut contacts = Vec::new();
+    for (ha, hb) in world.candidate_pairs() {
+        let (Some(a), Some(b)) = (world.body(ha), world.body(hb)) else {
+            continue;
+        };
+        if let (Some(ca), Some(cb)) = (a.collider(), b.collider()) {
+            pair_contacts((ha, a, ca), (hb, b, cb), &mut contacts);
+        }
+    }
+    contacts
+}
+
+/// Reference implementation: every pair, O(n²). Tests compare the broadphase against it.
+#[cfg(test)]
+pub(crate) fn find_contacts_brute_force(world: &World) -> Vec<Contact> {
     let bodies: Vec<_> = world
         .bodies()
         .filter_map(|(h, b)| Some((h, b, b.collider()?)))
         .collect();
     let mut contacts = Vec::new();
-    for (i, &(ha, a, ca)) in bodies.iter().enumerate() {
-        for &(hb, b, cb) in &bodies[i + 1..] {
-            if a.inverse_mass() == 0.0 && b.inverse_mass() == 0.0 {
+    for (i, &a) in bodies.iter().enumerate() {
+        for &b in &bodies[i + 1..] {
+            if a.1.inverse_mass() == 0.0 && b.1.inverse_mass() == 0.0 {
                 continue;
             }
-            let (pa, pb) = (a.position(), b.position());
-            let (qa, qb) = (a.orientation(), b.orientation());
-            // `flipped`: the narrowphase saw (b, a), so its normal points from a to b.
-            let (hits, flipped): (Vec<Geometry>, bool) = match (ca, cb) {
-                (Collider::Sphere { radius: ra }, Collider::Sphere { radius: rb }) => {
-                    (sphere_sphere(pa, ra, pb, rb).into_iter().collect(), false)
-                }
-                (Collider::Sphere { radius }, Collider::Plane { normal }) => (
-                    sphere_plane(pa, radius, pb, normal).into_iter().collect(),
-                    false,
-                ),
-                (Collider::Plane { normal }, Collider::Sphere { radius }) => (
-                    sphere_plane(pb, radius, pa, normal).into_iter().collect(),
-                    true,
-                ),
-                (Collider::Box { half_extents }, Collider::Plane { normal }) => {
-                    (box_plane(pa, qa, half_extents, pb, normal), false)
-                }
-                (Collider::Plane { normal }, Collider::Box { half_extents }) => {
-                    (box_plane(pb, qb, half_extents, pa, normal), true)
-                }
-                (Collider::Sphere { radius }, Collider::Box { half_extents }) => (
-                    sphere_box(pa, radius, pb, qb, half_extents)
-                        .into_iter()
-                        .collect(),
-                    false,
-                ),
-                (Collider::Box { half_extents }, Collider::Sphere { radius }) => (
-                    sphere_box(pb, radius, pa, qa, half_extents)
-                        .into_iter()
-                        .collect(),
-                    true,
-                ),
-                (Collider::Box { half_extents: ha }, Collider::Box { half_extents: hb }) => {
-                    (box_box(pa, qa, ha, pb, qb, hb), false)
-                }
-                (Collider::Plane { .. }, Collider::Plane { .. }) => (Vec::new(), false),
-            };
-            let (a, b) = if flipped { (hb, ha) } else { (ha, hb) };
-            contacts.extend(hits.into_iter().map(|(normal, depth, point)| Contact {
-                a,
-                b,
-                normal,
-                depth,
-                point,
-            }));
+            pair_contacts(a, b, &mut contacts);
         }
     }
     contacts
+}
+
+/// Exact contacts between two bodies, appended to `out`.
+fn pair_contacts(
+    (ha, a, ca): (BodyHandle, &RigidBody, Collider),
+    (hb, b, cb): (BodyHandle, &RigidBody, Collider),
+    out: &mut Vec<Contact>,
+) {
+    let (pa, pb) = (a.position(), b.position());
+    let (qa, qb) = (a.orientation(), b.orientation());
+    // `flipped`: the narrowphase saw (b, a), so its normal points from a to b.
+    let (hits, flipped): (Vec<Geometry>, bool) = match (ca, cb) {
+        (Collider::Sphere { radius: ra }, Collider::Sphere { radius: rb }) => {
+            (sphere_sphere(pa, ra, pb, rb).into_iter().collect(), false)
+        }
+        (Collider::Sphere { radius }, Collider::Plane { normal }) => (
+            sphere_plane(pa, radius, pb, normal).into_iter().collect(),
+            false,
+        ),
+        (Collider::Plane { normal }, Collider::Sphere { radius }) => (
+            sphere_plane(pb, radius, pa, normal).into_iter().collect(),
+            true,
+        ),
+        (Collider::Box { half_extents }, Collider::Plane { normal }) => {
+            (box_plane(pa, qa, half_extents, pb, normal), false)
+        }
+        (Collider::Plane { normal }, Collider::Box { half_extents }) => {
+            (box_plane(pb, qb, half_extents, pa, normal), true)
+        }
+        (Collider::Sphere { radius }, Collider::Box { half_extents }) => (
+            sphere_box(pa, radius, pb, qb, half_extents)
+                .into_iter()
+                .collect(),
+            false,
+        ),
+        (Collider::Box { half_extents }, Collider::Sphere { radius }) => (
+            sphere_box(pb, radius, pa, qa, half_extents)
+                .into_iter()
+                .collect(),
+            true,
+        ),
+        (Collider::Box { half_extents: ha }, Collider::Box { half_extents: hb }) => {
+            (box_box(pa, qa, ha, pb, qb, hb), false)
+        }
+        (Collider::Plane { .. }, Collider::Plane { .. }) => (Vec::new(), false),
+    };
+    let (a, b) = if flipped { (hb, ha) } else { (ha, hb) };
+    out.extend(hits.into_iter().map(|(normal, depth, point)| Contact {
+        a,
+        b,
+        normal,
+        depth,
+        point,
+    }));
 }
 
 #[cfg(test)]
@@ -291,6 +317,55 @@ mod tests {
             sphere_box(Vec3::new(0.0, 0.0, 1.3), 0.5, Vec3::ZERO, turned, long).unwrap();
         assert!(normal.abs_diff_eq(Vec3::Z, 1e-5));
         assert!((depth - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn broadphase_finds_exactly_the_brute_force_contacts() {
+        use crate::body::BodyDesc;
+        let mut world = World::default();
+        world
+            .add_body(
+                BodyDesc::fixed(Vec3::ZERO).with_collider(Collider::Plane { normal: Vec3::Y }),
+            )
+            .unwrap();
+        let mut seed = 5u32;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for i in 0..200 {
+            let p = Vec3::new(rand() * 8.0 - 4.0, rand() * 3.0, rand() * 8.0 - 4.0);
+            let collider = if i % 2 == 0 {
+                Collider::Sphere {
+                    radius: 0.2 + rand() * 0.4,
+                }
+            } else {
+                Collider::Box {
+                    half_extents: Vec3::new(0.2 + rand() * 0.3, 0.3, 0.25),
+                }
+            };
+            let desc = BodyDesc {
+                orientation: Quat::from_rotation_y(rand() * 6.0) * Quat::from_rotation_x(rand()),
+                ..if i % 10 == 0 {
+                    BodyDesc::fixed(p)
+                } else {
+                    BodyDesc::dynamic(1.0, p)
+                }
+            };
+            world.add_body(desc.with_collider(collider)).unwrap();
+        }
+        let key = |c: &Contact| (c.a, c.b, c.point.to_array().map(f32::to_bits));
+        for _ in 0..3 {
+            let mut fast = find_contacts(&world);
+            let mut brute = find_contacts_brute_force(&world);
+            assert!(!brute.is_empty());
+            fast.sort_by_key(key);
+            brute.sort_by_key(key);
+            assert_eq!(fast, brute);
+            for _ in 0..20 {
+                world.step(1.0 / 60.0);
+            }
+        }
     }
 
     #[test]

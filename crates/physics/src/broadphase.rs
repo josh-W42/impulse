@@ -292,6 +292,7 @@ impl AabbTree {
     }
 
     /// Tree height (0 for a single leaf, -1 when empty).
+    #[cfg(test)]
     pub(crate) fn height(&self) -> i32 {
         self.root.map_or(-1, |r| self.nodes[r].height)
     }
