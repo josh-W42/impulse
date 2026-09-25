@@ -94,3 +94,22 @@ resize; native run to retest resize flicker; high-DPI check on a real device.
 
 Collisions (M2), rotation dynamics (M3), PBR, post-processing, model loading,
 GPU-driven rendering, benchmarks (M5).
+
+## Research findings (2026-09-25, verified against source / compile tests)
+
+Spikes — all resolved:
+1. **Pointer lock (web):** winit 0.30.13 web supports `CursorGrabMode::Locked` (calls `requestPointerLock`) and emits `DeviceEvent::MouseMotion`. Runtime check still needed: browsers only grant lock inside a user gesture (keydown `F`). Native Windows supports `Confined`, not `Locked` → try Locked, fall back to Confined + hide cursor.
+2. **egui:** egui 0.36.2 + egui-wgpu 0.36.2 compile for wasm32 and native (scratch test). **egui-winit 0.36.2 does NOT compile for wasm32** (its `DroppedFile` impl lacks the wasm-only `bytes_async`; default `clipboard` feature also breaks). Decision: drop egui-winit; write a small `egui_input` module translating winit events → `egui::RawInput` (CursorMoved→`PointerMoved(pos/ppp)`, MouseInput→`PointerButton`, MouseWheel→`MouseWheel{unit Line|Point}`, CursorLeft→`PointerGone`, Focused→`WindowFocused`, first touch→pointer events; set `screen_rect` in points, `time`, and `viewports[ROOT].native_pixels_per_point`). No keyboard/text/clipboard (panel has no text fields).
+3. **Shadows on WebGL2:** wgpu-hal GLES always sets `DownlevelFlags::COMPARISON_SAMPLERS`; the official shadow example (Depth32Float + `sampler_comparison`) runs on WebGL.
+
+Scope cut: touch = one-finger rotate + pinch zoom only (no two-finger pan).
+Deps to add: `glam 0.33.10`, `bytemuck 1.25.2 (derive)`, `egui 0.36.2`, `egui-wgpu 0.36.2`, `web-time 1.1.0` (std `Instant` panics on wasm).
+
+API facts (code from memory will get these wrong):
+- **wgpu 30:** `DepthStencilState { depth_write_enabled: Some(true), depth_compare: Some(..), .. }`; `PipelineLayoutDescriptor { bind_group_layouts: &[Some(&bgl)], immediate_size: 0 }`; `RenderPipelineDescriptor { .., multiview_mask: None, cache: None }`; `VertexState/FragmentState { entry_point: Some("..."), compilation_options: Default::default(), .. }`; `SamplerDescriptor { mipmap_filter: wgpu::MipmapFilterMode::Nearest, compare: Some(LessEqual), .. }`; `RenderPass::forget_lifetime()` exists; shadow bias example `DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 }`. Reference: `examples/features/src/shadow/{mod.rs,shader.wgsl}` at tag v30.0.1.
+- Shadow pass needs its own bind group layout (uniform only): the shadow texture can't be bound while it is the depth attachment. Use `textureSampleCompareLevel` (allowed in non-uniform control flow).
+- **egui 0.36:** `ctx.run_ui(raw_input, |ui| ..)` (no `Context::run`); `egui::Window::new(..).show(ui.ctx(), ..)`; `textures_delta.set` is `(TextureId, SmallVec<[ImageDelta;1]>)` → call `update_texture` per delta; `ctx.egui_wants_pointer_input()` / `egui_is_using_pointer()` for input routing; `egui::ClippedPrimitive`/`TexturesDelta` re-exported at root; `ViewportInfo: Default`.
+- **egui-wgpu 0.36:** `Renderer::new(&device, format, RendererOptions::default())`; `update_buffers(&device,&queue,&mut encoder,&jobs,&screen)` returns command buffers to submit first; `render(&mut RenderPass<'static>, &jobs, &ScreenDescriptor{size_in_pixels, pixels_per_point})`.
+- WebGL2 budget: ≤16 vertex attributes (plan uses 10: pos, normal + instance mat4, normal-mat3, color), use u16 indices, uniforms ≤16 KB (globals ~176 B), shadow map 2048².
+
+Plan sketch (lean plan still to write): Gpu refactor to `acquire()/present()`; render crate gets meshes (unit cube/sphere/plane with CCW-winding tests), `DrawList` + grouping (normal matrix = inverse-transpose, perpendicularity test), `Renderer` (lit+shadow+lines pipelines, lazy depth resize, growable instance buffers, egui pass); engine gets `FixedTimestep` (tests with dt=1/64 to avoid float ties), `Pose` interpolation, orbit/fly `CameraRig`, `InputState`, `egui_input`, demo scene (auto re-drop when all bodies below y=-30); physics `World`/`RigidBody`/`BodyHandle` + semi-implicit Euler. End with native resize-flicker retest and real high-DPI device check.
