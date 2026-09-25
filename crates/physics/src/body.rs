@@ -1,6 +1,6 @@
 use std::fmt;
 
-use glam::{Quat, Vec3};
+use glam::{Mat3, Quat, Vec3};
 
 use crate::collider::{Collider, Material};
 
@@ -20,6 +20,8 @@ pub struct BodyDesc {
     pub position: Vec3,
     pub orientation: Quat,
     pub velocity: Vec3,
+    /// Radians per second, world space.
+    pub angular_velocity: Vec3,
     /// `None`: the body moves but never collides.
     pub collider: Option<Collider>,
     pub material: Material,
@@ -32,6 +34,7 @@ impl BodyDesc {
             position,
             orientation: Quat::IDENTITY,
             velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
             collider: None,
             material: Material::default(),
         }
@@ -58,6 +61,13 @@ impl BodyDesc {
     pub fn with_velocity(self, velocity: Vec3) -> Self {
         Self { velocity, ..self }
     }
+
+    pub fn with_angular_velocity(self, angular_velocity: Vec3) -> Self {
+        Self {
+            angular_velocity,
+            ..self
+        }
+    }
 }
 
 /// Why a body could not be created.
@@ -78,7 +88,7 @@ impl fmt::Display for BodyError {
             Self::InvalidOrientation => write!(f, "orientation must be a non-zero quaternion"),
             Self::InvalidCollider => write!(
                 f,
-                "spheres need a finite positive radius; planes a non-zero normal and a static body"
+                "spheres/boxes need finite positive sizes; planes a non-zero normal and a static body"
             ),
             Self::InvalidMaterial => write!(f, "restitution and friction must be finite and >= 0"),
         }
@@ -94,14 +104,20 @@ pub struct RigidBody {
     pub(crate) position: Vec3,
     orientation: Quat,
     pub(crate) velocity: Vec3,
+    pub(crate) angular_velocity: Vec3,
     inverse_mass: f32,
+    /// Diagonal of the inverse inertia tensor in body space (principal axes).
+    inverse_inertia_local: Vec3,
     collider: Option<Collider>,
     material: Material,
 }
 
 impl RigidBody {
     pub(crate) fn new(desc: BodyDesc) -> Result<Self, BodyError> {
-        if !(desc.position.is_finite() && desc.velocity.is_finite() && desc.orientation.is_finite())
+        if !(desc.position.is_finite()
+            && desc.velocity.is_finite()
+            && desc.angular_velocity.is_finite()
+            && desc.orientation.is_finite())
         {
             return Err(BodyError::NonFinite);
         }
@@ -120,17 +136,22 @@ impl RigidBody {
             .collider
             .map(|c| validate_collider(c, inverse_mass == 0.0))
             .transpose()?;
-        let velocity = if inverse_mass == 0.0 {
-            Vec3::ZERO
+        let inverse_inertia_local = inverse_inertia(collider, inverse_mass);
+        let (velocity, angular_velocity) = if inverse_mass == 0.0 {
+            (Vec3::ZERO, Vec3::ZERO)
+        } else if inverse_inertia_local == Vec3::ZERO {
+            (desc.velocity, Vec3::ZERO)
         } else {
-            desc.velocity
+            (desc.velocity, desc.angular_velocity)
         };
         Ok(Self {
             kind: desc.kind,
             position: desc.position,
             orientation: desc.orientation.normalize(),
             velocity,
+            angular_velocity,
             inverse_mass,
+            inverse_inertia_local,
             collider,
             material: desc.material,
         })
@@ -165,6 +186,16 @@ impl RigidBody {
         self.inverse_mass
     }
 
+    pub fn angular_velocity(&self) -> Vec3 {
+        self.angular_velocity
+    }
+
+    /// Inverse inertia tensor in world space: `R·I⁻¹·Rᵀ`. Zero if the body can't rotate.
+    pub fn inverse_inertia_world(&self) -> Mat3 {
+        let r = Mat3::from_quat(self.orientation);
+        r * Mat3::from_diagonal(self.inverse_inertia_local) * r.transpose()
+    }
+
     /// First half of semi-implicit Euler: forces change velocity.
     pub(crate) fn apply_gravity(&mut self, gravity: Vec3, dt: f32) {
         if self.inverse_mass != 0.0 {
@@ -176,6 +207,10 @@ impl RigidBody {
     pub(crate) fn advance(&mut self, dt: f32) {
         if self.inverse_mass != 0.0 {
             self.position += self.velocity * dt;
+            // dq/dt = ½·(ω, 0)·q; renormalize to stop drift. (No gyroscopic term.)
+            let w = self.angular_velocity;
+            let spin = Quat::from_xyzw(w.x, w.y, w.z, 0.0) * self.orientation * (0.5 * dt);
+            self.orientation = (self.orientation + spin).normalize();
         }
         debug_assert!(
             self.position.is_finite() && self.velocity.is_finite(),
@@ -187,6 +222,11 @@ impl RigidBody {
 fn validate_collider(collider: Collider, is_static: bool) -> Result<Collider, BodyError> {
     match collider {
         Collider::Sphere { radius } if radius.is_finite() && radius > 0.0 => Ok(collider),
+        Collider::Box { half_extents }
+            if half_extents.is_finite() && half_extents.min_element() > 0.0 =>
+        {
+            Ok(collider)
+        }
         Collider::Plane { normal } if is_static && normal.is_finite() && normal.length() > 1e-6 => {
             Ok(Collider::Plane {
                 normal: normal.normalize(),
@@ -196,9 +236,60 @@ fn validate_collider(collider: Collider, is_static: bool) -> Result<Collider, Bo
     }
 }
 
+/// Inverse principal moments; zero (no rotation) for static or collider-less bodies.
+fn inverse_inertia(collider: Option<Collider>, inverse_mass: f32) -> Vec3 {
+    if inverse_mass == 0.0 {
+        return Vec3::ZERO;
+    }
+    let mass = 1.0 / inverse_mass;
+    let inertia = match collider {
+        Some(Collider::Sphere { radius }) => Vec3::splat(0.4 * mass * radius * radius),
+        Some(Collider::Box { half_extents: h }) => {
+            let s = h * h;
+            Vec3::new(s.y + s.z, s.x + s.z, s.x + s.y) * (mass / 3.0)
+        }
+        _ => return Vec3::ZERO,
+    };
+    inertia.recip()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inertia_matches_textbook_formulas() {
+        // Solid sphere: I = 2/5·m·r² = 0.4·2·0.25 = 0.2.
+        let sphere = inverse_inertia(Some(Collider::Sphere { radius: 0.5 }), 1.0 / 2.0);
+        assert!(sphere.abs_diff_eq(Vec3::splat(5.0), 1e-5));
+        // Box, m = 3, half-extents (1, 2, 3): Iₓ = m/3·(4 + 9) = 13, I_y = 10, I_z = 5.
+        let cuboid = inverse_inertia(
+            Some(Collider::Box {
+                half_extents: Vec3::new(1.0, 2.0, 3.0),
+            }),
+            1.0 / 3.0,
+        );
+        assert!(cuboid.abs_diff_eq(Vec3::new(1.0 / 13.0, 1.0 / 10.0, 1.0 / 5.0), 1e-6));
+    }
+
+    #[test]
+    fn static_and_collider_less_bodies_do_not_rotate() {
+        let spin = Vec3::new(1.0, 2.0, 3.0);
+        let fixed = RigidBody::new(
+            BodyDesc::fixed(Vec3::ZERO)
+                .with_collider(Collider::Box {
+                    half_extents: Vec3::ONE,
+                })
+                .with_angular_velocity(spin),
+        )
+        .unwrap();
+        let bare =
+            RigidBody::new(BodyDesc::dynamic(1.0, Vec3::ZERO).with_angular_velocity(spin)).unwrap();
+        for body in [fixed, bare] {
+            assert_eq!(body.angular_velocity(), Vec3::ZERO);
+            assert_eq!(body.inverse_inertia_world(), Mat3::ZERO);
+        }
+    }
 
     fn sphere(radius: f32) -> BodyDesc {
         BodyDesc::dynamic(1.0, Vec3::ZERO).with_collider(Collider::Sphere { radius })

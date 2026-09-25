@@ -123,6 +123,7 @@ pub fn all_below(world: &World, objects: &[SceneObject], y: f32) -> bool {
 fn collider_visual(collider: Collider) -> Option<(MeshKind, Vec3)> {
     match collider {
         Collider::Sphere { radius } => Some((MeshKind::Sphere, Vec3::splat(radius * 2.0))),
+        Collider::Box { half_extents } => Some((MeshKind::Cube, half_extents * 2.0)),
         Collider::Plane { .. } => None,
     }
 }

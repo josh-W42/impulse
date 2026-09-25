@@ -6,6 +6,10 @@ pub enum Collider {
     Sphere {
         radius: f32,
     },
+    /// Oriented box, centered on the body, axes along the body's local axes.
+    Box {
+        half_extents: Vec3,
+    },
     /// Infinite plane through the body's position. Static bodies only; the
     /// normal points out of the solid side and is normalized on creation.
     Plane {

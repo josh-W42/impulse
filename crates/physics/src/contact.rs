@@ -77,6 +77,8 @@ pub fn find_contacts(world: &World) -> Vec<Contact> {
                 (Collider::Plane { normal }, Collider::Sphere { radius }) => {
                     sphere_plane(pb, radius, pa, normal).map(|g| (hb, ha, g))
                 }
+                // Box pairs arrive in M3 (R3/R4 box–plane and sphere–box; M3b box–box).
+                (Collider::Box { .. }, _) | (_, Collider::Box { .. }) => None,
                 (Collider::Plane { .. }, Collider::Plane { .. }) => None,
             };
             if let Some((a, b, (normal, depth, point))) = contact {
