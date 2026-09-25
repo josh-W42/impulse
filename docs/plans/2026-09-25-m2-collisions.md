@@ -57,3 +57,13 @@ Test: scene builds 30 dynamic + 5 static bodies; all spheres start inside the pi
 **P5. Verify + ship** — tests, clippy ×2, physics guard; browser pane (visible):
 WebGPU **and** WebGL2 screenshots; native debug run (user eyeballs: bounces,
 settling, no tunneling through walls). Merge, push, confirm live on both backends.
+
+## Results (2026-09-25)
+
+- 25 physics tests (17 unit + 8 contract) + 4 scene tests; three solver mutations
+  (no restitution / no friction / no position correction) each caught.
+- Plane placement refinement: `Plane { normal }` passes through the body position
+  (one source of truth) instead of a separate `offset`.
+- Browser: WebGPU verified (balls bounce by restitution, settle in the pit); WebGL2
+  renders the new scene (pane was hidden mid-check; no render/surface code changed in
+  M2). Native debug: no panics; user confirmed bounces, settling, containment, reset.
