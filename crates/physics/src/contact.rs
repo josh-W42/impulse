@@ -3,6 +3,7 @@
 
 use glam::{Quat, Vec3};
 
+use crate::box_box::box_box;
 use crate::collider::Collider;
 use crate::world::{BodyHandle, World};
 
@@ -18,7 +19,7 @@ pub struct Contact {
 }
 
 /// `(normal b→a, depth, point)` for one contact point.
-type Geometry = (Vec3, f32, Vec3);
+pub(crate) type Geometry = (Vec3, f32, Vec3);
 
 /// `(normal b→a, depth, point)` if the spheres overlap. Touching isn't overlap.
 pub(crate) fn sphere_sphere(
@@ -165,8 +166,9 @@ pub fn find_contacts(world: &World) -> Vec<Contact> {
                         .collect(),
                     true,
                 ),
-                // Box–box arrives in M3b (SAT + clipping).
-                (Collider::Box { .. }, Collider::Box { .. }) => (Vec::new(), false),
+                (Collider::Box { half_extents: ha }, Collider::Box { half_extents: hb }) => {
+                    (box_box(pa, qa, ha, pb, qb, hb), false)
+                }
                 (Collider::Plane { .. }, Collider::Plane { .. }) => (Vec::new(), false),
             };
             let (a, b) = if flipped { (hb, ha) } else { (ha, hb) };

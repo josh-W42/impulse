@@ -145,3 +145,71 @@ fn ball_rolls_off_the_edge_of_a_box() {
         "should end on the floor: {p}"
     );
 }
+
+#[test]
+fn box_dropped_on_a_box_comes_to_rest_on_top() {
+    let mut world = world_with_floor();
+    let cube = Vec3::splat(0.5);
+    let bottom = drop_box(&mut world, cube, Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY);
+    let top = drop_box(
+        &mut world,
+        cube,
+        Vec3::new(0.1, 2.0, 0.0),
+        Quat::from_rotation_y(0.3),
+    );
+    run(&mut world, 5.0);
+    let (b, t) = (world.body(bottom).unwrap(), world.body(top).unwrap());
+    assert!(
+        (b.position().y - 0.5).abs() < 0.03,
+        "bottom at {}",
+        b.position().y
+    );
+    assert!(
+        (t.position().y - 1.5).abs() < 0.05,
+        "top at {} (fell through?)",
+        t.position().y
+    );
+    assert!(
+        tilt_degrees(t.orientation()) < 3.0,
+        "top tilted {}°",
+        tilt_degrees(t.orientation())
+    );
+}
+
+#[test]
+fn pile_of_boxes_never_deeply_interpenetrates() {
+    let mut world = world_with_floor();
+    for i in 0..12 {
+        let x = (i % 3) as f32 * 0.7 - 0.7;
+        let z = (i / 3 % 2) as f32 * 0.7 - 0.35;
+        let tilt = Quat::from_rotation_x(i as f32 * 0.5) * Quat::from_rotation_z(i as f32 * 0.3);
+        drop_box(
+            &mut world,
+            Vec3::new(0.3, 0.25, 0.35),
+            Vec3::new(x, 1.0 + i as f32 * 0.6, z),
+            tilt,
+        );
+    }
+    let mut deepest = 0.0f32;
+    for _ in 0..(8 * 60) {
+        world.step(DT);
+        for c in impulse_physics::find_contacts(&world) {
+            deepest = deepest.max(c.depth);
+        }
+    }
+    // `deepest` only sees contacts that detection reports, so it can't notice
+    // missed box–box contacts. Independent check: 12 boxes on 6 spots must pile up
+    // (without box–box collisions they all end at floor level, below 0.35 m).
+    let highest = world
+        .bodies()
+        .map(|(_, b)| b.position().y)
+        .fold(f32::MIN, f32::max);
+    assert!(
+        highest > 0.6,
+        "no pile formed (highest center {highest}): boxes passed through each other"
+    );
+    assert!(deepest < 0.15, "bodies sank {deepest} m into each other");
+    for (_, b) in world.bodies() {
+        assert!(b.position().is_finite() && b.position().y > -0.1);
+    }
+}

@@ -5,6 +5,7 @@
 //! headless. `scripts/check-physics-deps.sh` enforces this in CI.
 
 mod body;
+mod box_box;
 mod collider;
 mod contact;
 mod solver;
