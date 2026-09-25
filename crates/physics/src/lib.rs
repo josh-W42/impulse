@@ -5,7 +5,12 @@
 //! headless. `scripts/check-physics-deps.sh` enforces this in CI.
 
 mod body;
+mod collider;
+mod contact;
+mod solver;
 mod world;
 
 pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};
+pub use collider::{Collider, Material};
+pub use contact::{Contact, find_contacts};
 pub use world::{BodyHandle, DEFAULT_GRAVITY, World};

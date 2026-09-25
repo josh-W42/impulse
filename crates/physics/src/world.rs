@@ -1,6 +1,8 @@
 use glam::Vec3;
 
 use crate::body::{BodyDesc, BodyError, RigidBody};
+use crate::contact::find_contacts;
+use crate::solver;
 
 pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 
@@ -115,12 +117,34 @@ impl World {
     }
 
     /// Advances the simulation by `dt` seconds.
+    ///
+    /// Order: gravity → find contacts → solve contact velocities → move →
+    /// push remaining overlap apart. (Semi-implicit Euler with the contact solve
+    /// between the velocity and position updates.)
     pub fn step(&mut self, dt: f32) {
         debug_assert!(dt.is_finite() && dt >= 0.0, "invalid timestep {dt}");
         let gravity = self.gravity;
-        for body in self.slots.iter_mut().filter_map(|slot| slot.body.as_mut()) {
-            body.integrate(gravity, dt);
+        for body in self.bodies_mut() {
+            body.apply_gravity(gravity, dt);
         }
+        let contacts = find_contacts(self);
+        solver::solve_velocities(self, &contacts);
+        for body in self.bodies_mut() {
+            body.advance(dt);
+        }
+        solver::correct_positions(self);
+    }
+
+    fn bodies_mut(&mut self) -> impl Iterator<Item = &mut RigidBody> {
+        self.slots.iter_mut().filter_map(|slot| slot.body.as_mut())
+    }
+
+    pub(crate) fn body_mut(&mut self, handle: BodyHandle) -> Option<&mut RigidBody> {
+        let slot = self.slots.get_mut(handle.index as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        slot.body.as_mut()
     }
 }
 

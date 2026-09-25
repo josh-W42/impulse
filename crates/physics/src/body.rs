@@ -2,6 +2,8 @@ use std::fmt;
 
 use glam::{Quat, Vec3};
 
+use crate::collider::{Collider, Material};
+
 /// How a body participates in the simulation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BodyKind {
@@ -18,6 +20,9 @@ pub struct BodyDesc {
     pub position: Vec3,
     pub orientation: Quat,
     pub velocity: Vec3,
+    /// `None`: the body moves but never collides.
+    pub collider: Option<Collider>,
+    pub material: Material,
 }
 
 impl BodyDesc {
@@ -27,6 +32,8 @@ impl BodyDesc {
             position,
             orientation: Quat::IDENTITY,
             velocity: Vec3::ZERO,
+            collider: None,
+            material: Material::default(),
         }
     }
 
@@ -36,6 +43,21 @@ impl BodyDesc {
             ..Self::dynamic(1.0, position)
         }
     }
+
+    pub fn with_collider(self, collider: Collider) -> Self {
+        Self {
+            collider: Some(collider),
+            ..self
+        }
+    }
+
+    pub fn with_material(self, material: Material) -> Self {
+        Self { material, ..self }
+    }
+
+    pub fn with_velocity(self, velocity: Vec3) -> Self {
+        Self { velocity, ..self }
+    }
 }
 
 /// Why a body could not be created.
@@ -44,6 +66,8 @@ pub enum BodyError {
     NonFinite,
     InvalidMass,
     InvalidOrientation,
+    InvalidCollider,
+    InvalidMaterial,
 }
 
 impl fmt::Display for BodyError {
@@ -52,20 +76,27 @@ impl fmt::Display for BodyError {
             Self::NonFinite => write!(f, "position, velocity, and orientation must be finite"),
             Self::InvalidMass => write!(f, "dynamic bodies need a finite, positive mass"),
             Self::InvalidOrientation => write!(f, "orientation must be a non-zero quaternion"),
+            Self::InvalidCollider => write!(
+                f,
+                "spheres need a finite positive radius; planes a non-zero normal and a static body"
+            ),
+            Self::InvalidMaterial => write!(f, "restitution and friction must be finite and >= 0"),
         }
     }
 }
 
 impl std::error::Error for BodyError {}
 
-/// A rigid body's state. Fields are private so every body stays finite and valid.
+/// A rigid body's state. Fields are crate-private so every body stays finite and valid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RigidBody {
     kind: BodyKind,
-    position: Vec3,
+    pub(crate) position: Vec3,
     orientation: Quat,
-    velocity: Vec3,
+    pub(crate) velocity: Vec3,
     inverse_mass: f32,
+    collider: Option<Collider>,
+    material: Material,
 }
 
 impl RigidBody {
@@ -82,6 +113,13 @@ impl RigidBody {
             BodyKind::Dynamic { .. } => return Err(BodyError::InvalidMass),
             BodyKind::Static => 0.0,
         };
+        if !desc.material.is_valid() {
+            return Err(BodyError::InvalidMaterial);
+        }
+        let collider = desc
+            .collider
+            .map(|c| validate_collider(c, inverse_mass == 0.0))
+            .transpose()?;
         let velocity = if inverse_mass == 0.0 {
             Vec3::ZERO
         } else {
@@ -93,7 +131,17 @@ impl RigidBody {
             orientation: desc.orientation.normalize(),
             velocity,
             inverse_mass,
+            collider,
+            material: desc.material,
         })
+    }
+
+    pub fn collider(&self) -> Option<Collider> {
+        self.collider
+    }
+
+    pub fn material(&self) -> Material {
+        self.material
     }
 
     pub fn kind(&self) -> BodyKind {
@@ -117,16 +165,103 @@ impl RigidBody {
         self.inverse_mass
     }
 
-    /// Semi-implicit Euler: update velocity first, then move with the new velocity.
-    pub(crate) fn integrate(&mut self, gravity: Vec3, dt: f32) {
-        if self.inverse_mass == 0.0 {
-            return;
+    /// First half of semi-implicit Euler: forces change velocity.
+    pub(crate) fn apply_gravity(&mut self, gravity: Vec3, dt: f32) {
+        if self.inverse_mass != 0.0 {
+            self.velocity += gravity * dt;
         }
-        self.velocity += gravity * dt;
-        self.position += self.velocity * dt;
+    }
+
+    /// Second half: move with the (contact-corrected) new velocity.
+    pub(crate) fn advance(&mut self, dt: f32) {
+        if self.inverse_mass != 0.0 {
+            self.position += self.velocity * dt;
+        }
         debug_assert!(
             self.position.is_finite() && self.velocity.is_finite(),
-            "non-finite body state after integrate"
+            "non-finite body state after advance"
         );
+    }
+}
+
+fn validate_collider(collider: Collider, is_static: bool) -> Result<Collider, BodyError> {
+    match collider {
+        Collider::Sphere { radius } if radius.is_finite() && radius > 0.0 => Ok(collider),
+        Collider::Plane { normal } if is_static && normal.is_finite() && normal.length() > 1e-6 => {
+            Ok(Collider::Plane {
+                normal: normal.normalize(),
+            })
+        }
+        _ => Err(BodyError::InvalidCollider),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sphere(radius: f32) -> BodyDesc {
+        BodyDesc::dynamic(1.0, Vec3::ZERO).with_collider(Collider::Sphere { radius })
+    }
+
+    #[test]
+    fn rejects_bad_colliders() {
+        for radius in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                RigidBody::new(sphere(radius)),
+                Err(BodyError::InvalidCollider)
+            );
+        }
+        let plane = |normal| Collider::Plane { normal };
+        assert_eq!(
+            RigidBody::new(BodyDesc::fixed(Vec3::ZERO).with_collider(plane(Vec3::ZERO))),
+            Err(BodyError::InvalidCollider)
+        );
+        assert_eq!(
+            RigidBody::new(BodyDesc::dynamic(1.0, Vec3::ZERO).with_collider(plane(Vec3::Y))),
+            Err(BodyError::InvalidCollider),
+            "planes must be static"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_materials() {
+        for (restitution, friction) in [
+            (-0.1, 0.5),
+            (0.5, -1.0),
+            (f32::NAN, 0.5),
+            (0.5, f32::INFINITY),
+        ] {
+            let desc = sphere(1.0).with_material(Material {
+                restitution,
+                friction,
+            });
+            assert_eq!(RigidBody::new(desc), Err(BodyError::InvalidMaterial));
+        }
+    }
+
+    #[test]
+    fn plane_normals_are_normalized() {
+        let body = RigidBody::new(BodyDesc::fixed(Vec3::ZERO).with_collider(Collider::Plane {
+            normal: Vec3::new(0.0, 3.0, 4.0),
+        }))
+        .unwrap();
+        let Some(Collider::Plane { normal }) = body.collider() else {
+            panic!("expected a plane");
+        };
+        assert!((normal.length() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn materials_combine_by_max_and_geometric_mean() {
+        let a = Material {
+            restitution: 0.2,
+            friction: 0.25,
+        };
+        let b = Material {
+            restitution: 0.8,
+            friction: 1.0,
+        };
+        assert_eq!(Material::combine(a, b), (0.8, 0.5));
     }
 }
