@@ -419,20 +419,22 @@ impl Renderer {
             depth: DepthTarget::new(device, gpu.size()),
             egui: egui_wgpu::Renderer::new(
                 device,
-                gpu.view_format(),
+                gpu.surface_format(),
                 egui_wgpu::RendererOptions::default(),
             ),
         }
     }
 
-    /// Draws one frame into `target` and submits it. The caller presents.
+    /// Draws one frame and submits it; the caller presents. `target` is the sRGB
+    /// view for the scene, `ui_target` the surface-format view for egui.
     pub fn render(
         &mut self,
         gpu: &Gpu,
         target: &wgpu::TextureView,
+        ui_target: &wgpu::TextureView,
         camera: &CameraData,
         list: &DrawList,
-        ui: &UiFrame,
+        mut ui: UiFrame,
     ) {
         let (device, queue) = (gpu.device(), gpu.queue());
         if self.depth.size != gpu.size() {
@@ -466,9 +468,10 @@ impl Renderer {
         self.lines
             .write(device, queue, bytemuck::cast_slice(&line_vertices));
 
-        for (id, deltas) in &ui.textures_delta.set {
-            for delta in deltas {
-                self.egui.update_texture(device, queue, *id, delta);
+        // Drain (not iterate): egui 0.36 panics in debug if a TexturesDelta is dropped unapplied.
+        for (id, deltas) in ui.textures_delta.set.drain() {
+            for delta in &deltas {
+                self.egui.update_texture(device, queue, id, delta);
             }
         }
 
@@ -545,7 +548,7 @@ impl Renderer {
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
+                        view: ui_target,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -563,8 +566,8 @@ impl Renderer {
         }
         queue.submit(egui_commands.into_iter().chain([encoder.finish()]));
 
-        for id in &ui.textures_delta.free {
-            self.egui.free_texture(id);
+        for id in ui.textures_delta.free.drain() {
+            self.egui.free_texture(&id);
         }
     }
 

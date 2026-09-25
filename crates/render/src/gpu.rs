@@ -83,8 +83,13 @@ impl Gpu {
         let mut config = surface
             .get_default_config(&adapter, width, height)
             .ok_or(GpuInitError::SurfaceUnsupported)?;
-        // Render through an sRGB view so colors are gamma-correct even when the
-        // surface format is not sRGB (browser WebGPU surfaces usually are not).
+        // Configure the surface non-sRGB when possible (egui wants that for its own
+        // gamma handling) and render the scene through an sRGB view, so scene colors
+        // are gamma-correct either way.
+        let linear = config.format.remove_srgb_suffix();
+        if surface.get_capabilities(&adapter).formats.contains(&linear) {
+            config.format = linear;
+        }
         let view_format = config.format.add_srgb_suffix();
         config.view_formats.push(view_format);
         surface.configure(&device, &config);
@@ -137,6 +142,11 @@ impl Gpu {
         (self.config.width, self.config.height)
     }
 
+    /// The surface's own format (often not sRGB); [`Frame::ui_view`] uses it.
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
     /// Format of the views returned by [`Gpu::acquire`] (sRGB); pipelines must target it.
     pub fn view_format(&self) -> wgpu::TextureFormat {
         self.view_format
@@ -169,7 +179,15 @@ impl Gpu {
             format: Some(self.view_format),
             ..Default::default()
         });
-        Ok(Frame { texture, view })
+        let ui_view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.config.format),
+            ..Default::default()
+        });
+        Ok(Frame {
+            texture,
+            view,
+            ui_view,
+        })
     }
 
     /// Shows a frame. Submit all work that draws into it first.
@@ -181,5 +199,8 @@ impl Gpu {
 /// A surface texture acquired for one frame, plus an sRGB view to draw into.
 pub struct Frame {
     texture: wgpu::SurfaceTexture,
+    /// sRGB view for the 3D scene (shaders output linear color).
     pub view: wgpu::TextureView,
+    /// View in the surface's own format, for egui (which handles gamma itself).
+    pub ui_view: wgpu::TextureView,
 }

@@ -327,8 +327,14 @@ impl Running {
             view_proj: CameraRig::projection(aspect) * self.camera.view(),
             eye: self.camera.eye(),
         };
-        self.renderer
-            .render(&self.gpu, &frame.view, &camera, &self.draw_list, &ui);
+        self.renderer.render(
+            &self.gpu,
+            &frame.view,
+            &frame.ui_view,
+            &camera,
+            &self.draw_list,
+            ui,
+        );
         window.pre_present_notify();
         self.gpu.present(frame);
         self.input.end_frame();
