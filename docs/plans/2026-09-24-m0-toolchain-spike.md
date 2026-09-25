@@ -26,6 +26,8 @@ Design doc: `docs/plans/2026-09-24-impulse-engine-design.md`.
 
 Requesting `Limits::downlevel_webgl2_defaults()` keeps every backend on the WebGL2 feature floor: **no compute shaders and no storage buffers**. Instancing via per-instance vertex buffers works. M1 must decide whether to keep WebGL2 fallback (and that floor) or require WebGPU.
 
+**Native live-resize artifacts (observed 2026-09-25, Windows + Vulkan):** while dragging a window edge, the newly exposed strip flashes black when growing and white when shrinking; dragging the left edge shows it on the right side. No crash, correct final image. Likely cause: presented frames lag the window size by the swapchain's frame latency. Revisit in M1 when the depth buffer also needs resize handling. Candidates to test (unverified): render+present synchronously inside `WindowEvent::Resized`; `desired_maximum_frame_latency = 1`; compare the DX12 backend (DXGI flip model).
+
 ## Unverified points (confirm during execution; stop and report if wrong)
 
 1. `rustup toolchain install` with no arguments installs the toolchain named in `rust-toolchain.toml` (rustup ≥ 1.28). Fallback: `rustup toolchain install 1.98.1 --component rustfmt clippy --target wasm32-unknown-unknown`.

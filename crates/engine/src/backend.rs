@@ -42,8 +42,14 @@ mod tests {
 
     #[test]
     fn reads_webgl_and_webgpu() {
-        assert_eq!(parse_backend_override("?backend=webgl"), Some(BackendOverride::WebGl));
-        assert_eq!(parse_backend_override("?backend=webgpu"), Some(BackendOverride::WebGpu));
+        assert_eq!(
+            parse_backend_override("?backend=webgl"),
+            Some(BackendOverride::WebGl)
+        );
+        assert_eq!(
+            parse_backend_override("?backend=webgpu"),
+            Some(BackendOverride::WebGpu)
+        );
     }
 
     #[test]
@@ -64,6 +70,9 @@ mod tests {
     #[test]
     fn maps_to_wgpu_backends() {
         assert_eq!(BackendOverride::WebGl.backends(), wgpu::Backends::GL);
-        assert_eq!(BackendOverride::WebGpu.backends(), wgpu::Backends::BROWSER_WEBGPU);
+        assert_eq!(
+            BackendOverride::WebGpu.backends(),
+            wgpu::Backends::BROWSER_WEBGPU
+        );
     }
 }

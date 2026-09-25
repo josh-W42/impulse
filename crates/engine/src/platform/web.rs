@@ -35,7 +35,9 @@ pub fn window_attributes(title: &str) -> WindowAttributes {
     if canvas.is_none() {
         log::error!("no <canvas id=\"{CANVAS_ID}\"> in the page; nothing will be visible");
     }
-    Window::default_attributes().with_title(title).with_canvas(canvas)
+    Window::default_attributes()
+        .with_title(title)
+        .with_canvas(canvas)
 }
 
 pub fn backend_override() -> Option<BackendOverride> {
