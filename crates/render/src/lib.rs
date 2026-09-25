@@ -4,3 +4,7 @@
 //! hands it over. Re-exports `wgpu` so every crate uses the same version.
 
 pub use wgpu;
+
+mod size;
+
+pub use size::clamp_surface_size;
