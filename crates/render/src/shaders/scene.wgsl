@@ -8,8 +8,15 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
+// Per material: base colour (sRGB texture, so samples arrive linear).
+@group(1) @binding(0) var base_texture: texture_2d<f32>;
+@group(1) @binding(1) var base_sampler: sampler;
 
-struct VertexIn { @location(0) position: vec3<f32>, @location(1) normal: vec3<f32> };
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(10) uv: vec2<f32>,
+};
 struct InstanceIn {
     @location(2) model_0: vec4<f32>, @location(3) model_1: vec4<f32>,
     @location(4) model_2: vec4<f32>, @location(5) model_3: vec4<f32>,
@@ -22,6 +29,7 @@ struct VertexOut {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) light_clip: vec4<f32>,
+    @location(4) uv: vec2<f32>,
 };
 
 fn model_matrix(i: InstanceIn) -> mat4x4<f32> {
@@ -38,6 +46,7 @@ fn vs_main(v: VertexIn, i: InstanceIn) -> VertexOut {
     out.normal = normal_matrix * v.normal;
     out.color = i.color;
     out.light_clip = globals.light_view_proj * world;
+    out.uv = v.uv;
     return out;
 }
 
@@ -67,6 +76,8 @@ fn shadow_factor(light_clip: vec4<f32>) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // Sampled first, in uniform control flow (implicit derivatives for mips).
+    let base = textureSample(base_texture, base_sampler, in.uv) * in.color;
     let n = normalize(in.normal);
     let l = -globals.light_dir.xyz;
     let v = normalize(globals.eye.xyz - in.world_pos);
@@ -76,6 +87,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let specular = pow(max(dot(n, h), 0.0), 32.0) * 0.25 * step(0.0001, n_dot_l);
     let ambient = mix(vec3<f32>(0.22, 0.20, 0.18), vec3<f32>(0.50, 0.60, 0.75), n.y * 0.5 + 0.5) * 0.35;
     let light = globals.light_color.rgb * shadow;
-    let rgb = in.color.rgb * (ambient + light * n_dot_l) + light * specular;
-    return vec4<f32>(rgb, in.color.a);
+    let rgb = base.rgb * (ambient + light * n_dot_l) + light * specular;
+    return vec4<f32>(rgb, base.a);
 }

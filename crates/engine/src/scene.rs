@@ -270,12 +270,13 @@ pub fn hull_mesh(hull: &ConvexHull) -> MeshData {
         indices: Vec::new(),
     };
     for face in hull.faces() {
-        let base = mesh.vertices.len() as u16;
+        let base = mesh.vertices.len() as u32;
         mesh.vertices.extend(face.vertices.iter().map(|&v| Vertex {
             position: hull.vertices()[v].to_array(),
             normal: face.normal.to_array(),
+            uv: [0.0; 2],
         }));
-        for k in 1..face.vertices.len() as u16 - 1 {
+        for k in 1..face.vertices.len() as u32 - 1 {
             mesh.indices.extend([base, base + k, base + k + 1]);
         }
     }

@@ -27,8 +27,8 @@ const LIGHT_COLOR: [f32; 4] = [1.0, 0.96, 0.9, 1.0];
 /// Half-width of the square the shadow map covers, centered on the origin.
 const SHADOW_EXTENT: f32 = 25.0;
 
-const MESH_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+const MESH_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 10 => Float32x2];
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
     2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
     6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4
@@ -71,6 +71,8 @@ struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Index into `Renderer::textures`.
+    texture: usize,
 }
 
 impl GpuMesh {
@@ -87,6 +89,7 @@ impl GpuMesh {
                 usage: wgpu::BufferUsages::INDEX,
             }),
             index_count: data.indices.len() as u32,
+            texture: 0,
         }
     }
 }
@@ -166,6 +169,11 @@ pub struct Renderer {
     /// Globals only: the shadow pass can't bind the texture it renders into.
     globals_bind_group: wgpu::BindGroup,
     lit_pipeline: wgpu::RenderPipeline,
+    /// Layout and shared sampler for per-material bind groups (group 1).
+    material_bgl: wgpu::BindGroupLayout,
+    material_sampler: wgpu::Sampler,
+    /// Material bind groups; 0 is a 1×1 white texture (untextured meshes).
+    textures: Vec<wgpu::BindGroup>,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
@@ -285,7 +293,42 @@ impl Renderer {
                 immediate_size: 0,
             })
         };
-        let scene_layout = layout("scene", &scene_bgl);
+        let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("material"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene"),
+            bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl)],
+            immediate_size: 0,
+        });
         let globals_layout = layout("globals", &globals_bgl);
 
         let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -414,11 +457,22 @@ impl Renderer {
             .map(|_| GrowableBuffer::new(device, "instances", INITIAL_INSTANCE_BYTES))
             .collect();
 
+        let white = texture_bind_group(
+            gpu,
+            &material_bgl,
+            &material_sampler,
+            1,
+            1,
+            &[&[255, 255, 255, 255]],
+        );
         Self {
             globals,
             scene_bind_group,
             globals_bind_group,
             lit_pipeline,
+            material_bgl,
+            material_sampler,
+            textures: vec![white],
             shadow_pipeline,
             line_pipeline,
             shadow_view,
@@ -505,7 +559,7 @@ impl Renderer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            self.draw_meshes(&mut pass, &groups);
+            self.draw_meshes(&mut pass, &groups, false);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -533,7 +587,7 @@ impl Renderer {
             });
             pass.set_pipeline(&self.lit_pipeline);
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
-            self.draw_meshes(&mut pass, &groups);
+            self.draw_meshes(&mut pass, &groups, true);
 
             if !line_vertices.is_empty() {
                 let bytes = std::mem::size_of_val(line_vertices.as_slice()) as u64;
@@ -580,9 +634,35 @@ impl Renderer {
         }
     }
 
-    /// Uploads a mesh for later instancing (e.g. a convex hull's shape).
+    /// Uploads an RGBA8 sRGB texture with its mip chain (`mips[0]` is
+    /// `width`×`height`, each next level half the size, down to 1×1).
+    pub fn add_texture(&mut self, gpu: &Gpu, width: u32, height: u32, mips: &[&[u8]]) -> TextureId {
+        let group = texture_bind_group(
+            gpu,
+            &self.material_bgl,
+            &self.material_sampler,
+            width,
+            height,
+            mips,
+        );
+        self.textures.push(group);
+        TextureId((self.textures.len() - 1) as u32)
+    }
+
+    /// Uploads an untextured mesh for later instancing (e.g. a convex hull's shape).
     pub fn add_mesh(&mut self, gpu: &Gpu, data: &MeshData) -> MeshId {
-        self.meshes.push(GpuMesh::new(gpu.device(), data));
+        self.add_textured_mesh(gpu, data, TextureId::WHITE)
+    }
+
+    /// Uploads a mesh drawn with `texture` (from [`Renderer::add_texture`]).
+    pub fn add_textured_mesh(&mut self, gpu: &Gpu, data: &MeshData, texture: TextureId) -> MeshId {
+        let mut mesh = GpuMesh::new(gpu.device(), data);
+        mesh.texture = if (texture.0 as usize) < self.textures.len() {
+            texture.0 as usize
+        } else {
+            0
+        };
+        self.meshes.push(mesh);
         self.instances.push(GrowableBuffer::new(
             gpu.device(),
             "instances",
@@ -591,13 +671,22 @@ impl Renderer {
         MeshId((self.meshes.len() - 1) as u32)
     }
 
-    /// Frees every runtime-added mesh (built-ins stay); their ids become invalid.
+    /// Frees every runtime-added mesh and texture (built-ins stay); their ids
+    /// become invalid.
     pub fn clear_custom_meshes(&mut self) {
         self.meshes.truncate(MeshKind::ALL.len());
         self.instances.truncate(MeshKind::ALL.len());
+        self.textures.truncate(1);
     }
 
-    fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, groups: &[Vec<InstanceRaw>]) {
+    /// `with_material`: bind each mesh's texture (the lit pass; the shadow pass
+    /// has no material group).
+    fn draw_meshes(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        groups: &[Vec<InstanceRaw>],
+        with_material: bool,
+    ) {
         for (index, group) in groups.iter().enumerate() {
             let count = group.len() as u32;
             if count == 0 {
@@ -607,10 +696,85 @@ impl Renderer {
             let bytes = count as u64 * size_of::<InstanceRaw>() as u64;
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, self.instances[index].buffer.slice(..bytes));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint16);
+            if with_material {
+                pass.set_bind_group(1, &self.textures[mesh.texture], &[]);
+            }
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..count);
         }
     }
+}
+
+/// A texture handle from [`Renderer::add_texture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextureId(pub u32);
+
+impl TextureId {
+    /// The built-in 1×1 white texture.
+    pub const WHITE: TextureId = TextureId(0);
+}
+
+/// Uploads an sRGB RGBA8 mip chain and binds it with the shared sampler.
+fn texture_bind_group(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+    mips: &[&[u8]],
+) -> wgpu::BindGroup {
+    let device = gpu.device();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("material"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: mips.len().max(1) as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, data) in mips.iter().enumerate() {
+        let (w, h) = ((width >> level).max(1), (height >> level).max(1));
+        gpu.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&Default::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("material"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 /// Orthographic view of the scene from the directional light.
