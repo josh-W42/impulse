@@ -9,6 +9,7 @@ mod box_box;
 mod broadphase;
 mod collider;
 mod contact;
+mod gjk;
 mod solver;
 mod union_find;
 mod world;
