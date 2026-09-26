@@ -39,6 +39,7 @@ const FLOOR_SIZE: f32 = 40.0;
 const FLOOR_COLOR: [f32; 4] = [0.32, 0.33, 0.35, 1.0];
 const WALL_COLOR: [f32; 4] = [0.42, 0.47, 0.55, 1.0];
 const GRID_COLOR: [f32; 4] = [0.12, 0.13, 0.15, 1.0];
+const ROPE_COLOR: [f32; 4] = [0.85, 0.78, 0.60, 1.0];
 const LOW_BOUNCE: [f32; 3] = [0.15, 0.40, 0.80];
 const HIGH_BOUNCE: [f32; 3] = [0.95, 0.55, 0.15];
 const STATIC_MATERIAL: Material = Material {
@@ -81,10 +82,18 @@ pub enum Demo {
     Pyramid,
     /// 1,000 mixed bodies (M5's scale showcase).
     Rain,
+    /// A chain, a rope bridge, and a ragdoll (M7's joints showcase).
+    Joints,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 4] = [Demo::Pit, Demo::Tower, Demo::Pyramid, Demo::Rain];
+    pub const ALL: [Demo; 5] = [
+        Demo::Pit,
+        Demo::Tower,
+        Demo::Pyramid,
+        Demo::Rain,
+        Demo::Joints,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -92,6 +101,7 @@ impl Demo {
             Demo::Tower => "Tower",
             Demo::Pyramid => "Pyramid",
             Demo::Rain => "Rain",
+            Demo::Joints => "Joints",
         }
     }
 
@@ -132,6 +142,7 @@ pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
             objects
         }
         Demo::Rain => rain_bodies(world),
+        Demo::Joints => crate::joint_scene::joint_bodies(world),
     }
 }
 
@@ -521,6 +532,14 @@ pub fn build_draw_list(
             }
         }
     }
+    // Joints whose anchors sit apart (distance joints) are drawn as ropes.
+    for id in world.joints() {
+        if let Some((a, b)) = world.joint_anchors(id)
+            && a.distance(b) > 1e-3
+        {
+            list.push_line(a, b, ROPE_COLOR);
+        }
+    }
     if show_grid {
         let half = FLOOR_SIZE / 2.0;
         let y = 0.01; // just above the floor to avoid z-fighting
@@ -607,6 +626,41 @@ mod tests {
         }
         assert_eq!(Demo::from_name("RAIN"), Some(Demo::Rain));
         assert_eq!(Demo::from_name("nope"), None);
+    }
+
+    #[test]
+    fn joints_scene_holds_together_and_stays_in_the_pit() {
+        use crate::joint_scene::{BALLS, CHAIN_LINKS, PLANKS, RAGDOLL_PARTS};
+        let mut world = World::default();
+        let objects = build(&mut world, Demo::Joints);
+        let posts = 3;
+        assert_eq!(
+            objects.len(),
+            posts + CHAIN_LINKS + PLANKS + BALLS + RAGDOLL_PARTS
+        );
+        let gaps = |w: &World| -> Vec<f32> {
+            w.joints()
+                .map(|j| {
+                    let (a, b) = w.joint_anchors(j).unwrap();
+                    a.distance(b)
+                })
+                .collect()
+        };
+        let before = gaps(&world);
+        for _ in 0..(6.0 * 60.0) as u32 {
+            world.step(1.0 / 60.0);
+        }
+        for (start, end) in before.iter().zip(gaps(&world)) {
+            assert!((end - start).abs() < 0.03, "joint gap {start} -> {end}");
+        }
+        for o in &objects {
+            let p = world.body(o.handle).unwrap().position();
+            assert!(
+                p.is_finite() && p.y > 0.0 && p.x.abs() < PIT && p.z.abs() < PIT,
+                "{p}"
+            );
+        }
+        assert_eq!(Demo::from_name("joints"), Some(Demo::Joints));
     }
 
     #[test]

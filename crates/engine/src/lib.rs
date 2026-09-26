@@ -10,6 +10,7 @@ mod app;
 mod camera;
 mod egui_input;
 mod input;
+mod joint_scene;
 mod pose;
 mod running;
 mod scene;
