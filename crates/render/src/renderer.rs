@@ -174,6 +174,9 @@ pub struct Renderer {
     material_sampler: wgpu::Sampler,
     /// Material bind groups; 0 is a 1×1 white texture (untextured meshes).
     textures: Vec<wgpu::BindGroup>,
+    /// Meshes/textures below these counts survive `clear_custom_meshes`.
+    pinned_meshes: usize,
+    pinned_textures: usize,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
@@ -473,6 +476,8 @@ impl Renderer {
             material_bgl,
             material_sampler,
             textures: vec![white],
+            pinned_meshes: MeshKind::ALL.len(),
+            pinned_textures: 1,
             shadow_pipeline,
             line_pipeline,
             shadow_view,
@@ -671,12 +676,27 @@ impl Renderer {
         MeshId((self.meshes.len() - 1) as u32)
     }
 
-    /// Frees every runtime-added mesh and texture (built-ins stay); their ids
-    /// become invalid.
+    /// Frees runtime-added meshes and textures added since the last
+    /// [`Renderer::pin_custom_meshes`] (built-ins and pinned ones stay); their
+    /// ids become invalid.
     pub fn clear_custom_meshes(&mut self) {
-        self.meshes.truncate(MeshKind::ALL.len());
-        self.instances.truncate(MeshKind::ALL.len());
-        self.textures.truncate(1);
+        self.meshes.truncate(self.pinned_meshes);
+        self.instances.truncate(self.pinned_meshes);
+        self.textures.truncate(self.pinned_textures);
+    }
+
+    /// Keeps everything uploaded so far (e.g. model meshes) through later
+    /// `clear_custom_meshes` calls.
+    pub fn pin_custom_meshes(&mut self) {
+        self.pinned_meshes = self.meshes.len();
+        self.pinned_textures = self.textures.len();
+    }
+
+    /// Frees every runtime-added mesh and texture, pinned or not.
+    pub fn reset_custom_meshes(&mut self) {
+        self.pinned_meshes = MeshKind::ALL.len();
+        self.pinned_textures = 1;
+        self.clear_custom_meshes();
     }
 
     /// `with_material`: bind each mesh's texture (the lit pass; the shadow pass

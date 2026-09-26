@@ -15,6 +15,7 @@ use crate::editor::Editor;
 use crate::editor_ui::{self, InspectorAction, NewShape};
 use crate::egui_input::EguiInput;
 use crate::input::InputState;
+use crate::models::{self, ModelMeshes, ModelRegistry};
 use crate::platform;
 use crate::scene::{self, Demo, SceneObject};
 use crate::scene_desc;
@@ -71,13 +72,16 @@ enum Action {
     Undo,
     Redo,
     Add(NewShape),
+    AddModel(crate::models::ModelId),
+    /// Desktop: a `.glb` from the `models/` folder.
+    ImportFile(usize),
     LoadDemo(Demo),
     Inspector(InspectorAction),
     Save,
     /// Desktop: a scene from the `scenes/` folder.
     LoadSaved(usize),
     /// Browser: open the file picker.
-    Open,
+    Open(platform::PickKind),
 }
 
 /// Panel-controlled settings plus one-shot requests the panel raises.
@@ -92,6 +96,9 @@ struct Settings {
     file_name: String,
     /// Desktop: saved scenes, refreshed when the load list opens.
     saved: Vec<String>,
+    /// Desktop: `.glb` files in `models/`, refreshed when the import list opens.
+    model_files: Vec<String>,
+    show_colliders: bool,
     warm_starting: bool,
     iterations: usize,
     sleeping: bool,
@@ -138,6 +145,9 @@ pub struct Running {
     modifiers: ModifiersState,
     /// Objects-list filter text.
     list_filter: String,
+    /// Bundled and imported models, and their render meshes.
+    models: ModelRegistry,
+    model_meshes: ModelMeshes,
     /// The selection the objects list last showed (it follows viewport picks).
     listed: Option<usize>,
 }
@@ -149,7 +159,9 @@ impl Running {
             .and_then(|name| Demo::from_name(&name))
             .unwrap_or(Demo::Pit);
         let desc = scene::demo_desc(initial);
-        let objects = scene_desc::rebuild(&mut world, &desc).expect("demo scenes are valid");
+        let models = ModelRegistry::bundled();
+        let objects =
+            scene_desc::rebuild(&mut world, &desc, &models).expect("demo scenes are valid");
         let now = Instant::now();
         Self {
             renderer: Renderer::new(&gpu),
@@ -178,6 +190,8 @@ impl Running {
                 reset_requested: false,
                 file_name: initial.label().to_string(),
                 saved: Vec::new(),
+                model_files: Vec::new(),
+                show_colliders: false,
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
                 sleeping: SolverSettings::default().sleeping,
@@ -196,14 +210,25 @@ impl Running {
             message: None,
             modifiers: ModifiersState::empty(),
             list_filter: String::new(),
+            models,
+            model_meshes: ModelMeshes::new(),
             listed: None,
         }
         .with_hull_meshes()
     }
 
     fn with_hull_meshes(mut self) -> Self {
-        self.sync_hull_meshes();
+        self.upload_models();
         self
+    }
+
+    /// (Re-)uploads every model's meshes and textures, pinned so scene
+    /// rebuilds keep them, then the current scene's hull meshes.
+    fn upload_models(&mut self) {
+        self.renderer.reset_custom_meshes();
+        self.model_meshes = models::upload_models(&mut self.renderer, &self.gpu, &self.models);
+        self.renderer.pin_custom_meshes();
+        self.sync_hull_meshes();
     }
 
     /// Re-registers a render mesh for every hull shape in the (rebuilt) world.
@@ -483,7 +508,7 @@ impl Running {
     /// Rebuilds the world from the authored scene (keeping the old world and
     /// reporting why if the scene is invalid).
     fn rebuild_scene(&mut self) {
-        match scene_desc::rebuild(&mut self.world, self.editor.desc()) {
+        match scene_desc::rebuild(&mut self.world, self.editor.desc(), &self.models) {
             Ok(objects) => {
                 self.objects = objects;
                 self.sync_hull_meshes();
@@ -570,7 +595,30 @@ impl Running {
                     Err(e) => self.message = Some(e),
                 }
             }
-            Action::Open => platform::pick_scene_file(),
+            Action::Open(kind) => platform::pick_file(kind),
+            Action::AddModel(id) => {
+                let target = self.camera.orbit.target;
+                let above = Vec3::new(target.x, 100.0, target.z);
+                let floor = self
+                    .world
+                    .raycast(above, Vec3::NEG_Y, 200.0)
+                    .map_or(0.0, |hit| hit.point.y);
+                let index = self.editor.desc().objects.len();
+                if let Some(object) =
+                    editor_ui::new_model_object(&self.models, id, target, floor, index)
+                {
+                    self.editor.add(object);
+                }
+            }
+            Action::ImportFile(index) => {
+                let Some(stem) = self.settings.model_files.get(index).cloned() else {
+                    return;
+                };
+                match platform::read_model(&stem) {
+                    Ok(bytes) => self.import_model(&format!("{stem}.glb"), &bytes),
+                    Err(e) => self.message = Some(e),
+                }
+            }
             Action::Inspector(InspectorAction::Duplicate) => {
                 self.editor.duplicate_selected();
             }
@@ -580,11 +628,29 @@ impl Running {
         }
     }
 
+    /// Adds a model to the registry and uploads it; scenes using that name are
+    /// rebuilt with the new mesh.
+    fn import_model(&mut self, file_name: &str, bytes: &[u8]) {
+        match self.models.import(file_name, bytes) {
+            Ok((_, name)) => {
+                self.upload_models();
+                let used = self.editor.desc().objects.iter().any(|o| {
+                    matches!(&o.shape, Some(scene_desc::ShapeDesc::Model { name: n, .. }) if *n == name)
+                });
+                if used {
+                    self.rebuild_scene();
+                }
+                self.message = Some(format!("imported '{name}' (add it from Model…)"));
+            }
+            Err(e) => self.message = Some(format!("{file_name}: {e}")),
+        }
+    }
+
     /// Replaces the authored scene with a scene file's contents, if it parses
     /// and builds; otherwise reports why and keeps the current scene.
     fn load_scene_text(&mut self, source: &str, text: &str) {
         let checked = scene_desc::from_ron(text)
-            .and_then(|desc| scene_desc::build_world(&desc).map(|_| desc));
+            .and_then(|desc| scene_desc::build_world(&desc, &self.models).map(|_| desc));
         match checked {
             Ok(desc) => {
                 self.settings.file_name = desc.name.clone();
@@ -742,8 +808,14 @@ impl Running {
             self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.egui_is_using_pointer();
         self.update_camera(dt, egui_has_pointer);
         self.update_edit_drag();
-        match platform::take_picked_scene() {
-            Some(Ok((name, text))) => self.load_scene_text(&name, &text),
+        match platform::take_picked() {
+            Some(Ok(picked)) => match picked.kind {
+                platform::PickKind::Scene => match String::from_utf8(picked.bytes) {
+                    Ok(text) => self.load_scene_text(&picked.name, &text),
+                    Err(_) => self.message = Some(format!("{} is not text", picked.name)),
+                },
+                platform::PickKind::Model => self.import_model(&picked.name, &picked.bytes),
+            },
             Some(Err(e)) => self.message = Some(e),
             None => {}
         }
@@ -758,12 +830,14 @@ impl Running {
             &self.world,
             &self.objects,
             &self.hull_meshes,
+            &self.model_meshes,
             scene::DrawOptions {
                 arena: self.editor.desc().arena,
                 selected: match self.mode {
                     Mode::Edit => self.editor.selected(),
                     Mode::Play => None,
                 },
+                show_colliders: self.settings.show_colliders,
                 alpha: self.alpha,
                 show_grid: self.settings.show_grid,
                 show_axes: self.settings.show_axes,
@@ -795,6 +869,11 @@ impl Running {
             can_undo: self.editor.can_undo(),
             can_redo: self.editor.can_redo(),
             message: self.message.clone(),
+            models: self
+                .models
+                .list()
+                .map(|(id, name, _)| (id, name.to_string()))
+                .collect(),
         };
         let mut actions = Vec::new();
         let follow = self.editor.selected() != self.listed;
@@ -808,7 +887,8 @@ impl Running {
             panel(ui, settings, &stats, &mut actions);
             if mode == Mode::Edit {
                 editor_ui::outliner(ui.ctx(), editor, filter, follow);
-                if let Some(action) = editor_ui::inspector(ui.ctx(), editor) {
+                let names: Vec<&str> = stats.models.iter().map(|(_, n)| n.as_str()).collect();
+                if let Some(action) = editor_ui::inspector(ui.ctx(), editor, &names) {
                     actions.push(Action::Inspector(action));
                 }
             }
@@ -863,6 +943,8 @@ struct Stats {
     can_undo: bool,
     can_redo: bool,
     message: Option<String>,
+    /// Every model's id and name, for the Model… picker.
+    models: Vec<(crate::models::ModelId, String)>,
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<Action>) {
@@ -905,6 +987,34 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                             actions.push(Action::Add(shape));
                         }
                     }
+                    egui::ComboBox::from_id_salt("add model")
+                        .selected_text("Model…")
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &stats.models {
+                                if ui.selectable_label(false, name).clicked() {
+                                    actions.push(Action::AddModel(*id));
+                                }
+                            }
+                        });
+                    if platform::HAS_SCENE_FOLDER {
+                        let list = egui::ComboBox::from_id_salt("import model")
+                            .selected_text("Import…")
+                            .show_ui(ui, |ui| {
+                                if s.model_files.is_empty() {
+                                    ui.label("put .glb files in models/");
+                                }
+                                for (i, name) in s.model_files.iter().enumerate() {
+                                    if ui.selectable_label(false, name).clicked() {
+                                        actions.push(Action::ImportFile(i));
+                                    }
+                                }
+                            });
+                        if list.response.clicked() {
+                            s.model_files = platform::model_files();
+                        }
+                    } else if ui.button("Import…").clicked() {
+                        actions.push(Action::Open(platform::PickKind::Model));
+                    }
                 });
             }
             ui.horizontal(|ui| {
@@ -941,7 +1051,7 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                         s.saved = platform::saved_scenes();
                     }
                 } else if ui.button("Open…").clicked() {
-                    actions.push(Action::Open);
+                    actions.push(Action::Open(platform::PickKind::Scene));
                 }
             });
             if let Some(message) = &stats.message {
@@ -993,6 +1103,7 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             ui.separator();
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");
+            ui.checkbox(&mut s.show_colliders, "model colliders");
             ui.label(match (stats.camera, stats.mode) {
                 (CameraMode::Orbit, Mode::Play) => {
                     "Drag a body: grab / throw · drag empty space: orbit · right-drag: pan · wheel: zoom · F: fly"

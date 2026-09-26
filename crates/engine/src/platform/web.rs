@@ -57,8 +57,8 @@ pub fn scene_override() -> Option<String> {
 pub const HAS_SCENE_FOLDER: bool = false;
 
 thread_local! {
-    /// A scene file the picker delivered: (file name, contents) or an error.
-    static PICKED: RefCell<Option<Result<(String, String), String>>> = const { RefCell::new(None) };
+    /// A file the picker delivered, or why it couldn't be read.
+    static PICKED: RefCell<Option<Result<super::Picked, String>>> = const { RefCell::new(None) };
 }
 
 /// Downloads `text` as `<stem>.ron`.
@@ -99,9 +99,18 @@ pub fn read_scene(_stem: &str) -> Result<String, String> {
     Err("use Open… to load a scene file in the browser".into())
 }
 
+/// The browser has no models folder to list.
+pub fn model_files() -> Vec<String> {
+    Vec::new()
+}
+
+pub fn read_model(_stem: &str) -> Result<Vec<u8>, String> {
+    Err("use Import… to load a model in the browser".into())
+}
+
 /// Opens the browser's file picker; the chosen file arrives later through
-/// [`take_picked_scene`].
-pub fn pick_scene_file() {
+/// [`take_picked`].
+pub fn pick_file(kind: super::PickKind) {
     let Some(doc) = document() else {
         return;
     };
@@ -112,21 +121,28 @@ pub fn pick_scene_file() {
         return;
     };
     input.set_type("file");
-    input.set_accept(".ron,text/plain");
+    input.set_accept(match kind {
+        super::PickKind::Scene => ".ron,text/plain",
+        super::PickKind::Model => ".glb,model/gltf-binary",
+    });
     let picker = input.clone();
     let on_change = Closure::once_into_js(move || {
         let Some(file) = picker.files().and_then(|files| files.get(0)) else {
             return;
         };
-        if file.size() > crate::scene_desc::MAX_SCENE_BYTES as f64 {
+        if file.size() > super::MAX_FILE_BYTES as f64 {
             deliver(Err(format!("{} is too large", file.name())));
             return;
         }
         wasm_bindgen_futures::spawn_local(async move {
-            let text = wasm_bindgen_futures::JsFuture::from(file.text()).await;
-            deliver(match text.ok().and_then(|t| t.as_string()) {
-                Some(text) => Ok((file.name(), text)),
-                None => Err(format!("couldn't read {}", file.name())),
+            let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await;
+            deliver(match buffer {
+                Ok(buffer) => Ok(super::Picked {
+                    kind,
+                    name: file.name(),
+                    bytes: js_sys::Uint8Array::new(&buffer).to_vec(),
+                }),
+                Err(_) => Err(format!("couldn't read {}", file.name())),
             });
         });
     });
@@ -134,12 +150,12 @@ pub fn pick_scene_file() {
     input.click();
 }
 
-fn deliver(result: Result<(String, String), String>) {
+fn deliver(result: Result<super::Picked, String>) {
     PICKED.with(|picked| *picked.borrow_mut() = Some(result));
 }
 
 /// The file the picker delivered since the last call, if any.
-pub fn take_picked_scene() -> Option<Result<(String, String), String>> {
+pub fn take_picked() -> Option<Result<super::Picked, String>> {
     PICKED.with(|picked| picked.borrow_mut().take())
 }
 

@@ -1011,6 +1011,7 @@ dependencies = [
  "egui",
  "env_logger",
  "glam",
+ "impulse-assets",
  "impulse-physics",
  "impulse-render",
  "js-sys",

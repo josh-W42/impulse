@@ -13,6 +13,7 @@ glam.workspace = true
 egui.workspace = true
 web-time.workspace = true
 impulse-physics.workspace = true
+impulse-assets.workspace = true
 serde.workspace = true
 ron.workspace = true
 

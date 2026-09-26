@@ -10,6 +10,7 @@ use impulse_physics::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::models::{ModelRegistry, model_collider};
 use crate::pose::Pose;
 use crate::scene::{STATIC_MATERIAL, SceneObject, pit_planes};
 
@@ -106,6 +107,27 @@ pub enum ShapeDesc {
     Hull {
         points: Vec<[f32; 3]>,
     },
+    /// A model from the registry (bundled or imported), uniformly scaled,
+    /// colliding as a convex shape derived from its mesh.
+    Model {
+        name: String,
+        scale: f32,
+        #[serde(default)]
+        collider: ModelCollider,
+    },
+}
+
+/// How a model collides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ModelCollider {
+    /// Convex hull of the mesh's extreme points.
+    #[default]
+    Hull,
+    /// Fitted to the mesh bounds.
+    Box,
+    Sphere,
+    /// Y-aligned.
+    Capsule,
 }
 
 impl ShapeDesc {
@@ -229,10 +251,14 @@ pub enum SceneError {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ObjectError {
     Body(BodyError),
     Hull(HullError),
+    /// The named model isn't in the registry (not bundled, not imported).
+    MissingModel(String),
+    /// Model scale must be finite and positive.
+    InvalidScale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -256,6 +282,10 @@ impl fmt::Display for SceneError {
                 match error {
                     ObjectError::Body(e) => write!(f, "{e}"),
                     ObjectError::Hull(e) => write!(f, "{e}"),
+                    ObjectError::MissingModel(model) => {
+                        write!(f, "model '{model}' isn't loaded; import it first")
+                    }
+                    ObjectError::InvalidScale => write!(f, "scale must be positive"),
                 }
             }
             Self::Joint { index, error } => {
@@ -316,22 +346,33 @@ fn vec3(v: [f32; 3]) -> Vec3 {
 
 /// Builds a fresh world from `desc`. `objects[i]` draws `desc.objects[i]`
 /// (anchors included, though they have nothing to draw).
-pub fn build_world(desc: &SceneDesc) -> Result<(World, Vec<SceneObject>), SceneError> {
+pub fn build_world(
+    desc: &SceneDesc,
+    models: &ModelRegistry,
+) -> Result<(World, Vec<SceneObject>), SceneError> {
     let mut world = World::default();
-    let objects = populate(&mut world, desc)?;
+    let objects = populate(&mut world, desc, models)?;
     Ok((world, objects))
 }
 
 /// Replaces `world`'s contents with `desc`, keeping its settings; every old
 /// handle goes stale. On error `world` is untouched (validated off to the side).
-pub fn rebuild(world: &mut World, desc: &SceneDesc) -> Result<Vec<SceneObject>, SceneError> {
-    build_world(desc)?;
+pub fn rebuild(
+    world: &mut World,
+    desc: &SceneDesc,
+    models: &ModelRegistry,
+) -> Result<Vec<SceneObject>, SceneError> {
+    build_world(desc, models)?;
     world.clear();
-    Ok(populate(world, desc).expect("validated above"))
+    Ok(populate(world, desc, models).expect("validated above"))
 }
 
 /// Adds `desc` to an empty `world`.
-fn populate(world: &mut World, desc: &SceneDesc) -> Result<Vec<SceneObject>, SceneError> {
+fn populate(
+    world: &mut World,
+    desc: &SceneDesc,
+    models: &ModelRegistry,
+) -> Result<Vec<SceneObject>, SceneError> {
     add_arena(world, desc.arena)?;
     let mut objects = Vec::with_capacity(desc.objects.len());
     for (index, object) in desc.objects.iter().enumerate() {
@@ -340,6 +381,7 @@ fn populate(world: &mut World, desc: &SceneDesc) -> Result<Vec<SceneObject>, Sce
             name: object.name.clone(),
             error,
         };
+        let mut model = None;
         let collider = match &object.shape {
             None => None,
             Some(ShapeDesc::Sphere { radius }) => Some(Collider::Sphere { radius: *radius }),
@@ -359,6 +401,19 @@ fn populate(world: &mut World, desc: &SceneDesc) -> Result<Vec<SceneObject>, Sce
                     .add_hull(&points)
                     .map_err(|e| fail(ObjectError::Hull(e)))?;
                 Some(Collider::Hull { hull })
+            }
+            Some(ShapeDesc::Model {
+                name,
+                scale,
+                collider,
+            }) => {
+                let missing = || fail(ObjectError::MissingModel(name.clone()));
+                let id = models.id(name).ok_or_else(missing)?;
+                let asset = models.get(id).ok_or_else(missing)?;
+                let (shape, visual) =
+                    model_collider(id, asset, *scale, *collider, world).map_err(fail)?;
+                model = Some(visual);
+                Some(shape)
             }
         };
         let position = vec3(object.position);
@@ -391,6 +446,7 @@ fn populate(world: &mut World, desc: &SceneDesc) -> Result<Vec<SceneObject>, Sce
                 position,
                 orientation,
             },
+            model,
         });
     }
     for (index, joint) in desc.joints.iter().enumerate() {
@@ -453,6 +509,7 @@ fn add_arena(world: &mut World, arena: Arena) -> Result<(), SceneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ModelRegistry;
 
     fn object(shape: Option<ShapeDesc>, position: [f32; 3], body: BodyType) -> ObjectDesc {
         ObjectDesc {
@@ -545,7 +602,7 @@ mod tests {
     #[test]
     fn builds_every_shape_body_and_joint_kind() {
         let desc = sampler();
-        let (world, objects) = build_world(&desc).unwrap();
+        let (world, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
         assert_eq!(objects.len(), desc.objects.len());
         assert_eq!(world.len(), 5 + desc.objects.len(), "pit planes + objects");
         assert_eq!(world.joints().count(), 3);
@@ -560,12 +617,12 @@ mod tests {
 
     #[test]
     fn failed_rebuild_leaves_the_world_alone_and_success_stales_handles() {
-        let (mut world, objects) = build_world(&sampler()).unwrap();
+        let (mut world, objects) = build_world(&sampler(), &ModelRegistry::default()).unwrap();
         let mut bad = sampler();
         bad.objects[1].body = BodyType::Dynamic { mass: 0.0 };
-        assert!(rebuild(&mut world, &bad).is_err());
+        assert!(rebuild(&mut world, &bad, &ModelRegistry::default()).is_err());
         assert!(objects.iter().all(|o| world.body(o.handle).is_some()));
-        rebuild(&mut world, &sampler()).unwrap();
+        rebuild(&mut world, &sampler(), &ModelRegistry::default()).unwrap();
         assert!(objects.iter().all(|o| world.body(o.handle).is_none()));
     }
 
@@ -592,8 +649,8 @@ mod tests {
                 })
                 .collect()
         };
-        let (fresh, _) = build_world(&desc).unwrap();
-        let (mut world, _) = build_world(&desc).unwrap();
+        let (fresh, _) = build_world(&desc, &ModelRegistry::default()).unwrap();
+        let (mut world, _) = build_world(&desc, &ModelRegistry::default()).unwrap();
         for _ in 0..120 {
             world.step(1.0 / 60.0);
         }
@@ -602,7 +659,7 @@ mod tests {
             state(&fresh),
             "the simulation should move things"
         );
-        rebuild(&mut world, &desc).unwrap();
+        rebuild(&mut world, &desc, &ModelRegistry::default()).unwrap();
         assert_eq!(state(&world), state(&fresh));
     }
 
@@ -620,6 +677,58 @@ mod tests {
     fn oversized_files_are_refused_before_parsing() {
         let huge = " ".repeat(MAX_SCENE_BYTES + 1);
         assert!(matches!(from_ron(&huge), Err(SceneError::Parse(_))));
+    }
+
+    #[test]
+    fn model_objects_round_trip_and_build_from_the_registry() {
+        let mut desc = sampler();
+        desc.objects.push(ObjectDesc {
+            name: "barrel".into(),
+            shape: Some(ShapeDesc::Model {
+                name: "barrel".into(),
+                scale: 1.5,
+                collider: ModelCollider::Hull,
+            }),
+            position: [0.0, 2.0, -2.0],
+            ..ObjectDesc::default()
+        });
+        assert_eq!(from_ron(&to_ron(&desc)).unwrap(), desc);
+        let (world, objects) = build_world(&desc, &ModelRegistry::bundled()).unwrap();
+        let barrel = objects.last().unwrap();
+        assert!(barrel.model.is_some());
+        let body = world.body(barrel.handle).unwrap();
+        assert!(matches!(body.collider(), Some(Collider::Hull { .. })));
+        assert_eq!(body.position(), Vec3::new(0.0, 2.0, -2.0));
+
+        // Not in this registry: a specific error naming the model.
+        let err = build_world(&desc, &ModelRegistry::default()).unwrap_err();
+        assert_eq!(
+            err,
+            SceneError::Object {
+                index: desc.objects.len() - 1,
+                name: "barrel".into(),
+                error: ObjectError::MissingModel("barrel".into()),
+            }
+        );
+        assert!(err.to_string().contains("import it first"), "{err}");
+    }
+
+    #[test]
+    fn hand_written_model_objects_default_to_hull_colliders() {
+        let text = r#"(
+            version: 1,
+            name: "one barrel",
+            arena: Floor,
+            objects: [(shape: Some(Model(name: "barrel", scale: 1.0)), position: (0.0, 1.0, 0.0))],
+        )"#;
+        let desc = from_ron(text).unwrap();
+        assert!(matches!(
+            desc.objects[0].shape,
+            Some(ShapeDesc::Model {
+                collider: ModelCollider::Hull,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -642,7 +751,7 @@ mod tests {
         let desc = from_ron(text).unwrap();
         assert!(desc.joints.is_empty());
         assert_eq!(desc.objects[0].body, BodyType::Dynamic { mass: 1.0 });
-        let (world, _) = build_world(&desc).unwrap();
+        let (world, _) = build_world(&desc, &ModelRegistry::default()).unwrap();
         assert_eq!(world.len(), 2, "floor + sphere");
     }
 
@@ -675,7 +784,7 @@ mod tests {
         let err = |edit: fn(&mut SceneDesc)| {
             let mut desc = sampler();
             edit(&mut desc);
-            build_world(&desc).expect_err("scene should be rejected")
+            build_world(&desc, &ModelRegistry::default()).expect_err("scene should be rejected")
         };
         assert_eq!(
             err(|d| d.objects[2].body = BodyType::Dynamic { mass: -1.0 }),

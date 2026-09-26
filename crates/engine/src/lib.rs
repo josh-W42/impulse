@@ -13,6 +13,7 @@ mod editor_ui;
 mod egui_input;
 mod input;
 mod joint_scene;
+mod models;
 mod pose;
 mod running;
 mod scene;
