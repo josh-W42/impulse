@@ -37,25 +37,45 @@ pub fn scene_override() -> Option<String> {
 pub const HAS_SCENE_FOLDER: bool = true;
 /// Saved scenes live here, relative to the working directory.
 const SCENE_DIR: &str = "scenes";
+/// Models to import live here (`.glb`).
+const MODEL_DIR: &str = "models";
 
 /// Writes `scenes/<stem>.ron`; returns the path for the status line.
 pub fn save_scene(stem: &str, text: &str) -> Result<String, String> {
     save_scene_in(Path::new(SCENE_DIR), stem, text)
 }
 
-/// Stems of the `.ron` files in `scenes/`, sorted.
+/// Names of the `.ron` files in `scenes/`, sorted.
 pub fn saved_scenes() -> Vec<String> {
-    saved_scenes_in(Path::new(SCENE_DIR))
+    list_in(Path::new(SCENE_DIR), "ron")
 }
 
-pub fn read_scene(stem: &str) -> Result<String, String> {
-    read_scene_in(Path::new(SCENE_DIR), stem)
+/// Reads a file name from [`saved_scenes`].
+pub fn read_scene(file_name: &str) -> Result<String, String> {
+    let bytes = read_in(Path::new(SCENE_DIR), file_name)?;
+    String::from_utf8(bytes).map_err(|_| format!("{file_name} is not text"))
+}
+
+/// Names of the `.glb` files in `models/`, sorted.
+pub fn model_files() -> Vec<String> {
+    list_in(Path::new(MODEL_DIR), "glb")
+}
+
+/// Reads a file name from [`model_files`].
+pub fn read_model(file_name: &str) -> Result<Vec<u8>, String> {
+    read_in(Path::new(MODEL_DIR), file_name)
+}
+
+/// Where `models/` resolves to (it is relative to the working directory).
+pub fn model_folder() -> String {
+    std::path::absolute(MODEL_DIR)
+        .map_or_else(|_| MODEL_DIR.to_string(), |p| p.display().to_string())
 }
 
 /// The browser's file picker; nothing to do on desktop.
-pub fn pick_scene_file() {}
+pub fn pick_file(_kind: super::PickKind) {}
 
-pub fn take_picked_scene() -> Option<Result<(String, String), String>> {
+pub fn take_picked() -> Option<Result<super::Picked, String>> {
     None
 }
 
@@ -66,29 +86,39 @@ fn save_scene_in(dir: &Path, stem: &str, text: &str) -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
-fn saved_scenes_in(dir: &Path) -> Vec<String> {
+/// File names in `dir` with `extension`, ignoring case (`.GLB` counts).
+fn list_in(dir: &Path, extension: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut stems: Vec<String> = entries
+    let mut names: Vec<String> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "ron"))
-        .filter_map(|p| p.file_stem()?.to_str().map(str::to_owned))
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case(extension))
+        })
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
         .collect();
-    stems.sort();
-    stems
+    names.sort();
+    names
 }
 
-fn read_scene_in(dir: &Path, stem: &str) -> Result<String, String> {
-    let path = dir.join(format!("{stem}.ron"));
+/// Reads `file_name` (a bare name, as listed) from `dir`.
+fn read_in(dir: &Path, file_name: &str) -> Result<Vec<u8>, String> {
+    if Path::new(file_name).file_name().and_then(|n| n.to_str()) != Some(file_name) {
+        return Err(format!("not a plain file name: {file_name}"));
+    }
+    let path = dir.join(file_name);
     let size = std::fs::metadata(&path)
         .map_err(|e| format!("can't read {}: {e}", path.display()))?
         .len();
-    if size > crate::scene_desc::MAX_SCENE_BYTES as u64 {
+    if size > super::MAX_FILE_BYTES as u64 {
         return Err(format!("{} is too large", path.display()));
     }
-    std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))
+    std::fs::read(&path).map_err(|e| format!("can't read {}: {e}", path.display()))
 }
 
 pub fn report_status(message: &str) {
@@ -108,15 +138,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("impulse-scenes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            saved_scenes_in(&dir).is_empty(),
+            list_in(&dir, "ron").is_empty(),
             "missing folder lists nothing"
         );
         save_scene_in(&dir, "b_scene", "(b)").unwrap();
         save_scene_in(&dir, "a_scene", "(a)").unwrap();
         std::fs::write(dir.join("notes.txt"), "not a scene").unwrap();
-        assert_eq!(saved_scenes_in(&dir), ["a_scene", "b_scene"]);
-        assert_eq!(read_scene_in(&dir, "b_scene").unwrap(), "(b)");
-        assert!(read_scene_in(&dir, "missing").is_err());
+        std::fs::write(dir.join("Shouty.RON"), "(s)").unwrap();
+        assert_eq!(
+            list_in(&dir, "ron"),
+            ["Shouty.RON", "a_scene.ron", "b_scene.ron"],
+            "extensions match ignoring case"
+        );
+        assert_eq!(list_in(&dir, "txt"), ["notes.txt"]);
+        assert_eq!(read_in(&dir, "b_scene.ron").unwrap(), b"(b)");
+        assert_eq!(read_in(&dir, "Shouty.RON").unwrap(), b"(s)");
+        assert!(read_in(&dir, "missing.ron").is_err());
+        assert!(
+            read_in(&dir, "../b_scene.ron").is_err(),
+            "names only, no paths"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

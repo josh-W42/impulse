@@ -9,6 +9,8 @@ use glam::Vec3;
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    /// Texture coordinates (zero on built-in meshes, which are untextured).
+    pub uv: [f32; 2],
 }
 
 /// Identifies a mesh the renderer can draw: a built-in [`MeshKind`] or one
@@ -56,19 +58,20 @@ impl MeshKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
 }
 
 fn vertex(position: Vec3, normal: Vec3) -> Vertex {
     Vertex {
         position: position.to_array(),
         normal: normal.to_array(),
+        uv: [0.0; 2],
     }
 }
 
 /// Adds one quad; corners must be counter-clockwise seen from the `normal` side.
 fn push_quad(mesh: &mut MeshData, corners: [Vec3; 4], normal: Vec3) {
-    let base = mesh.vertices.len() as u16;
+    let base = mesh.vertices.len() as u32;
     mesh.vertices.extend(corners.map(|c| vertex(c, normal)));
     mesh.indices
         .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -121,7 +124,7 @@ pub fn plane() -> MeshData {
 }
 
 /// Side wall only: the ends are hidden inside a capsule's end spheres.
-pub fn cylinder(segments: u16) -> MeshData {
+pub fn cylinder(segments: u32) -> MeshData {
     assert!(segments >= 3);
     let mut mesh = MeshData {
         vertices: Vec::new(),
@@ -144,7 +147,7 @@ pub fn cylinder(segments: u16) -> MeshData {
     mesh
 }
 
-pub fn uv_sphere(segments: u16, rings: u16) -> MeshData {
+pub fn uv_sphere(segments: u32, rings: u32) -> MeshData {
     assert!(segments >= 3 && rings >= 2);
     let mut mesh = MeshData {
         vertices: Vec::new(),

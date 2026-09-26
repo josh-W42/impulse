@@ -10,8 +10,11 @@ use impulse_render::{DrawList, MeshData, MeshId, MeshKind, Vertex};
 /// Renderer meshes registered for the hull shapes in the world.
 pub type HullMeshes = HashMap<HullId, MeshId>;
 
+use crate::models::{ModelMeshes, ModelVisual};
 use crate::pose::{Pose, interpolate};
-use crate::scene_desc::{Arena, BodyType, ObjectDesc, SCENE_VERSION, SceneDesc, ShapeDesc};
+use crate::scene_desc::{
+    Arena, BodyType, ModelCollider, ObjectDesc, SCENE_VERSION, SceneDesc, ShapeDesc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneObject {
@@ -19,6 +22,8 @@ pub struct SceneObject {
     pub color: [f32; 4],
     /// Pose before the most recent physics step, for interpolation.
     pub prev: Pose,
+    /// Model objects draw their mesh here instead of their collider.
+    pub model: Option<ModelVisual>,
 }
 
 /// Spheres, boxes, and capsules in turn.
@@ -85,15 +90,18 @@ pub enum Demo {
     Rain,
     /// A chain, a rope bridge, and a ragdoll (M7's joints showcase).
     Joints,
+    /// Bundled glTF models tumbling into the pit (M9's models showcase).
+    Props,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 5] = [
+    pub const ALL: [Demo; 6] = [
         Demo::Pit,
         Demo::Tower,
         Demo::Pyramid,
         Demo::Rain,
         Demo::Joints,
+        Demo::Props,
     ];
 
     pub fn label(self) -> &'static str {
@@ -103,6 +111,7 @@ impl Demo {
             Demo::Pyramid => "Pyramid",
             Demo::Rain => "Rain",
             Demo::Joints => "Joints",
+            Demo::Props => "Props",
         }
     }
 
@@ -145,6 +154,7 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
         }
         Demo::Rain => (rain_objects(), Vec::new()),
         Demo::Joints => crate::joint_scene::joint_objects(),
+        Demo::Props => (props_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
         version: SCENE_VERSION,
@@ -165,12 +175,13 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
 
 /// "box 3", "anchor 0": a readable name for unnamed objects.
 pub fn default_name(object: &ObjectDesc, index: usize) -> String {
-    let kind = match object.shape {
+    let kind = match &object.shape {
         None => "anchor",
         Some(ShapeDesc::Sphere { .. }) => "sphere",
         Some(ShapeDesc::Box { .. }) => "box",
         Some(ShapeDesc::Capsule { .. }) => "capsule",
         Some(ShapeDesc::Hull { .. }) => "gem",
+        Some(ShapeDesc::Model { name, .. }) => name.as_str(),
     };
     format!("{kind} {index}")
 }
@@ -178,7 +189,12 @@ pub fn default_name(object: &ObjectDesc, index: usize) -> String {
 /// Replaces everything in `world` with `demo`, keeping its solver settings.
 #[cfg(test)]
 pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
-    crate::scene_desc::rebuild(world, &demo_desc(demo)).expect("demo scenes are valid")
+    crate::scene_desc::rebuild(
+        world,
+        &demo_desc(demo),
+        &crate::models::ModelRegistry::bundled(),
+    )
+    .expect("demo scenes are valid")
 }
 
 /// A demo object from physics-style values.
@@ -206,6 +222,56 @@ fn demo_object(
     };
     object.set_orientation(orientation);
     object
+}
+
+/// Models dropped into the pit
+/// (all bundled, so the scene always resolves).
+pub const PROPS: [&str; 8] = [
+    "barrel",
+    "box",
+    "box-large",
+    "bucket",
+    "chest",
+    "rock-a",
+    "rock-b",
+    "tree-log",
+];
+pub const PROP_COUNT: usize = 24;
+
+fn props_objects() -> Vec<ObjectDesc> {
+    let registry = crate::models::ModelRegistry::bundled();
+    (0..PROP_COUNT)
+        .map(|i| {
+            let name = PROPS[i % PROPS.len()];
+            let id = registry.id(name).expect("bundled");
+            let scale = crate::models::fitting_scale(registry.get(id).expect("bundled"), 1.2);
+            let position = Vec3::new(
+                (i % 4) as f32 * 2.4 - 3.6,
+                2.0 + (i / 8) as f32 * 1.6 + spread(i, 0.37),
+                ((i / 4) % 2) as f32 * 2.4 - 1.2 + ((i / 8) as f32 - 1.0) * 1.5,
+            );
+            let mut object = ObjectDesc {
+                shape: Some(ShapeDesc::Model {
+                    name: name.to_string(),
+                    scale,
+                    collider: ModelCollider::Hull,
+                }),
+                position: position.to_array(),
+                body: BodyType::Dynamic { mass: 2.0 },
+                color: [1.0; 3],
+                angular_velocity: [
+                    spread(i, 0.31) - 0.5,
+                    spread(i, 0.47) - 0.5,
+                    spread(i, 0.71) - 0.5,
+                ],
+                ..ObjectDesc::default()
+            };
+            object.set_orientation(glam::Quat::from_rotation_y(
+                spread(i, 0.53) * std::f32::consts::TAU,
+            ));
+            object
+        })
+        .collect()
 }
 
 /// Layers of mixed spheres and boxes filling the Rain pit (same recipe as the
@@ -270,12 +336,13 @@ pub fn hull_mesh(hull: &ConvexHull) -> MeshData {
         indices: Vec::new(),
     };
     for face in hull.faces() {
-        let base = mesh.vertices.len() as u16;
+        let base = mesh.vertices.len() as u32;
         mesh.vertices.extend(face.vertices.iter().map(|&v| Vertex {
             position: hull.vertices()[v].to_array(),
             normal: face.normal.to_array(),
+            uv: [0.0; 2],
         }));
-        for k in 1..face.vertices.len() as u16 - 1 {
+        for k in 1..face.vertices.len() as u32 - 1 {
             mesh.indices.extend([base, base + k, base + k + 1]);
         }
     }
@@ -534,8 +601,80 @@ fn local_half_extents(collider: Collider, world: &World) -> Vec3 {
     }
 }
 
+const COLLIDER_COLOR: [f32; 4] = [0.2, 0.95, 0.6, 1.0];
+
+/// A collider's outline: hull edges, a box, or circles for round shapes.
+fn push_collider_wireframe(
+    list: &mut DrawList,
+    world: &World,
+    collider: Collider,
+    transform: Mat4,
+) {
+    let circle = |list: &mut DrawList, center: Vec3, radius: f32, axis: usize| {
+        let point = |k: usize| {
+            let a = k as f32 / 24.0 * std::f32::consts::TAU;
+            let (s, c) = a.sin_cos();
+            let local = match axis {
+                0 => Vec3::new(0.0, c, s),
+                1 => Vec3::new(c, 0.0, s),
+                _ => Vec3::new(c, s, 0.0),
+            };
+            transform.transform_point3(center + local * radius)
+        };
+        for k in 0..24 {
+            list.push_line(point(k), point(k + 1), COLLIDER_COLOR);
+        }
+    };
+    match collider {
+        Collider::Hull { hull } => {
+            let Some(hull) = world.hull(hull) else { return };
+            for face in hull.faces() {
+                let n = face.vertices.len();
+                for k in 0..n {
+                    let a = hull.vertices()[face.vertices[k]];
+                    let b = hull.vertices()[face.vertices[(k + 1) % n]];
+                    list.push_line(
+                        transform.transform_point3(a),
+                        transform.transform_point3(b),
+                        COLLIDER_COLOR,
+                    );
+                }
+            }
+        }
+        Collider::Box { half_extents } => {
+            push_box_outline_colored(list, transform, half_extents, COLLIDER_COLOR);
+        }
+        Collider::Sphere { radius } => {
+            for axis in 0..3 {
+                circle(list, Vec3::ZERO, radius, axis);
+            }
+        }
+        Collider::Capsule {
+            half_height,
+            radius,
+        } => {
+            for y in [-half_height, half_height] {
+                circle(list, Vec3::Y * y, radius, 1);
+            }
+            for (x, z) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                let side = Vec3::new(x, 0.0, z) * radius;
+                list.push_line(
+                    transform.transform_point3(side - Vec3::Y * half_height),
+                    transform.transform_point3(side + Vec3::Y * half_height),
+                    COLLIDER_COLOR,
+                );
+            }
+        }
+        Collider::Plane { .. } => {}
+    }
+}
+
 /// The 12 edges of a box of `half` extents placed by `transform`.
 fn push_box_outline(list: &mut DrawList, transform: Mat4, half: Vec3) {
+    push_box_outline_colored(list, transform, half, OUTLINE_COLOR);
+}
+
+fn push_box_outline_colored(list: &mut DrawList, transform: Mat4, half: Vec3, color: [f32; 4]) {
     let corner = |i: usize| {
         let s = |bit: usize| if i & bit == 0 { -1.0 } else { 1.0 };
         transform.transform_point3(half * Vec3::new(s(1), s(2), s(4)))
@@ -543,7 +682,7 @@ fn push_box_outline(list: &mut DrawList, transform: Mat4, half: Vec3) {
     for i in 0..8 {
         for bit in [1, 2, 4] {
             if i & bit == 0 {
-                list.push_line(corner(i), corner(i | bit), OUTLINE_COLOR);
+                list.push_line(corner(i), corner(i | bit), color);
             }
         }
     }
@@ -556,6 +695,8 @@ pub struct DrawOptions {
     pub arena: Arena,
     /// Object to highlight (edit mode).
     pub selected: Option<usize>,
+    /// Draw model objects' colliders as wireframes over their meshes.
+    pub show_colliders: bool,
     /// Interpolation between the previous and current physics states.
     pub alpha: f32,
     pub show_grid: bool,
@@ -567,11 +708,13 @@ pub fn build_draw_list(
     world: &World,
     objects: &[SceneObject],
     hull_meshes: &HullMeshes,
+    model_meshes: &ModelMeshes,
     options: DrawOptions,
 ) {
     let DrawOptions {
         arena,
         selected,
+        show_colliders,
         alpha,
         show_grid,
         show_axes,
@@ -597,8 +740,20 @@ pub fn build_draw_list(
         } else {
             object.color
         };
-        for (mesh, local) in collider_visual(collider, hull_meshes) {
-            list.push_instance(mesh, body_transform * local, color);
+        match object.model {
+            Some(visual) => {
+                for &mesh in model_meshes.get(&visual.model).into_iter().flatten() {
+                    list.push_instance(mesh, body_transform * visual.transform, color);
+                }
+                if show_colliders {
+                    push_collider_wireframe(list, world, collider, body_transform);
+                }
+            }
+            None => {
+                for (mesh, local) in collider_visual(collider, hull_meshes) {
+                    list.push_instance(mesh, body_transform * local, color);
+                }
+            }
         }
         if selected {
             push_box_outline(list, body_transform, local_half_extents(collider, world));
@@ -761,6 +916,25 @@ mod tests {
     }
 
     #[test]
+    fn props_scene_settles_inside_the_pit() {
+        let mut world = World::default();
+        let objects = build(&mut world, Demo::Props);
+        assert_eq!(objects.len(), PROP_COUNT);
+        assert!(objects.iter().all(|o| o.model.is_some()));
+        for _ in 0..(6.0 * 60.0) as u32 {
+            world.step(1.0 / 60.0);
+        }
+        for o in &objects {
+            let p = world.body(o.handle).unwrap().position();
+            assert!(
+                p.is_finite() && p.y > 0.0 && p.x.abs() < PIT && p.z.abs() < PIT,
+                "{p}"
+            );
+        }
+        assert_eq!(Demo::from_name("props"), Some(Demo::Props));
+    }
+
+    #[test]
     fn stack_scenes_build_the_expected_bodies() {
         let mut world = World::default();
         assert_eq!(build(&mut world, Demo::Tower).len(), TOWER_HEIGHT);
@@ -800,9 +974,11 @@ mod tests {
             &world,
             &objects,
             &HullMeshes::new(),
+            &ModelMeshes::new(),
             DrawOptions {
                 arena: Arena::Pit { half: PIT },
                 selected: None,
+                show_colliders: false,
                 alpha: 0.0,
                 show_grid: true,
                 show_axes: false,

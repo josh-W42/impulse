@@ -6,7 +6,7 @@ use impulse_physics::World;
 
 use crate::editor::Editor;
 use crate::scene::{SceneObject, default_name};
-use crate::scene_desc::{BodyType, JointKindSpec, ObjectDesc, SceneDesc, ShapeDesc};
+use crate::scene_desc::{BodyType, JointKindSpec, ModelCollider, ObjectDesc, SceneDesc, ShapeDesc};
 
 /// Requests from the inspector that the app carries out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,33 @@ pub fn new_object(shape: NewShape, at: Vec3, index: usize) -> ObjectDesc {
     object
 }
 
+/// A new dynamic model object scaled to about 1 m, resting with its bottom at
+/// `floor` (white, so the texture shows its own colours).
+pub fn new_model_object(
+    registry: &crate::models::ModelRegistry,
+    id: crate::models::ModelId,
+    at: Vec3,
+    floor: f32,
+    index: usize,
+) -> Option<ObjectDesc> {
+    let asset = registry.get(id)?;
+    let (_, name, _) = registry.list().find(|(m, _, _)| *m == id)?;
+    let scale = crate::models::fitting_scale(asset, 1.0);
+    let half_height = (asset.data.max.y - asset.data.min.y) / 2.0 * scale;
+    let mut object = ObjectDesc {
+        shape: Some(ShapeDesc::Model {
+            name: name.to_string(),
+            scale,
+            collider: ModelCollider::Hull,
+        }),
+        position: [at.x, floor + half_height + 0.05, at.z],
+        color: [1.0; 3],
+        ..ObjectDesc::default()
+    };
+    object.name = default_name(&object, index);
+    Some(object)
+}
+
 /// The object whose body the ray hits first (arena planes don't count).
 pub fn object_at(
     world: &World,
@@ -95,6 +122,7 @@ enum ShapeKind {
     Box,
     Capsule,
     Gem,
+    Model,
 }
 
 impl ShapeKind {
@@ -105,6 +133,7 @@ impl ShapeKind {
             Some(ShapeDesc::Box { .. }) => Self::Box,
             Some(ShapeDesc::Capsule { .. }) => Self::Capsule,
             Some(ShapeDesc::Hull { .. }) => Self::Gem,
+            Some(ShapeDesc::Model { .. }) => Self::Model,
         }
     }
 
@@ -115,6 +144,7 @@ impl ShapeKind {
             Self::Box => "box",
             Self::Capsule => "capsule",
             Self::Gem => "gem (hull)",
+            Self::Model => "model",
         }
     }
 
@@ -134,6 +164,8 @@ impl ShapeKind {
                 .iter()
                 .map(|p| Vec3::from_array(*p).length())
                 .fold(0.0, f32::max),
+            // The model's size isn't known here; start from a unit-ish shape.
+            Some(ShapeDesc::Model { scale, .. }) => 0.5 * scale,
         }
         .max(0.05);
         match self {
@@ -146,7 +178,7 @@ impl ShapeKind {
                 half_height: size * 0.6,
                 radius: size * 0.4,
             }),
-            Self::Gem => old.clone(),
+            Self::Gem | Self::Model => old.clone(),
         }
     }
 }
@@ -191,6 +223,7 @@ fn kind_tag(shape: &Option<ShapeDesc>) -> &'static str {
         ShapeKind::Box => "box",
         ShapeKind::Capsule => "capsule",
         ShapeKind::Gem => "gem",
+        ShapeKind::Model => "model",
     }
 }
 
@@ -245,7 +278,11 @@ const ROWS_SHOWN: f32 = 12.0;
 
 /// The inspector for the selected object; edits go straight into `editor` as
 /// part of the current gesture (the caller commits when interaction ends).
-pub fn inspector(ctx: &egui::Context, editor: &mut Editor) -> Option<InspectorAction> {
+pub fn inspector(
+    ctx: &egui::Context,
+    editor: &mut Editor,
+    model_names: &[&str],
+) -> Option<InspectorAction> {
     let index = editor.selected()?;
     let original = editor.desc().objects[index].clone();
     let mut o = original.clone();
@@ -286,8 +323,8 @@ pub fn inspector(ctx: &egui::Context, editor: &mut Editor) -> Option<InspectorAc
                         ShapeKind::Capsule,
                         ShapeKind::Anchor,
                     ];
-                    if current == ShapeKind::Gem {
-                        choices.push(ShapeKind::Gem);
+                    if matches!(current, ShapeKind::Gem | ShapeKind::Model) {
+                        choices.push(current);
                     }
                     for choice in choices {
                         ui.selectable_value(&mut kind, choice, choice.label());
@@ -319,6 +356,37 @@ pub fn inspector(ctx: &egui::Context, editor: &mut Editor) -> Option<InspectorAc
                 }
                 Some(ShapeDesc::Hull { points }) => {
                     ui.label(format!("{} points", points.len()));
+                }
+                Some(ShapeDesc::Model {
+                    name,
+                    scale,
+                    collider,
+                }) => {
+                    egui::ComboBox::from_label("model")
+                        .selected_text(name.as_str())
+                        .show_ui(ui, |ui| {
+                            for &choice in model_names {
+                                if ui.selectable_label(name == choice, choice).clicked() {
+                                    *name = choice.to_string();
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("scale");
+                        number(ui, scale, 0.01, 0.01..=100.0);
+                        egui::ComboBox::from_label("collider")
+                            .selected_text(format!("{collider:?}"))
+                            .show_ui(ui, |ui| {
+                                for kind in [
+                                    ModelCollider::Hull,
+                                    ModelCollider::Box,
+                                    ModelCollider::Sphere,
+                                    ModelCollider::Capsule,
+                                ] {
+                                    ui.selectable_value(collider, kind, format!("{kind:?}"));
+                                }
+                            });
+                    });
                 }
                 None => {
                     ui.label("invisible, no collisions");
@@ -404,7 +472,8 @@ mod tests {
             ],
             joints: Vec::new(),
         };
-        let (world, objects) = build_world(&desc).unwrap();
+        let (world, objects) =
+            build_world(&desc, &crate::models::ModelRegistry::default()).unwrap();
         let eye = Vec3::new(0.0, 1.0, 10.0);
         let toward = |p: Vec3| (p - eye).normalize();
         let (index, point) =
@@ -429,7 +498,7 @@ mod tests {
                 let revision = editor.revision();
                 for _ in 0..3 {
                     let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                        inspector(ui.ctx(), &mut editor);
+                        inspector(ui.ctx(), &mut editor, &["barrel", "box"]);
                     });
                     output.textures_delta.clear(); // no renderer to apply them
                 }
@@ -481,6 +550,28 @@ mod tests {
         }
         assert_eq!(editor.revision(), 0);
         assert_eq!(editor.selected(), Some(500));
+    }
+
+    #[test]
+    fn new_models_are_about_a_metre_and_rest_on_the_floor() {
+        let registry = crate::models::ModelRegistry::bundled();
+        let id = registry.id("barrel").unwrap();
+        let object = new_model_object(&registry, id, Vec3::new(2.0, 9.0, 3.0), 1.0, 4).unwrap();
+        let Some(ShapeDesc::Model {
+            name,
+            scale,
+            collider,
+        }) = &object.shape
+        else {
+            panic!("expected a model");
+        };
+        assert_eq!((name.as_str(), *collider), ("barrel", ModelCollider::Hull));
+        let size =
+            (registry.get(id).unwrap().data.max - registry.get(id).unwrap().data.min) * *scale;
+        assert!((size.max_element() - 1.0).abs() < 0.01, "{size}");
+        assert!((object.position[1] - (1.0 + size.y / 2.0 + 0.05)).abs() < 1e-4);
+        assert_eq!(object.name, "barrel 4");
+        assert_eq!(object.color, [1.0; 3]);
     }
 
     #[test]

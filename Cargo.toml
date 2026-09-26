@@ -12,6 +12,7 @@ publish = false
 impulse-physics = { path = "crates/physics" }
 impulse-render = { path = "crates/render" }
 impulse-engine = { path = "crates/engine" }
+impulse-assets = { path = "crates/assets" }
 
 wgpu = { version = "30.0.1", features = ["webgl"] }
 winit = "0.30.13"
@@ -23,6 +24,9 @@ egui-wgpu = "0.36.2"
 web-time = "1.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 ron = "0.12.2"
+# Models: .glb parsing (images decoded here, not by gltf) and PNG/JPEG decoding.
+gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 
 # native only
 env_logger = "0.11.11"
