@@ -75,3 +75,52 @@ authored scene bit-identically.
 in the panel.
 **S6. Verify** (native, WebGPU, WebGL2); record results here; update the README;
 ship after desktop confirmation.
+
+## Results
+
+- 188 tests pass across the workspace. New tests cover:
+  - scene descriptions: every shape, body and joint kind builds; RON round
+    trip; hand-written files may omit defaults; specific errors, including
+    oversized files; safe file names;
+  - the editor: add, delete (joint renumbering), duplicate, gesture undo,
+    history cap, capture pose, replace;
+  - UI helpers: picking, ray–plane intersection, shape resizing;
+  - input: key and text events;
+  - native save, list and read;
+  - Stop restoring the scene exactly.
+- **Demos are unchanged by the port.** A before/after fingerprint of all five
+  demos (2,238 lines of body, joint and colour state) matched structurally,
+  with a largest numeric difference of 1.4e-7, the rounding from Euler
+  degrees.
+- **Bugs found along the way:**
+  - **Rebuilt worlds replayed differently.** `World::clear()` reused slots in
+    reverse, so a rebuilt scene got the opposite handle order, a different
+    solve order, and a different simulation from a fresh world, alternating
+    on each rebuild. Fixed in physics (slots are now reused lowest-first),
+    with a regression test.
+  - **Stale handles.** Swapping in a fresh `World` let old handles, such as
+    the drag target, point at new bodies. `rebuild` now validates the
+    description off to the side, then clears and refills in place.
+  - **Idle rebuilds.** egui's colour button nudges the colour's low bits every
+    frame, which marked the scene edited and rebuilt the world each frame. A
+    test now runs the inspector idle over every demo and checks nothing
+    changes.
+  - **No keyboard input in egui.** The custom input layer never forwarded
+    keys, text or modifiers, so no text field could work. Added, and app keys
+    now stand down while a field has focus.
+- **Changes from the approved design:**
+  - Capture pose writes back only objects without joints. Joint limits and
+    cones are defined at the authored pose and can't be re-expressed for a
+    jointed body that has moved.
+  - New shapes are placed on top of whatever is under the camera target,
+    using a downward raycast.
+- **Verified in the browser:** Edit/Play/Stop, selection highlight and
+  inspector, adding and plane-dragging objects, and Delete, on both WebGPU and
+  WebGL2.
+- **Not verified by automation:**
+  - Ctrl shortcuts: the automation tool sends Ctrl as a flag on the key,
+    without the Ctrl key press itself.
+  - Typing into fields: in the hidden, throttled pane, the focusing click
+    and the keystrokes arrive in the same frame.
+  - Browser download and upload.
+  - These are covered by the manual desktop and browser check.
