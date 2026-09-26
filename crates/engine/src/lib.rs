@@ -14,6 +14,7 @@ mod joint_scene;
 mod pose;
 mod running;
 mod scene;
+mod scene_desc;
 mod timestep;
 
 pub use app::run;

@@ -27,6 +27,19 @@ pub enum HullError {
     Degenerate,
 }
 
+impl std::fmt::Display for HullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFewPoints => write!(f, "a hull needs at least 4 points"),
+            Self::TooManyPoints => write!(f, "a hull takes at most {MAX_HULL_POINTS} points"),
+            Self::NonFinite => write!(f, "hull points must be finite"),
+            Self::Degenerate => write!(f, "hull points must not all lie in one plane"),
+        }
+    }
+}
+
+impl std::error::Error for HullError {}
+
 /// A convex polyhedron centered on its center of mass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConvexHull {

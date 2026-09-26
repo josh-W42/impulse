@@ -5,10 +5,9 @@
 use std::f32::consts::FRAC_PI_2;
 
 use glam::{Quat, Vec3};
-use impulse_physics::{BodyDesc, BodyHandle, Collider, JointDesc, Material, World};
+use impulse_physics::{Collider, Material};
 
-use crate::pose::Pose;
-use crate::scene::SceneObject;
+use crate::scene_desc::{BodyType, JointSpec, ObjectDesc, ShapeDesc};
 
 const POST_COLOR: [f32; 4] = [0.45, 0.35, 0.28, 1.0];
 const CHAIN_COLOR: [f32; 4] = [0.70, 0.72, 0.78, 1.0];
@@ -32,33 +31,39 @@ const MATERIAL: Material = Material {
     friction: 0.6,
 };
 
-/// Adds bodies and records them for drawing.
-struct Builder<'w> {
-    world: &'w mut World,
-    objects: Vec<SceneObject>,
+/// Collects the scene's objects and joints (joints refer to object indices).
+#[derive(Default)]
+struct Builder {
+    objects: Vec<ObjectDesc>,
+    joints: Vec<JointSpec>,
 }
 
-impl Builder<'_> {
-    fn body(&mut self, desc: BodyDesc, color: [f32; 4]) -> BodyHandle {
-        let desc = desc.with_material(MATERIAL);
-        let handle = self
-            .world
-            .add_body(desc)
-            .expect("joint scene bodies are valid");
-        self.objects.push(SceneObject {
-            handle,
-            color,
-            prev: Pose {
-                position: desc.position,
-                orientation: desc.orientation,
-            },
-        });
-        handle
+impl Builder {
+    fn body(
+        &mut self,
+        body: BodyType,
+        at: Vec3,
+        orientation: Quat,
+        collider: Collider,
+        color: [f32; 4],
+    ) -> usize {
+        let mut object = ObjectDesc {
+            shape: ShapeDesc::primitive(collider),
+            position: at.to_array(),
+            body,
+            restitution: MATERIAL.restitution,
+            friction: MATERIAL.friction,
+            color: [color[0], color[1], color[2]],
+            ..ObjectDesc::default()
+        };
+        object.set_orientation(orientation);
+        self.objects.push(object);
+        self.objects.len() - 1
     }
 
-    fn post(&mut self, at: Vec3, half_extents: Vec3) -> BodyHandle {
-        let desc = BodyDesc::fixed(at).with_collider(Collider::Box { half_extents });
-        self.body(desc, POST_COLOR)
+    fn post(&mut self, at: Vec3, half_extents: Vec3) -> usize {
+        let collider = Collider::Box { half_extents };
+        self.body(BodyType::Static, at, Quat::IDENTITY, collider, POST_COLOR)
     }
 
     fn dynamic(
@@ -68,31 +73,22 @@ impl Builder<'_> {
         orientation: Quat,
         collider: Collider,
         color: [f32; 4],
-    ) -> BodyHandle {
-        let desc = BodyDesc {
-            orientation,
-            ..BodyDesc::dynamic(mass, at)
-        }
-        .with_collider(collider);
-        self.body(desc, color)
+    ) -> usize {
+        self.body(BodyType::Dynamic { mass }, at, orientation, collider, color)
     }
 
-    fn join(&mut self, desc: JointDesc) {
-        self.world
-            .add_joint(desc)
-            .expect("joint scene joints are valid");
+    fn join(&mut self, joint: JointSpec) {
+        self.joints.push(joint);
     }
 }
 
-pub fn joint_bodies(world: &mut World) -> Vec<SceneObject> {
-    let mut b = Builder {
-        world,
-        objects: Vec::new(),
-    };
+/// The scene's objects and the joints between them.
+pub fn joint_objects() -> (Vec<ObjectDesc>, Vec<JointSpec>) {
+    let mut b = Builder::default();
     chain(&mut b, Vec3::new(-4.0, 5.5, -3.0));
     bridge(&mut b, Vec3::new(0.0, 2.5, 2.5));
     ragdoll(&mut b, Vec3::new(2.5, 2.2, -2.5));
-    b.objects
+    (b.objects, b.joints)
 }
 
 /// Capsule links released horizontally, so the chain whips down and swings.
@@ -115,7 +111,7 @@ fn chain(b: &mut Builder, top: Vec3) {
             collider,
             CHAIN_COLOR,
         );
-        b.join(JointDesc::ball_socket(previous, link, pivot));
+        b.join(JointSpec::ball_socket(previous, link, pivot));
         previous = link;
     }
 }
@@ -140,7 +136,7 @@ fn bridge(b: &mut Builder, center: Vec3) {
         );
         if let Some(&previous) = planks.last() {
             let pivot = center + Vec3::X * (x - pitch / 2.0);
-            b.join(JointDesc::hinge(previous, plank, pivot, Vec3::Z));
+            b.join(JointSpec::hinge(previous, plank, pivot, Vec3::Z));
         }
         planks.push(plank);
     }
@@ -149,7 +145,7 @@ fn bridge(b: &mut Builder, center: Vec3) {
         let post = b.post(post_at, Vec3::new(0.15, 0.15, ROPE_SPLAY * half.z + 0.1));
         for z in [-half.z, half.z] {
             let on_plank = center + Vec3::new(side * span / 2.0, 0.0, z);
-            b.join(JointDesc::distance(
+            b.join(JointSpec::distance(
                 post,
                 end,
                 post_at + Vec3::Z * (z * ROPE_SPLAY),
@@ -191,7 +187,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
         Collider::Sphere { radius: 0.14 },
         HEAD_COLOR,
     );
-    b.join(JointDesc::ball_socket(torso, head, pelvis + Vec3::Y * 0.66).with_cone(Vec3::Y, 0.6));
+    b.join(JointSpec::ball_socket(torso, head, pelvis + Vec3::Y * 0.66).with_cone(Vec3::Y, 0.6));
 
     let limb = |half_height: f32, radius: f32| Collider::Capsule {
         half_height,
@@ -208,7 +204,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             limb(0.14, 0.06),
             RAGDOLL_COLOR,
         );
-        b.join(JointDesc::ball_socket(torso, upper, shoulder).with_cone(Vec3::X * side, 1.3));
+        b.join(JointSpec::ball_socket(torso, upper, shoulder).with_cone(Vec3::X * side, 1.3));
         let elbow = shoulder + Vec3::X * side * 0.42;
         let fore = b.dynamic(
             0.5,
@@ -217,7 +213,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             limb(0.14, 0.05),
             HEAD_COLOR,
         );
-        b.join(JointDesc::hinge(upper, fore, elbow, Vec3::NEG_Y * side).with_limits(0.0, 2.4));
+        b.join(JointSpec::hinge(upper, fore, elbow, Vec3::NEG_Y * side).with_limits(0.0, 2.4));
 
         // Legs hang down; the knee bends the shin backward (toward −Z).
         let hip = pelvis + Vec3::new(side * 0.12, -0.02, 0.0);
@@ -228,7 +224,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             limb(0.15, 0.08),
             RAGDOLL_COLOR,
         );
-        b.join(JointDesc::ball_socket(torso, thigh, hip).with_cone(Vec3::NEG_Y, 1.0));
+        b.join(JointSpec::ball_socket(torso, thigh, hip).with_cone(Vec3::NEG_Y, 1.0));
         let knee = hip - Vec3::Y * 0.48;
         let shin = b.dynamic(
             0.9,
@@ -237,6 +233,6 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             limb(0.15, 0.07),
             RAGDOLL_COLOR,
         );
-        b.join(JointDesc::hinge(thigh, shin, knee, Vec3::X).with_limits(0.0, 2.4));
+        b.join(JointSpec::hinge(thigh, shin, knee, Vec3::X).with_limits(0.0, 2.4));
     }
 }

@@ -4,13 +4,16 @@
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 
-use impulse_physics::{BodyDesc, BodyHandle, Collider, ConvexHull, HullId, Material, World};
+use impulse_physics::{BodyHandle, Collider, ConvexHull, HullId, Material, World};
 use impulse_render::{DrawList, MeshData, MeshId, MeshKind, Vertex};
 
 /// Renderer meshes registered for the hull shapes in the world.
 pub type HullMeshes = HashMap<HullId, MeshId>;
 
 use crate::pose::{Pose, interpolate};
+use crate::scene_desc::{
+    Arena, BodyType, ObjectDesc, SCENE_VERSION, SceneDesc, ShapeDesc, rebuild,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneObject {
@@ -42,7 +45,7 @@ const GRID_COLOR: [f32; 4] = [0.12, 0.13, 0.15, 1.0];
 const ROPE_COLOR: [f32; 4] = [0.85, 0.78, 0.60, 1.0];
 const LOW_BOUNCE: [f32; 3] = [0.15, 0.40, 0.80];
 const HIGH_BOUNCE: [f32; 3] = [0.95, 0.55, 0.15];
-const STATIC_MATERIAL: Material = Material {
+pub(crate) const STATIC_MATERIAL: Material = Material {
     restitution: 0.4,
     friction: 0.5,
 };
@@ -53,7 +56,7 @@ fn spread(i: usize, k: f32) -> f32 {
 }
 
 /// The floor plane and the four inward-facing wall planes: `(point, normal)`.
-fn pit_planes(half: f32) -> [(Vec3, Vec3); 5] {
+pub(crate) fn pit_planes(half: f32) -> [(Vec3, Vec3); 5] {
     [
         (Vec3::ZERO, Vec3::Y),
         (Vec3::new(-half, 0.0, 0.0), Vec3::X),
@@ -121,34 +124,94 @@ const STACK_COLORS: [[f32; 4]; 3] = [
     [0.30, 0.55, 0.75, 1.0],
 ];
 
-/// Replaces everything in `world` with `demo`. Deterministic.
-pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
-    world.clear();
-    add_pit(world, pit_half(demo));
-    match demo {
-        Demo::Pit => pit_bodies(world),
-        Demo::Tower => (0..TOWER_HEIGHT)
-            .map(|i| stack_cube(world, Vec3::new(0.0, 0.5 + i as f32, 0.0), i))
-            .collect(),
+/// A demo as a scene description. Deterministic.
+pub fn demo_desc(demo: Demo) -> SceneDesc {
+    let (objects, joints) = match demo {
+        Demo::Pit => (pit_objects(), Vec::new()),
+        Demo::Tower => (
+            (0..TOWER_HEIGHT)
+                .map(|i| stack_cube(Vec3::new(0.0, 0.5 + i as f32, 0.0), i))
+                .collect(),
+            Vec::new(),
+        ),
         Demo::Pyramid => {
             let mut objects = Vec::new();
             for row in 0..PYRAMID_BASE {
                 let count = PYRAMID_BASE - row;
                 for i in 0..count {
                     let x = (i as f32 - (count - 1) as f32 / 2.0) * 1.025;
-                    objects.push(stack_cube(world, Vec3::new(x, 0.5 + row as f32, 0.0), row));
+                    objects.push(stack_cube(Vec3::new(x, 0.5 + row as f32, 0.0), row));
                 }
             }
-            objects
+            (objects, Vec::new())
         }
-        Demo::Rain => rain_bodies(world),
-        Demo::Joints => crate::joint_scene::joint_bodies(world),
+        Demo::Rain => (rain_objects(), Vec::new()),
+        Demo::Joints => crate::joint_scene::joint_objects(),
+    };
+    let mut desc = SceneDesc {
+        version: SCENE_VERSION,
+        name: demo.label().to_string(),
+        arena: Arena::Pit {
+            half: pit_half(demo),
+        },
+        objects,
+        joints,
+    };
+    for (i, object) in desc.objects.iter_mut().enumerate() {
+        if object.name.is_empty() {
+            object.name = default_name(object, i);
+        }
     }
+    desc
+}
+
+/// "box 3", "anchor 0": a readable name for unnamed objects.
+pub fn default_name(object: &ObjectDesc, index: usize) -> String {
+    let kind = match object.shape {
+        None => "anchor",
+        Some(ShapeDesc::Sphere { .. }) => "sphere",
+        Some(ShapeDesc::Box { .. }) => "box",
+        Some(ShapeDesc::Capsule { .. }) => "capsule",
+        Some(ShapeDesc::Hull { .. }) => "gem",
+    };
+    format!("{kind} {index}")
+}
+
+/// Replaces everything in `world` with `demo`, keeping its solver settings.
+pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
+    rebuild(world, &demo_desc(demo)).expect("demo scenes are valid")
+}
+
+/// A demo object from physics-style values.
+#[allow(clippy::too_many_arguments)]
+fn demo_object(
+    shape: ShapeDesc,
+    position: Vec3,
+    orientation: glam::Quat,
+    mass: f32,
+    material: Material,
+    color: [f32; 4],
+    velocity: Vec3,
+    spin: Vec3,
+) -> ObjectDesc {
+    let mut object = ObjectDesc {
+        shape: Some(shape),
+        position: position.to_array(),
+        body: BodyType::Dynamic { mass },
+        restitution: material.restitution,
+        friction: material.friction,
+        color: [color[0], color[1], color[2]],
+        velocity: velocity.to_array(),
+        angular_velocity: spin.to_array(),
+        ..ObjectDesc::default()
+    };
+    object.set_orientation(orientation);
+    object
 }
 
 /// Layers of mixed spheres and boxes filling the Rain pit (same recipe as the
 /// physics benchmark, so browser and native numbers are comparable).
-fn rain_bodies(world: &mut World) -> Vec<SceneObject> {
+fn rain_objects() -> Vec<ObjectDesc> {
     let per_row = ((2.0 * RAIN_PIT - 2.0) / 1.2).floor() as usize;
     (0..RAIN_COUNT)
         .map(|i| {
@@ -163,30 +226,26 @@ fn rain_bodies(world: &mut World) -> Vec<SceneObject> {
                 -RAIN_PIT + 1.0 + row as f32 * 1.2,
             );
             let size = 0.25 + 0.2 * spread(i, 0.37);
-            let collider = if i % 2 == 0 {
-                Collider::Sphere { radius: size }
+            let shape = if i % 2 == 0 {
+                ShapeDesc::Sphere { radius: size }
             } else {
-                Collider::Box {
-                    half_extents: Vec3::new(size, size * 0.8, size * 0.9),
+                ShapeDesc::Box {
+                    half_extents: [size, size * 0.8, size * 0.9],
                 }
             };
-            let desc = BodyDesc {
-                orientation: glam::Quat::from_rotation_y(spread(i, 0.53) * 6.0),
-                ..BodyDesc::dynamic(1.0, position)
-            }
-            .with_collider(collider)
-            .with_material(Material {
-                restitution: 0.2,
-                friction: 0.5,
-            });
-            SceneObject {
-                handle: world.add_body(desc).expect("rain bodies are valid"),
-                color: PALETTE_RAIN[i % PALETTE_RAIN.len()],
-                prev: Pose {
-                    position,
-                    orientation: desc.orientation,
+            demo_object(
+                shape,
+                position,
+                glam::Quat::from_rotation_y(spread(i, 0.53) * 6.0),
+                1.0,
+                Material {
+                    restitution: 0.2,
+                    friction: 0.5,
                 },
-            }
+                PALETTE_RAIN[i % PALETTE_RAIN.len()],
+                Vec3::ZERO,
+                Vec3::ZERO,
+            )
         })
         .collect()
 }
@@ -242,38 +301,25 @@ pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
     build(world, Demo::Pit)
 }
 
-fn stack_cube(world: &mut World, position: Vec3, layer: usize) -> SceneObject {
-    let desc = BodyDesc::dynamic(1.0, position)
-        .with_collider(Collider::Box {
-            half_extents: Vec3::splat(0.5),
-        })
-        .with_material(Material {
+fn stack_cube(position: Vec3, layer: usize) -> ObjectDesc {
+    demo_object(
+        ShapeDesc::Box {
+            half_extents: [0.5; 3],
+        },
+        position,
+        glam::Quat::IDENTITY,
+        1.0,
+        Material {
             restitution: 0.0,
             friction: 0.6,
-        });
-    SceneObject {
-        handle: world.add_body(desc).expect("stack cubes are valid"),
-        color: STACK_COLORS[layer % STACK_COLORS.len()],
-        prev: Pose {
-            position,
-            orientation: desc.orientation,
         },
-    }
+        STACK_COLORS[layer % STACK_COLORS.len()],
+        Vec3::ZERO,
+        Vec3::ZERO,
+    )
 }
 
-fn add_pit(world: &mut World, half: f32) {
-    for (point, normal) in pit_planes(half) {
-        world
-            .add_body(
-                BodyDesc::fixed(point)
-                    .with_collider(Collider::Plane { normal })
-                    .with_material(STATIC_MATERIAL),
-            )
-            .expect("pit planes are valid");
-    }
-}
-
-fn pit_bodies(world: &mut World) -> Vec<SceneObject> {
+fn pit_objects() -> Vec<ObjectDesc> {
     (0..BODY_COUNT)
         .map(|i| {
             let radius = 0.3 + 0.4 * spread(i, 0.37);
@@ -288,81 +334,69 @@ fn pit_bodies(world: &mut World) -> Vec<SceneObject> {
                 0.0,
                 spread(i, 0.79) * 4.0 - 2.0,
             );
+            let tumble = Vec3::new(
+                spread(i, 0.31) - 0.5,
+                spread(i, 0.47) - 0.5,
+                spread(i, 0.71) - 0.5,
+            ) * 4.0;
             // Cycle sphere, box, capsule, gem (convex hull); all but spheres spawn
             // tilted and spinning.
-            let (collider, mass, orientation, spin) = if i % 4 == 0 {
+            let (shape, mass, orientation, spin) = if i % 4 == 0 {
                 (
-                    Collider::Sphere { radius },
+                    ShapeDesc::Sphere { radius },
                     8.0 * radius.powi(3),
                     glam::Quat::IDENTITY,
                     Vec3::ZERO,
                 )
             } else if i % 4 == 3 {
-                let hull = world
-                    .add_hull(&gem_points(i, radius * 1.1))
-                    .expect("gem points form a hull");
+                let points = gem_points(i, radius * 1.1)
+                    .into_iter()
+                    .map(|p| p.to_array())
+                    .collect();
                 (
-                    Collider::Hull { hull },
+                    ShapeDesc::Hull { points },
                     8.0 * radius.powi(3),
                     glam::Quat::from_axis_angle(Vec3::Z, spread(i, 0.53) * std::f32::consts::TAU),
-                    Vec3::new(
-                        spread(i, 0.31) - 0.5,
-                        spread(i, 0.47) - 0.5,
-                        spread(i, 0.71) - 0.5,
-                    ) * 4.0,
+                    tumble,
                 )
             } else if i % 4 == 2 {
-                let half_height = radius * (1.0 + spread(i, 0.43));
                 (
-                    Collider::Capsule {
-                        half_height,
+                    ShapeDesc::Capsule {
+                        half_height: radius * (1.0 + spread(i, 0.43)),
                         radius: radius * 0.6,
                     },
                     8.0 * radius.powi(3),
                     glam::Quat::from_axis_angle(Vec3::X, spread(i, 0.53) * std::f32::consts::TAU),
-                    Vec3::new(
-                        spread(i, 0.31) - 0.5,
-                        spread(i, 0.47) - 0.5,
-                        spread(i, 0.71) - 0.5,
-                    ) * 4.0,
+                    tumble,
                 )
             } else {
                 let half_extents =
                     Vec3::new(radius, radius * (0.6 + 0.6 * spread(i, 0.43)), radius * 0.8);
                 let axis = Vec3::new(spread(i, 0.17) - 0.5, 1.0, spread(i, 0.29) - 0.5).normalize();
                 (
-                    Collider::Box { half_extents },
+                    ShapeDesc::Box {
+                        half_extents: half_extents.to_array(),
+                    },
                     8.0 * half_extents.x * half_extents.y * half_extents.z,
                     glam::Quat::from_axis_angle(axis, spread(i, 0.53) * std::f32::consts::TAU),
-                    Vec3::new(
-                        spread(i, 0.31) - 0.5,
-                        spread(i, 0.47) - 0.5,
-                        spread(i, 0.71) - 0.5,
-                    ) * 4.0,
+                    tumble,
                 )
             };
-            let desc = BodyDesc {
-                orientation,
-                ..BodyDesc::dynamic(mass, position)
-            }
-            .with_collider(collider)
-            .with_angular_velocity(spin)
-            .with_material(Material {
-                restitution,
-                friction: 0.4,
-            })
-            .with_velocity(velocity);
-            let handle = world.add_body(desc).expect("demo bodies are valid");
             let t = (restitution - 0.1) / 0.8;
             let c = |k: usize| LOW_BOUNCE[k] + (HIGH_BOUNCE[k] - LOW_BOUNCE[k]) * t;
-            SceneObject {
-                handle,
-                color: [c(0), c(1), c(2), 1.0],
-                prev: Pose {
-                    position,
-                    orientation: desc.orientation,
+            demo_object(
+                shape,
+                position,
+                orientation,
+                mass,
+                Material {
+                    restitution,
+                    friction: 0.4,
                 },
-            }
+                [c(0), c(1), c(2), 1.0],
+                velocity,
+                spin,
+            )
         })
         .collect()
 }
@@ -661,6 +695,20 @@ mod tests {
             );
         }
         assert_eq!(Demo::from_name("joints"), Some(Demo::Joints));
+    }
+
+    #[test]
+    fn every_demo_round_trips_through_ron_and_names_its_objects() {
+        for demo in Demo::ALL {
+            let desc = demo_desc(demo);
+            let text = crate::scene_desc::to_ron(&desc);
+            assert_eq!(
+                crate::scene_desc::from_ron(&text).unwrap(),
+                desc,
+                "{demo:?}"
+            );
+            assert!(desc.objects.iter().all(|o| !o.name.is_empty()));
+        }
     }
 
     #[test]
