@@ -213,7 +213,6 @@ pub enum JointKindSpec {
 }
 
 /// Why a scene could not be loaded or built. The caller keeps its current scene.
-#[cfg_attr(not(test), allow(dead_code))] // Parse/UnsupportedVersion: save/load (M8 S5)
 #[derive(Debug, Clone, PartialEq)]
 pub enum SceneError {
     Parse(String),
@@ -272,14 +271,38 @@ impl fmt::Display for SceneError {
 
 impl std::error::Error for SceneError {}
 
-#[cfg_attr(not(test), allow(dead_code))] // used by save/load (M8 S5)
 pub fn to_ron(desc: &SceneDesc) -> String {
     ron::ser::to_string_pretty(desc, ron::ser::PrettyConfig::default())
         .expect("scene descriptions always serialize")
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // used by save/load (M8 S5)
+/// Largest scene file accepted (bytes); guards against loading something huge.
+pub const MAX_SCENE_BYTES: usize = 16 * 1024 * 1024;
+
+/// A safe file stem for a scene name: letters, digits, `-` and `_` (spaces
+/// become `_`), at most 64 characters. `None` if nothing usable remains. Keeps
+/// saved files inside the scenes folder (no separators, no `..`).
+pub fn file_stem(name: &str) -> Option<String> {
+    let stem: String = name
+        .trim()
+        .chars()
+        .filter_map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => Some(c),
+            ' ' => Some('_'),
+            _ => None,
+        })
+        .take(64)
+        .collect();
+    (!stem.is_empty()).then_some(stem)
+}
+
 pub fn from_ron(text: &str) -> Result<SceneDesc, SceneError> {
+    if text.len() > MAX_SCENE_BYTES {
+        return Err(SceneError::Parse(format!(
+            "file is larger than {} MB",
+            MAX_SCENE_BYTES / (1024 * 1024)
+        )));
+    }
     let desc: SceneDesc = ron::from_str(text).map_err(|e| SceneError::Parse(e.to_string()))?;
     if desc.version != SCENE_VERSION {
         return Err(SceneError::UnsupportedVersion(desc.version));
@@ -581,6 +604,22 @@ mod tests {
         );
         rebuild(&mut world, &desc).unwrap();
         assert_eq!(state(&world), state(&fresh));
+    }
+
+    #[test]
+    fn file_stems_are_safe() {
+        assert_eq!(file_stem("My Scene-2").as_deref(), Some("My_Scene-2"));
+        assert_eq!(file_stem("../../etc/passwd").as_deref(), Some("etcpasswd"));
+        assert_eq!(file_stem("C:\\x.ron").as_deref(), Some("Cxron"));
+        assert_eq!(file_stem("  ").as_deref(), None);
+        assert_eq!(file_stem("...").as_deref(), None);
+        assert_eq!(file_stem(&"a".repeat(100)).map(|s| s.len()), Some(64));
+    }
+
+    #[test]
+    fn oversized_files_are_refused_before_parsing() {
+        let huge = " ".repeat(MAX_SCENE_BYTES + 1);
+        assert!(matches!(from_ron(&huge), Err(SceneError::Parse(_))));
     }
 
     #[test]

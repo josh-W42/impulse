@@ -1,12 +1,13 @@
 //! Translates window input into `egui::RawInput`.
 //!
 //! egui-winit (0.36) doesn't build for wasm32, so impulse feeds egui itself.
-//! Only what the debug panel needs: pointer, buttons, wheel, focus, and the
-//! first touch as a pointer. No keyboard, text, or clipboard.
+//! What the panels need: pointer, buttons, wheel, focus, the first touch as a
+//! pointer, and keys/text for the editor's fields. No clipboard or IME.
 
 use egui::{
-    Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2,
+    Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2,
 };
+use winit::keyboard::{KeyCode, ModifiersState};
 
 #[derive(Debug)]
 pub struct EguiInput {
@@ -15,6 +16,7 @@ pub struct EguiInput {
     pointer: Option<Pos2>,
     focused: bool,
     touch_id: Option<u64>,
+    modifiers: Modifiers,
 }
 
 impl EguiInput {
@@ -25,6 +27,7 @@ impl EguiInput {
             pointer: None,
             focused: true,
             touch_id: None,
+            modifiers: Modifiers::default(),
         }
     }
 
@@ -58,7 +61,7 @@ impl EguiInput {
                 pos,
                 button,
                 pressed,
-                modifiers: Modifiers::default(),
+                modifiers: self.modifiers,
             });
         }
     }
@@ -78,8 +81,45 @@ impl EguiInput {
             unit,
             delta,
             phase: TouchPhase::Move,
-            modifiers: Modifiers::default(),
+            modifiers: self.modifiers,
         });
+    }
+
+    pub fn set_modifiers(&mut self, state: ModifiersState) {
+        let mac = cfg!(target_os = "macos");
+        self.modifiers = Modifiers {
+            alt: state.alt_key(),
+            ctrl: state.control_key(),
+            shift: state.shift_key(),
+            mac_cmd: mac && state.super_key(),
+            command: if mac {
+                state.super_key()
+            } else {
+                state.control_key()
+            },
+        };
+    }
+
+    /// A key press or release; `text` is what it types, if anything.
+    pub fn on_key(&mut self, code: KeyCode, pressed: bool, repeat: bool, text: Option<&str>) {
+        if let Some(key) = egui_key(code) {
+            self.raw.events.push(Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat,
+                modifiers: self.modifiers,
+            });
+        }
+        let shortcut = self.modifiers.ctrl || self.modifiers.command;
+        if let Some(text) = text
+            && pressed
+            && !shortcut
+            && !text.is_empty()
+            && !text.chars().any(char::is_control)
+        {
+            self.raw.events.push(Event::Text(text.to_owned()));
+        }
     }
 
     pub fn on_focus(&mut self, focused: bool) {
@@ -122,6 +162,35 @@ impl EguiInput {
             .native_pixels_per_point = Some(self.pixels_per_point);
         raw
     }
+}
+
+/// Keys that text and value fields act on (typed characters arrive as
+/// `Event::Text`).
+fn egui_key(code: KeyCode) -> Option<Key> {
+    use KeyCode as C;
+    Some(match code {
+        C::ArrowDown => Key::ArrowDown,
+        C::ArrowLeft => Key::ArrowLeft,
+        C::ArrowRight => Key::ArrowRight,
+        C::ArrowUp => Key::ArrowUp,
+        C::Backspace => Key::Backspace,
+        C::Delete => Key::Delete,
+        C::End => Key::End,
+        C::Enter | C::NumpadEnter => Key::Enter,
+        C::Escape => Key::Escape,
+        C::Home => Key::Home,
+        C::Tab => Key::Tab,
+        C::Space => Key::Space,
+        C::Minus | C::NumpadSubtract => Key::Minus,
+        C::Period | C::NumpadDecimal => Key::Period,
+        C::KeyA => Key::A,
+        C::KeyC => Key::C,
+        C::KeyV => Key::V,
+        C::KeyX => Key::X,
+        C::KeyY => Key::Y,
+        C::KeyZ => Key::Z,
+        _ => return None,
+    })
 }
 
 fn sanitize_ppp(pixels_per_point: f32) -> f32 {
@@ -205,6 +274,33 @@ mod tests {
             })
             .collect();
         assert_eq!(presses, vec![true, false]);
+    }
+
+    #[test]
+    fn keys_type_text_unless_a_shortcut_is_held() {
+        let mut input = EguiInput::new(1.0);
+        input.on_key(KeyCode::KeyQ, true, false, Some("q"));
+        input.on_key(KeyCode::Backspace, true, false, Some("\u{8}"));
+        input.set_modifiers(ModifiersState::CONTROL);
+        input.on_key(KeyCode::KeyA, true, false, Some("a"));
+        let raw = input.take([10, 10], 0.0);
+        let texts: Vec<_> = raw
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["q"], "control characters and Ctrl+A don't type");
+        assert!(raw.events.iter().any(|e| matches!(
+            e,
+            Event::Key {
+                key: Key::Backspace,
+                pressed: true,
+                ..
+            }
+        )));
     }
 
     #[test]

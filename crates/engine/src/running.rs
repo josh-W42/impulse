@@ -7,7 +7,7 @@ use impulse_physics::{BodyHandle, SolverSettings, StepStats, World};
 use impulse_render::{CameraData, DrawList, FrameOutcome, Gpu, Renderer, UiFrame, backend_name};
 use web_time::Instant;
 use winit::event::{DeviceEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Window};
 
 use crate::camera::{self, CameraMode, CameraRig, OrbitCamera};
@@ -63,7 +63,7 @@ struct EditDrag {
 }
 
 /// Panel requests carried out after the UI pass.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Action {
     Play,
     Stop,
@@ -73,6 +73,11 @@ enum Action {
     Add(NewShape),
     LoadDemo(Demo),
     Inspector(InspectorAction),
+    Save,
+    /// Desktop: a scene from the `scenes/` folder.
+    LoadSaved(usize),
+    /// Browser: open the file picker.
+    Open,
 }
 
 /// Panel-controlled settings plus one-shot requests the panel raises.
@@ -83,6 +88,10 @@ struct Settings {
     show_axes: bool,
     step_requested: bool,
     reset_requested: bool,
+    /// Name to save the scene under.
+    file_name: String,
+    /// Desktop: saved scenes, refreshed when the load list opens.
+    saved: Vec<String>,
     warm_starting: bool,
     iterations: usize,
     sleeping: bool,
@@ -125,6 +134,8 @@ pub struct Running {
     demo: Option<(Demo, u64)>,
     /// Last error or status for the panel.
     message: Option<String>,
+    /// Ctrl/Shift/etc., from the window (key events alone can miss them).
+    modifiers: ModifiersState,
 }
 
 impl Running {
@@ -161,6 +172,8 @@ impl Running {
                 show_axes: false,
                 step_requested: false,
                 reset_requested: false,
+                file_name: initial.label().to_string(),
+                saved: Vec::new(),
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
                 sleeping: SolverSettings::default().sleeping,
@@ -177,6 +190,7 @@ impl Running {
             edit_drag: None,
             demo: Some((initial, 0)),
             message: None,
+            modifiers: ModifiersState::empty(),
         }
         .with_hull_meshes()
     }
@@ -271,6 +285,12 @@ impl Running {
                     return;
                 };
                 let pressed = event.state.is_pressed();
+                self.egui_input
+                    .on_key(code, pressed, event.repeat, event.text.as_deref());
+                // Typing into a panel field: the keys are the field's, not the app's.
+                if pressed && self.egui_ctx.egui_wants_keyboard_input() {
+                    return;
+                }
                 // Toggle here, inside the key handler: browsers only grant pointer
                 // lock during a user gesture.
                 if pressed && !event.repeat {
@@ -279,11 +299,14 @@ impl Running {
                         self.toggle_camera(window);
                     }
                 }
-                if pressed && self.mode == Mode::Edit && !self.egui_ctx.egui_wants_keyboard_input()
-                {
+                if pressed && self.mode == Mode::Edit {
                     self.edit_shortcut(code, event.repeat);
                 }
                 self.input.on_key(code, pressed);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+                self.egui_input.set_modifiers(self.modifiers);
             }
             WindowEvent::Focused(focused) => {
                 self.egui_input.on_focus(*focused);
@@ -379,8 +402,7 @@ impl Running {
             Some((index, point)) => {
                 self.editor.select(Some(index));
                 let start = Vec3::from_array(self.editor.desc().objects[index].position);
-                let vertical = self.input.key_held(KeyCode::ShiftLeft)
-                    || self.input.key_held(KeyCode::ShiftRight);
+                let vertical = self.modifiers.shift_key();
                 self.editor.begin();
                 self.edit_drag = Some(EditDrag {
                     object: index,
@@ -428,11 +450,10 @@ impl Running {
         }
     }
 
-    /// Delete/Backspace, Ctrl+D, Ctrl+Z, Ctrl+Y (or Ctrl+Shift+Z).
+    /// Delete/Backspace, Ctrl+D, Ctrl+Z, Ctrl+Y (or Ctrl+Shift+Z); Cmd on macOS.
     fn edit_shortcut(&mut self, code: KeyCode, repeat: bool) {
-        let held = |a, b| self.input.key_held(a) || self.input.key_held(b);
-        let ctrl = held(KeyCode::ControlLeft, KeyCode::ControlRight);
-        let shift = held(KeyCode::ShiftLeft, KeyCode::ShiftRight);
+        let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+        let shift = self.modifiers.shift_key();
         match code {
             KeyCode::Delete | KeyCode::Backspace if !repeat => {
                 self.editor.delete_selected();
@@ -502,22 +523,71 @@ impl Running {
                 self.editor.redo();
             }
             Action::Add(shape) => {
+                // On top of whatever is under the camera target (0.5 m shapes).
                 let target = self.camera.orbit.target;
-                let at = Vec3::new(target.x, 1.0, target.z);
+                let above = Vec3::new(target.x, 100.0, target.z);
+                let surface = self
+                    .world
+                    .raycast(above, Vec3::NEG_Y, 200.0)
+                    .map_or(0.0, |hit| hit.point.y);
+                let at = Vec3::new(target.x, surface + 0.6, target.z);
                 let index = self.editor.desc().objects.len();
                 self.editor.add(editor_ui::new_object(shape, at, index));
             }
             Action::LoadDemo(demo) => {
                 self.editor.replace(scene::demo_desc(demo));
                 self.demo = Some((demo, self.editor.revision()));
+                self.settings.file_name = demo.label().to_string();
                 self.rebuild_scene();
             }
+            Action::Save => {
+                self.editor.commit();
+                let Some(stem) = scene_desc::file_stem(&self.settings.file_name) else {
+                    self.message = Some("give the scene a name (letters, digits, - or _)".into());
+                    return;
+                };
+                let mut desc = self.editor.desc().clone();
+                desc.name = stem.clone();
+                self.message = Some(
+                    match platform::save_scene(&stem, &scene_desc::to_ron(&desc)) {
+                        Ok(place) => format!("saved {place}"),
+                        Err(e) => e,
+                    },
+                );
+            }
+            Action::LoadSaved(index) => {
+                let Some(stem) = self.settings.saved.get(index).cloned() else {
+                    return;
+                };
+                match platform::read_scene(&stem) {
+                    Ok(text) => self.load_scene_text(&stem, &text),
+                    Err(e) => self.message = Some(e),
+                }
+            }
+            Action::Open => platform::pick_scene_file(),
             Action::Inspector(InspectorAction::Duplicate) => {
                 self.editor.duplicate_selected();
             }
             Action::Inspector(InspectorAction::Delete) => {
                 self.editor.delete_selected();
             }
+        }
+    }
+
+    /// Replaces the authored scene with a scene file's contents, if it parses
+    /// and builds; otherwise reports why and keeps the current scene.
+    fn load_scene_text(&mut self, source: &str, text: &str) {
+        let checked = scene_desc::from_ron(text)
+            .and_then(|desc| scene_desc::build_world(&desc).map(|_| desc));
+        match checked {
+            Ok(desc) => {
+                self.settings.file_name = desc.name.clone();
+                self.editor.replace(desc);
+                self.demo = None;
+                self.rebuild_scene();
+                self.message = Some(format!("loaded {source}"));
+            }
+            Err(e) => self.message = Some(format!("{source}: {e}")),
         }
     }
 
@@ -666,6 +736,11 @@ impl Running {
             self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.egui_is_using_pointer();
         self.update_camera(dt, egui_has_pointer);
         self.update_edit_drag();
+        match platform::take_picked_scene() {
+            Some(Ok((name, text))) => self.load_scene_text(&name, &text),
+            Some(Err(e)) => self.message = Some(e),
+            None => {}
+        }
         if let Some((origin, dir)) = self.cursor_ray()
             && let Some(drag) = &mut self.drag
         {
@@ -827,6 +902,32 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     {
                         actions.push(Action::LoadDemo(demo));
                     }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("file");
+                ui.add(egui::TextEdit::singleline(&mut s.file_name).desired_width(110.0));
+                if ui.button("Save").clicked() {
+                    actions.push(Action::Save);
+                }
+                if platform::HAS_SCENE_FOLDER {
+                    let list = egui::ComboBox::from_id_salt("load")
+                        .selected_text("Load…")
+                        .show_ui(ui, |ui| {
+                            if s.saved.is_empty() {
+                                ui.label("no saved scenes yet");
+                            }
+                            for (i, name) in s.saved.iter().enumerate() {
+                                if ui.selectable_label(false, name).clicked() {
+                                    actions.push(Action::LoadSaved(i));
+                                }
+                            }
+                        });
+                    if list.response.clicked() {
+                        s.saved = platform::saved_scenes();
+                    }
+                } else if ui.button("Open…").clicked() {
+                    actions.push(Action::Open);
                 }
             });
             if let Some(message) = &stats.message {

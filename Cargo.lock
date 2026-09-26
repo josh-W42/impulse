@@ -906,6 +906,7 @@ dependencies = [
  "glam",
  "impulse-physics",
  "impulse-render",
+ "js-sys",
  "log",
  "pollster",
  "ron",
