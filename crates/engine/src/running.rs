@@ -76,6 +76,10 @@ enum Action {
     /// Desktop: import a `.glb` from the `models/` folder and add it.
     ImportFile(usize),
     LoadDemo(Demo),
+    /// Start a blank scene (open floor).
+    New,
+    /// Change the authored scene's surroundings (undoable).
+    SetArena(scene_desc::Arena),
     Inspector(InspectorAction),
     Save,
     /// Desktop: a scene from the `scenes/` folder.
@@ -571,6 +575,18 @@ impl Running {
                 self.settings.file_name = demo.label().to_string();
                 self.rebuild_scene();
             }
+            Action::New => {
+                self.editor.replace(scene::empty_desc());
+                self.demo = None;
+                self.settings.file_name = "untitled".to_string();
+                self.mode = Mode::Edit;
+                self.rebuild_scene();
+            }
+            // Part of the current gesture: a whole size drag is one undo step
+            // (committed when the pointer is released).
+            Action::SetArena(arena) => {
+                self.editor.modify(|d| d.arena = arena);
+            }
             Action::Save => {
                 self.editor.commit();
                 let Some(stem) = scene_desc::file_stem(&self.settings.file_name) else {
@@ -879,6 +895,7 @@ impl Running {
             can_undo: self.editor.can_undo(),
             can_redo: self.editor.can_redo(),
             message: self.message.clone(),
+            arena: self.editor.desc().arena,
             models: self
                 .models
                 .list()
@@ -953,6 +970,8 @@ struct Stats {
     can_undo: bool,
     can_redo: bool,
     message: Option<String>,
+    /// The authored scene's surroundings.
+    arena: scene_desc::Arena,
     /// Every model's id, name, and whether it is bundled (Model… picker).
     models: Vec<(crate::models::ModelId, String, bool)>,
 }
@@ -1049,6 +1068,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             }
             ui.horizontal(|ui| {
                 ui.label("scene");
+                if ui.button("New").clicked() {
+                    actions.push(Action::New);
+                }
                 for demo in Demo::ALL {
                     if ui
                         .selectable_label(stats.demo == Some(demo), demo.label())
@@ -1058,6 +1080,33 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     }
                 }
             });
+            if stats.mode == Mode::Edit {
+                ui.horizontal(|ui| {
+                    use scene_desc::Arena;
+                    ui.label("arena");
+                    let pit = matches!(stats.arena, Arena::Pit { .. });
+                    if ui.selectable_label(!pit, "open floor").clicked() && pit {
+                        actions.push(Action::SetArena(Arena::Floor));
+                    }
+                    if ui.selectable_label(pit, "walled pit").clicked() && !pit {
+                        actions.push(Action::SetArena(Arena::Pit {
+                            half: scene::DEFAULT_PIT,
+                        }));
+                    }
+                    if let Arena::Pit { half } = stats.arena {
+                        let mut size = half;
+                        let drag = ui.add(
+                            egui::DragValue::new(&mut size)
+                                .speed(0.1)
+                                .range(1.0..=100.0)
+                                .prefix("half-width "),
+                        );
+                        if drag.changed() && size != half {
+                            actions.push(Action::SetArena(Arena::Pit { half: size }));
+                        }
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("file");
                 ui.add(egui::TextEdit::singleline(&mut s.file_name).desired_width(110.0));

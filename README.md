@@ -29,6 +29,8 @@ to exactly what you authored.
 - Click to select; drag to move it across the floor (Shift: up/down); the inspector
   edits shape, pose, body, material, colour, and starting velocity
 - Add sphere/box/capsule, Ctrl+D duplicate, Del delete, Ctrl+Z / Ctrl+Y undo/redo
+- **New** starts a blank scene on an open floor; in Edit mode, **arena** switches any
+  scene between an open floor and a walled pit (with its size)
 - **Capture pose** (in Play) writes the simulated poses back as the starting scene
 - Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
   opens them. The demos are available as starting points.

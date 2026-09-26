@@ -132,6 +132,20 @@ const STACK_COLORS: [[f32; 4]; 3] = [
 ];
 
 /// A demo as a scene description. Deterministic.
+/// A blank scene: an open floor, nothing on it.
+pub fn empty_desc() -> SceneDesc {
+    SceneDesc {
+        version: SCENE_VERSION,
+        name: "untitled".to_string(),
+        arena: Arena::Floor,
+        objects: Vec::new(),
+        joints: Vec::new(),
+    }
+}
+
+/// Default pit half-width when switching an open floor to a pit.
+pub const DEFAULT_PIT: f32 = PIT;
+
 pub fn demo_desc(demo: Demo) -> SceneDesc {
     let (objects, joints) = match demo {
         Demo::Pit => (pit_objects(), Vec::new()),
@@ -932,6 +946,20 @@ mod tests {
             );
         }
         assert_eq!(Demo::from_name("props"), Some(Demo::Props));
+    }
+
+    #[test]
+    fn the_empty_scene_is_just_an_open_floor() {
+        let desc = empty_desc();
+        let (world, objects) =
+            crate::scene_desc::build_world(&desc, &crate::models::ModelRegistry::default())
+                .unwrap();
+        assert!(objects.is_empty());
+        assert_eq!(world.len(), 1, "only the floor plane: no walls");
+        assert_eq!(
+            crate::scene_desc::from_ron(&crate::scene_desc::to_ron(&desc)).unwrap(),
+            desc
+        );
     }
 
     #[test]
