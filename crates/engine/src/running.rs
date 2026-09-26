@@ -136,6 +136,10 @@ pub struct Running {
     message: Option<String>,
     /// Ctrl/Shift/etc., from the window (key events alone can miss them).
     modifiers: ModifiersState,
+    /// Objects-list filter text.
+    list_filter: String,
+    /// The selection the objects list last showed (it follows viewport picks).
+    listed: Option<usize>,
 }
 
 impl Running {
@@ -191,6 +195,8 @@ impl Running {
             demo: Some((initial, 0)),
             message: None,
             modifiers: ModifiersState::empty(),
+            list_filter: String::new(),
+            listed: None,
         }
         .with_hull_meshes()
     }
@@ -791,15 +797,23 @@ impl Running {
             message: self.message.clone(),
         };
         let mut actions = Vec::new();
-        let (settings, editor, mode) = (&mut self.settings, &mut self.editor, self.mode);
+        let follow = self.editor.selected() != self.listed;
+        let (settings, editor, mode, filter) = (
+            &mut self.settings,
+            &mut self.editor,
+            self.mode,
+            &mut self.list_filter,
+        );
         let output = self.egui_ctx.run_ui(raw, |ui| {
             panel(ui, settings, &stats, &mut actions);
-            if mode == Mode::Edit
-                && let Some(action) = editor_ui::inspector(ui.ctx(), editor)
-            {
-                actions.push(Action::Inspector(action));
+            if mode == Mode::Edit {
+                editor_ui::outliner(ui.ctx(), editor, filter, follow);
+                if let Some(action) = editor_ui::inspector(ui.ctx(), editor) {
+                    actions.push(Action::Inspector(action));
+                }
             }
         });
+        self.listed = self.editor.selected();
         for action in actions {
             self.apply(action);
         }
