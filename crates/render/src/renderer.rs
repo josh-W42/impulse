@@ -8,9 +8,9 @@ use glam::camera::rh::{proj, view};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::draw_list::{DrawList, InstanceRaw, MESH_KINDS, group_by_mesh};
+use crate::draw_list::{DrawList, InstanceRaw, group_by_mesh};
 use crate::gpu::Gpu;
-use crate::mesh::{MeshKind, Vertex};
+use crate::mesh::{MeshData, MeshId, MeshKind, Vertex};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -72,6 +72,26 @@ struct GpuMesh {
     indices: wgpu::Buffer,
     index_count: u32,
 }
+
+impl GpuMesh {
+    fn new(device: &wgpu::Device, data: &MeshData) -> Self {
+        Self {
+            vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh vertices"),
+                contents: bytemuck::cast_slice(&data.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh indices"),
+                contents: bytemuck::cast_slice(&data.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+            index_count: data.indices.len() as u32,
+        }
+    }
+}
+
+const INITIAL_INSTANCE_BYTES: u64 = 64 * size_of::<InstanceRaw>() as u64;
 
 /// A vertex buffer that grows to the next power of two when a frame needs more room.
 struct GrowableBuffer {
@@ -149,8 +169,9 @@ pub struct Renderer {
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
-    meshes: [GpuMesh; MESH_KINDS],
-    instances: [GrowableBuffer; MESH_KINDS],
+    /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
+    meshes: Vec<GpuMesh>,
+    instances: Vec<GrowableBuffer>,
     lines: GrowableBuffer,
     depth: DepthTarget,
     egui: egui_wgpu::Renderer,
@@ -385,30 +406,13 @@ impl Renderer {
             cache: None,
         });
 
-        let meshes = MeshKind::ALL.map(|kind| {
-            let data = kind.data();
-            GpuMesh {
-                vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh vertices"),
-                    contents: bytemuck::cast_slice(&data.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh indices"),
-                    contents: bytemuck::cast_slice(&data.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                index_count: data.indices.len() as u32,
-            }
-        });
-        let instance_bytes = 64 * size_of::<InstanceRaw>() as u64;
-        let instances = [
-            "cube instances",
-            "sphere instances",
-            "plane instances",
-            "cylinder instances",
-        ]
-        .map(|label| GrowableBuffer::new(device, label, instance_bytes));
+        let meshes: Vec<GpuMesh> = MeshKind::ALL
+            .iter()
+            .map(|k| GpuMesh::new(device, &k.data()))
+            .collect();
+        let instances = (0..meshes.len())
+            .map(|_| GrowableBuffer::new(device, "instances", INITIAL_INSTANCE_BYTES))
+            .collect();
 
         Self {
             globals,
@@ -456,7 +460,7 @@ impl Renderer {
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
-        let groups = group_by_mesh(&list.instances);
+        let groups = group_by_mesh(&list.instances, self.meshes.len());
         for (buffer, group) in self.instances.iter_mut().zip(&groups) {
             buffer.write(device, queue, bytemuck::cast_slice(group));
         }
@@ -576,20 +580,33 @@ impl Renderer {
         }
     }
 
-    fn draw_meshes(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        groups: &[Vec<InstanceRaw>; MESH_KINDS],
-    ) {
-        for kind in MeshKind::ALL {
-            let count = groups[kind.index()].len() as u32;
+    /// Uploads a mesh for later instancing (e.g. a convex hull's shape).
+    pub fn add_mesh(&mut self, gpu: &Gpu, data: &MeshData) -> MeshId {
+        self.meshes.push(GpuMesh::new(gpu.device(), data));
+        self.instances.push(GrowableBuffer::new(
+            gpu.device(),
+            "instances",
+            INITIAL_INSTANCE_BYTES,
+        ));
+        MeshId((self.meshes.len() - 1) as u32)
+    }
+
+    /// Frees every runtime-added mesh (built-ins stay); their ids become invalid.
+    pub fn clear_custom_meshes(&mut self) {
+        self.meshes.truncate(MeshKind::ALL.len());
+        self.instances.truncate(MeshKind::ALL.len());
+    }
+
+    fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, groups: &[Vec<InstanceRaw>]) {
+        for (index, group) in groups.iter().enumerate() {
+            let count = group.len() as u32;
             if count == 0 {
                 continue;
             }
-            let mesh = &self.meshes[kind.index()];
+            let mesh = &self.meshes[index];
             let bytes = count as u64 * size_of::<InstanceRaw>() as u64;
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.instances[kind.index()].buffer.slice(..bytes));
+            pass.set_vertex_buffer(1, self.instances[index].buffer.slice(..bytes));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..mesh.index_count, 0, 0..count);
         }

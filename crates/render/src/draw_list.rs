@@ -3,13 +3,13 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
 
+use crate::mesh::MeshId;
+#[cfg(test)]
 use crate::mesh::MeshKind;
-
-pub const MESH_KINDS: usize = MeshKind::ALL.len();
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Instance {
-    pub mesh: MeshKind,
+    pub mesh: MeshId,
     pub transform: Mat4,
     /// Linear RGBA.
     pub color: [f32; 4],
@@ -34,9 +34,9 @@ impl DrawList {
         self.lines.clear();
     }
 
-    pub fn push_instance(&mut self, mesh: MeshKind, transform: Mat4, color: [f32; 4]) {
+    pub fn push_instance(&mut self, mesh: impl Into<MeshId>, transform: Mat4, color: [f32; 4]) {
         self.instances.push(Instance {
-            mesh,
+            mesh: mesh.into(),
             transform,
             color,
         });
@@ -70,11 +70,14 @@ impl InstanceRaw {
     }
 }
 
-/// Splits instances by mesh (indexed by [`MeshKind::index`]), keeping their order.
-pub fn group_by_mesh(instances: &[Instance]) -> [Vec<InstanceRaw>; MESH_KINDS] {
-    let mut groups: [Vec<InstanceRaw>; MESH_KINDS] = Default::default();
+/// Splits instances by mesh id (`mesh_count` groups), keeping their order.
+/// Instances with unknown ids are dropped.
+pub fn group_by_mesh(instances: &[Instance], mesh_count: usize) -> Vec<Vec<InstanceRaw>> {
+    let mut groups = vec![Vec::new(); mesh_count];
     for instance in instances {
-        groups[instance.mesh.index()].push(InstanceRaw::new(instance));
+        if let Some(group) = groups.get_mut(instance.mesh.0 as usize) {
+            group.push(InstanceRaw::new(instance));
+        }
     }
     groups
 }
@@ -87,7 +90,7 @@ mod tests {
 
     fn at(mesh: MeshKind, x: f32) -> Instance {
         Instance {
-            mesh,
+            mesh: mesh.into(),
             transform: Mat4::from_translation(Vec3::X * x),
             color: [1.0; 4],
         }
@@ -101,12 +104,12 @@ mod tests {
             at(MeshKind::Cube, 2.0),
             at(MeshKind::Cube, 3.0),
         ];
-        let groups = group_by_mesh(&list);
+        let groups = group_by_mesh(&list, MeshKind::ALL.len());
         let xs = |g: &Vec<InstanceRaw>| g.iter().map(|r| r.model[3][0]).collect::<Vec<_>>();
         assert_eq!(xs(&groups[MeshKind::Cube.index()]), vec![0.0, 2.0, 3.0]);
         assert_eq!(xs(&groups[MeshKind::Sphere.index()]), vec![1.0]);
         assert!(groups[MeshKind::Plane.index()].is_empty());
-        assert!(group_by_mesh(&[]).iter().all(Vec::is_empty));
+        assert!(group_by_mesh(&[], 4).iter().all(Vec::is_empty));
     }
 
     #[test]
@@ -117,7 +120,7 @@ mod tests {
             Vec3::new(4.0, 5.0, 6.0),
         );
         let raw = InstanceRaw::new(&Instance {
-            mesh: MeshKind::Cube,
+            mesh: MeshKind::Cube.into(),
             transform,
             color: [1.0; 4],
         });

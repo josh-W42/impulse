@@ -21,5 +21,5 @@ mod shaders;
 
 pub use draw_list::{DebugLine, DrawList, Instance, InstanceRaw, group_by_mesh};
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};
-pub use mesh::{MeshData, MeshKind, Vertex};
+pub use mesh::{MeshData, MeshId, MeshKind, Vertex};
 pub use renderer::{CameraData, Renderer, UiFrame};

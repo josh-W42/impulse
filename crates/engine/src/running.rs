@@ -80,6 +80,7 @@ pub struct Running {
     /// The scene currently in the world (the panel choice applies on reset).
     loaded: Demo,
     drag: Option<Drag>,
+    hull_meshes: scene::HullMeshes,
 }
 
 impl Running {
@@ -126,6 +127,25 @@ impl Running {
             physics: StepStats::default(),
             loaded: initial,
             drag: None,
+            hull_meshes: scene::HullMeshes::new(),
+        }
+        .with_hull_meshes()
+    }
+
+    fn with_hull_meshes(mut self) -> Self {
+        self.sync_hull_meshes();
+        self
+    }
+
+    /// Re-registers a render mesh for every hull shape in the (rebuilt) world.
+    fn sync_hull_meshes(&mut self) {
+        self.renderer.clear_custom_meshes();
+        self.hull_meshes.clear();
+        for id in scene::hulls_in_world(&self.world) {
+            if let Some(hull) = self.world.hull(id) {
+                let mesh = self.renderer.add_mesh(&self.gpu, &scene::hull_mesh(hull));
+                self.hull_meshes.insert(id, mesh);
+            }
         }
     }
 
@@ -359,7 +379,9 @@ impl Running {
         if self.world.solver_settings() != solver {
             self.world.set_solver_settings(solver);
         }
-        if settings.reset_requested || scene::all_below(&self.world, &self.objects, RESET_HEIGHT) {
+        let rebuild =
+            settings.reset_requested || scene::all_below(&self.world, &self.objects, RESET_HEIGHT);
+        if rebuild {
             settings.reset_requested = false;
             self.objects = scene::build(&mut self.world, settings.scene);
             self.loaded = settings.scene;
@@ -379,6 +401,9 @@ impl Running {
             plan.steps
         };
         settings.step_requested = false;
+        if rebuild {
+            self.sync_hull_meshes(); // after the last use of `settings`
+        }
 
         let start = self.start;
         let mut clock = || start.elapsed().as_secs_f64() * 1000.0;
@@ -434,10 +459,13 @@ impl Running {
             &mut self.draw_list,
             &self.world,
             &self.objects,
-            scene::pit_half(self.loaded),
-            self.alpha,
-            self.settings.show_grid,
-            self.settings.show_axes,
+            &self.hull_meshes,
+            scene::DrawOptions {
+                pit: scene::pit_half(self.loaded),
+                alpha: self.alpha,
+                show_grid: self.settings.show_grid,
+                show_axes: self.settings.show_axes,
+            },
         );
         if let Some(drag) = &self.drag
             && let Some(body) = self.world.body(drag.body)

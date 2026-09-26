@@ -11,6 +11,17 @@ pub struct Vertex {
     pub normal: [f32; 3],
 }
 
+/// Identifies a mesh the renderer can draw: a built-in [`MeshKind`] or one
+/// added at runtime with `Renderer::add_mesh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MeshId(pub u32);
+
+impl From<MeshKind> for MeshId {
+    fn from(kind: MeshKind) -> Self {
+        MeshId(kind.index() as u32)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshKind {
     Cube,

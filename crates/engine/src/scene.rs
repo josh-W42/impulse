@@ -2,8 +2,13 @@
 //! walled pit, plus how to draw it. Render sizes come from the physics colliders.
 
 use glam::{Mat4, Vec3};
-use impulse_physics::{BodyDesc, BodyHandle, Collider, Material, World};
-use impulse_render::{DrawList, MeshKind};
+use std::collections::HashMap;
+
+use impulse_physics::{BodyDesc, BodyHandle, Collider, ConvexHull, HullId, Material, World};
+use impulse_render::{DrawList, MeshData, MeshId, MeshKind, Vertex};
+
+/// Renderer meshes registered for the hull shapes in the world.
+pub type HullMeshes = HashMap<HullId, MeshId>;
 
 use crate::pose::{Pose, interpolate};
 
@@ -176,6 +181,51 @@ fn rain_bodies(world: &mut World) -> Vec<SceneObject> {
 }
 
 /// The pit demo (tests use it as the canonical scene).
+/// A faceted gem: points on a slightly squashed sphere (golden-angle spiral).
+fn gem_points(seed: usize, radius: f32) -> Vec<Vec3> {
+    let squash = 0.7 + 0.5 * spread(seed, 0.19);
+    (0..10)
+        .map(|k| {
+            let y = 1.0 - 2.0 * (k as f32 + 0.5) / 10.0;
+            let ring = (1.0 - y * y).sqrt();
+            let phi = k as f32 * 2.399_963 + seed as f32;
+            Vec3::new(ring * phi.cos(), y * squash, ring * phi.sin()) * radius
+        })
+        .collect()
+}
+
+/// Flat-shaded mesh of a hull: each face fanned into triangles carrying its normal.
+pub fn hull_mesh(hull: &ConvexHull) -> MeshData {
+    let mut mesh = MeshData {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    for face in hull.faces() {
+        let base = mesh.vertices.len() as u16;
+        mesh.vertices.extend(face.vertices.iter().map(|&v| Vertex {
+            position: hull.vertices()[v].to_array(),
+            normal: face.normal.to_array(),
+        }));
+        for k in 1..face.vertices.len() as u16 - 1 {
+            mesh.indices.extend([base, base + k, base + k + 1]);
+        }
+    }
+    mesh
+}
+
+/// Distinct hull shapes used by bodies in the world.
+pub fn hulls_in_world(world: &World) -> Vec<HullId> {
+    let mut ids = Vec::new();
+    for (_, body) in world.bodies() {
+        if let Some(Collider::Hull { hull }) = body.collider()
+            && !ids.contains(&hull)
+        {
+            ids.push(hull);
+        }
+    }
+    ids
+}
+
 #[cfg(test)]
 pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
     build(world, Demo::Pit)
@@ -227,16 +277,30 @@ fn pit_bodies(world: &mut World) -> Vec<SceneObject> {
                 0.0,
                 spread(i, 0.79) * 4.0 - 2.0,
             );
-            // Even: sphere. Odd: box of similar size, spawned tilted and spinning.
-            // Cycle sphere, box, capsule; boxes and capsules spawn tilted and spinning.
-            let (collider, mass, orientation, spin) = if i % 3 == 0 {
+            // Cycle sphere, box, capsule, gem (convex hull); all but spheres spawn
+            // tilted and spinning.
+            let (collider, mass, orientation, spin) = if i % 4 == 0 {
                 (
                     Collider::Sphere { radius },
                     8.0 * radius.powi(3),
                     glam::Quat::IDENTITY,
                     Vec3::ZERO,
                 )
-            } else if i % 3 == 2 {
+            } else if i % 4 == 3 {
+                let hull = world
+                    .add_hull(&gem_points(i, radius * 1.1))
+                    .expect("gem points form a hull");
+                (
+                    Collider::Hull { hull },
+                    8.0 * radius.powi(3),
+                    glam::Quat::from_axis_angle(Vec3::Z, spread(i, 0.53) * std::f32::consts::TAU),
+                    Vec3::new(
+                        spread(i, 0.31) - 0.5,
+                        spread(i, 0.47) - 0.5,
+                        spread(i, 0.71) - 0.5,
+                    ) * 4.0,
+                )
+            } else if i % 4 == 2 {
                 let half_height = radius * (1.0 + spread(i, 0.43));
                 (
                     Collider::Capsule {
@@ -318,14 +382,15 @@ pub fn all_below(world: &World, objects: &[SceneObject], y: f32) -> bool {
 
 /// Meshes (with transforms in body space) that draw a collider; empty for planes
 /// (drawn as scenery). A capsule is a cylinder plus a sphere at each end.
-fn collider_visual(collider: Collider) -> Vec<(MeshKind, Mat4)> {
+fn collider_visual(collider: Collider, hull_meshes: &HullMeshes) -> Vec<(MeshId, Mat4)> {
+    let kind = |k: MeshKind, m: Mat4| (MeshId::from(k), m);
     match collider {
-        Collider::Sphere { radius } => vec![(
+        Collider::Sphere { radius } => vec![kind(
             MeshKind::Sphere,
             Mat4::from_scale(Vec3::splat(radius * 2.0)),
         )],
         Collider::Box { half_extents } => {
-            vec![(MeshKind::Cube, Mat4::from_scale(half_extents * 2.0))]
+            vec![kind(MeshKind::Cube, Mat4::from_scale(half_extents * 2.0))]
         }
         Collider::Capsule {
             half_height,
@@ -335,16 +400,19 @@ fn collider_visual(collider: Collider) -> Vec<(MeshKind, Mat4)> {
                 Mat4::from_translation(Vec3::Y * y) * Mat4::from_scale(Vec3::splat(radius * 2.0))
             };
             vec![
-                (
+                kind(
                     MeshKind::Cylinder,
                     Mat4::from_scale(Vec3::new(radius * 2.0, half_height * 2.0, radius * 2.0)),
                 ),
-                (MeshKind::Sphere, cap(half_height)),
-                (MeshKind::Sphere, cap(-half_height)),
+                kind(MeshKind::Sphere, cap(half_height)),
+                kind(MeshKind::Sphere, cap(-half_height)),
             ]
         }
-        // Hull meshes are registered with the renderer per hull (next task).
-        Collider::Hull { .. } => Vec::new(),
+        // Hull vertices are already in body space, at true size.
+        Collider::Hull { hull } => hull_meshes
+            .get(&hull)
+            .map(|&mesh| vec![(mesh, Mat4::IDENTITY)])
+            .unwrap_or_default(),
         Collider::Plane { .. } => Vec::new(),
     }
 }
@@ -399,15 +467,30 @@ fn push_scenery(list: &mut DrawList, pit: f32) {
     }
 }
 
+/// How to draw a frame of the scene.
+#[derive(Debug, Clone, Copy)]
+pub struct DrawOptions {
+    /// Pit half-width (walls are drawn to match).
+    pub pit: f32,
+    /// Interpolation between the previous and current physics states.
+    pub alpha: f32,
+    pub show_grid: bool,
+    pub show_axes: bool,
+}
+
 pub fn build_draw_list(
     list: &mut DrawList,
     world: &World,
     objects: &[SceneObject],
-    pit: f32,
-    alpha: f32,
-    show_grid: bool,
-    show_axes: bool,
+    hull_meshes: &HullMeshes,
+    options: DrawOptions,
 ) {
+    let DrawOptions {
+        pit,
+        alpha,
+        show_grid,
+        show_axes,
+    } = options;
     list.clear();
     push_scenery(list, pit);
     for object in objects {
@@ -423,7 +506,7 @@ pub fn build_draw_list(
         };
         let pose = interpolate(object.prev, current, alpha);
         let body_transform = Mat4::from_rotation_translation(pose.orientation, pose.position);
-        for (mesh, local) in collider_visual(collider) {
+        for (mesh, local) in collider_visual(collider, hull_meshes) {
             list.push_instance(mesh, body_transform * local, object.color);
         }
         if show_axes {
@@ -475,6 +558,13 @@ mod tests {
                     half_height,
                     radius,
                 }) => half_height + radius,
+                Some(Collider::Hull { hull }) => world
+                    .hull(hull)
+                    .unwrap()
+                    .vertices()
+                    .iter()
+                    .map(|v| v.length())
+                    .fold(0.0, f32::max),
                 other => panic!("unexpected collider {other:?}"),
             };
             let p = body.position();
@@ -483,6 +573,23 @@ mod tests {
                 "outside the pit: {p}"
             );
             assert!(p.y - radius > 0.0, "starts in the floor: {p}");
+        }
+    }
+
+    #[test]
+    fn hull_meshes_face_outward_and_the_pit_has_gems() {
+        let mut world = World::default();
+        build(&mut world, Demo::Pit);
+        let hulls = hulls_in_world(&world);
+        assert!(!hulls.is_empty(), "the pit should contain gems");
+        for id in hulls {
+            let mesh = hull_mesh(world.hull(id).unwrap());
+            for tri in mesh.indices.chunks(3) {
+                let [a, b, c] = [tri[0], tri[1], tri[2]]
+                    .map(|i| Vec3::from(mesh.vertices[i as usize].position));
+                let n = Vec3::from(mesh.vertices[tri[0] as usize].normal);
+                assert!((b - a).cross(c - a).dot(n) > 0.0, "inward-wound triangle");
+            }
         }
     }
 
@@ -537,15 +644,32 @@ mod tests {
         snapshot(&world, &mut objects);
         world.step(0.1);
         let mut list = DrawList::default();
-        build_draw_list(&mut list, &world, &objects, PIT, 0.0, true, false);
+        build_draw_list(
+            &mut list,
+            &world,
+            &objects,
+            &HullMeshes::new(),
+            DrawOptions {
+                pit: PIT,
+                alpha: 0.0,
+                show_grid: true,
+                show_axes: false,
+            },
+        );
         // One instance per body, except capsules: cylinder + two end spheres.
         let expected: usize = objects
             .iter()
-            .map(|o| collider_visual(world.body(o.handle).unwrap().collider().unwrap()).len())
+            .map(|o| {
+                collider_visual(
+                    world.body(o.handle).unwrap().collider().unwrap(),
+                    &HullMeshes::new(),
+                )
+                .len()
+            })
             .sum();
         assert!(expected > BODY_COUNT, "the pit should include capsules");
         assert_eq!(list.instances.len(), SCENERY + expected);
-        assert_eq!(list.instances[0].mesh, MeshKind::Plane);
+        assert_eq!(list.instances[0].mesh, MeshId::from(MeshKind::Plane));
         // alpha 0 draws the pre-step pose, not the current one.
         assert_eq!(
             list.instances[SCENERY].transform.w_axis.y,
