@@ -3,7 +3,7 @@
 A 3D game engine in Rust + wgpu whose deep spike is rigid-body physics.
 Runs natively and in the browser (WebGPU, falling back to WebGL2).
 
-Live demo: https://impulse-engine.web.app (scenes: `?scene=pit|tower|pyramid|rain|joints`)
+Live demo: https://impulse-engine.web.app (scenes: `?scene=pit|tower|pyramid|rain|joints|props`)
 
 Design: `docs/plans/2026-09-24-impulse-engine-design.md` (one plan per milestone
 in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
@@ -32,6 +32,10 @@ to exactly what you authored.
 - **Capture pose** (in Play) writes the simulated poses back as the starting scene
 - Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
   opens them. The demos are available as starting points.
+- **Models** (glTF `.glb`): Add → Model… places a bundled CC0 prop
+  (`assets/models/`, see its `LICENSES.md`); import your own from `models/` on
+  desktop or with Import… in the browser. Each collides as a convex hull or a
+  fitted box/sphere/capsule; the "model colliders" toggle shows them.
 
 ## Prerequisites
 
