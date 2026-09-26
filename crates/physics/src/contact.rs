@@ -5,6 +5,7 @@ use glam::{Quat, Vec3};
 
 use crate::body::RigidBody;
 use crate::box_box::box_box;
+use crate::capsule::{Capsule, capsule_box, capsule_capsule, capsule_plane, sphere_capsule};
 use crate::collider::Collider;
 use crate::world::{BodyHandle, World};
 
@@ -206,6 +207,26 @@ fn pair_contacts(
         (Collider::Box { half_extents: ha }, Collider::Box { half_extents: hb }) => {
             (box_box(pa, qa, ha, pb, qb, hb), false)
         }
+        (
+            Collider::Capsule {
+                half_height,
+                radius,
+            },
+            other,
+        ) => {
+            let capsule = Capsule::new(pa, qa, half_height, radius);
+            (capsule_versus(capsule, other, pb, qb), false)
+        }
+        (
+            other,
+            Collider::Capsule {
+                half_height,
+                radius,
+            },
+        ) => {
+            let capsule = Capsule::new(pb, qb, half_height, radius);
+            (capsule_versus(capsule, other, pa, qa), true)
+        }
         (Collider::Plane { .. }, Collider::Plane { .. }) => (Vec::new(), false),
     };
     let (a, b) = if flipped { (hb, ha) } else { (ha, hb) };
@@ -216,6 +237,30 @@ fn pair_contacts(
         depth,
         point,
     }));
+}
+
+/// Capsule (as A) against any other collider (as B).
+fn capsule_versus(
+    capsule: Capsule,
+    other: Collider,
+    position: Vec3,
+    orientation: Quat,
+) -> Vec<Geometry> {
+    match other {
+        Collider::Plane { normal } => capsule_plane(capsule, position, normal),
+        Collider::Sphere { radius } => sphere_capsule(position, radius, capsule)
+            .map(|(normal, depth, point)| (-normal, depth, point)) // sphere→capsule flipped
+            .into_iter()
+            .collect(),
+        Collider::Box { half_extents } => capsule_box(capsule, position, orientation, half_extents),
+        Collider::Capsule {
+            half_height,
+            radius,
+        } => capsule_capsule(
+            capsule,
+            Capsule::new(position, orientation, half_height, radius),
+        ),
+    }
 }
 
 #[cfg(test)]

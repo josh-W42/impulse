@@ -8,7 +8,7 @@ use glam::camera::rh::{proj, view};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::draw_list::{DrawList, InstanceRaw, group_by_mesh};
+use crate::draw_list::{DrawList, InstanceRaw, MESH_KINDS, group_by_mesh};
 use crate::gpu::Gpu;
 use crate::mesh::{MeshKind, Vertex};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
@@ -149,8 +149,8 @@ pub struct Renderer {
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
-    meshes: [GpuMesh; 3],
-    instances: [GrowableBuffer; 3],
+    meshes: [GpuMesh; MESH_KINDS],
+    instances: [GrowableBuffer; MESH_KINDS],
     lines: GrowableBuffer,
     depth: DepthTarget,
     egui: egui_wgpu::Renderer,
@@ -402,8 +402,13 @@ impl Renderer {
             }
         });
         let instance_bytes = 64 * size_of::<InstanceRaw>() as u64;
-        let instances = ["cube instances", "sphere instances", "plane instances"]
-            .map(|label| GrowableBuffer::new(device, label, instance_bytes));
+        let instances = [
+            "cube instances",
+            "sphere instances",
+            "plane instances",
+            "cylinder instances",
+        ]
+        .map(|label| GrowableBuffer::new(device, label, instance_bytes));
 
         Self {
             globals,
@@ -571,7 +576,11 @@ impl Renderer {
         }
     }
 
-    fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, groups: &[Vec<InstanceRaw>; 3]) {
+    fn draw_meshes(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        groups: &[Vec<InstanceRaw>; MESH_KINDS],
+    ) {
         for kind in MeshKind::ALL {
             let count = groups[kind.index()].len() as u32;
             if count == 0 {

@@ -8,21 +8,16 @@ use glam::{Mat3, Quat, Vec3};
 /// A convex shape posed in world space, described by its support mapping.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Convex {
-    Sphere {
-        center: Vec3,
-        radius: f32,
-    },
+    // Used by the GJK tests; convex hulls (M6b) will pair with it too.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Sphere { center: Vec3, radius: f32 },
     Box {
         center: Vec3,
         axes: Mat3,
         half: Vec3,
     },
     /// Segment from `a` to `b`, inflated by `radius`.
-    Capsule {
-        a: Vec3,
-        b: Vec3,
-        radius: f32,
-    },
+    Capsule { a: Vec3, b: Vec3, radius: f32 },
 }
 
 impl Convex {

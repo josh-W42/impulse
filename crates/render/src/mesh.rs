@@ -16,10 +16,17 @@ pub enum MeshKind {
     Cube,
     Sphere,
     Plane,
+    /// Open tube (radius 0.5, height 1 along Y); capsules cap it with spheres.
+    Cylinder,
 }
 
 impl MeshKind {
-    pub const ALL: [MeshKind; 3] = [MeshKind::Cube, MeshKind::Sphere, MeshKind::Plane];
+    pub const ALL: [MeshKind; 4] = [
+        MeshKind::Cube,
+        MeshKind::Sphere,
+        MeshKind::Plane,
+        MeshKind::Cylinder,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -30,6 +37,7 @@ impl MeshKind {
             MeshKind::Cube => cube(),
             MeshKind::Sphere => uv_sphere(32, 16),
             MeshKind::Plane => plane(),
+            MeshKind::Cylinder => cylinder(32),
         }
     }
 }
@@ -98,6 +106,30 @@ pub fn plane() -> MeshData {
     push_quad(&mut mesh, [-x + z, x + z, x - z, -x - z], Vec3::Y);
     // Same corners reversed: counter-clockwise seen from below.
     push_quad(&mut mesh, [-x - z, x - z, x + z, -x + z], Vec3::NEG_Y);
+    mesh
+}
+
+/// Side wall only: the ends are hidden inside a capsule's end spheres.
+pub fn cylinder(segments: u16) -> MeshData {
+    assert!(segments >= 3);
+    let mut mesh = MeshData {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    for segment in 0..=segments {
+        let phi = std::f32::consts::TAU * segment as f32 / segments as f32;
+        let normal = Vec3::new(phi.cos(), 0.0, -phi.sin());
+        for y in [-0.5, 0.5] {
+            mesh.vertices
+                .push(vertex(normal * 0.5 + Vec3::Y * y, normal));
+        }
+    }
+    for segment in 0..segments {
+        let (bottom, top) = (segment * 2, segment * 2 + 1);
+        let (next_bottom, next_top) = (bottom + 2, top + 2);
+        mesh.indices
+            .extend([bottom, next_bottom, next_top, bottom, next_top, top]);
+    }
     mesh
 }
 

@@ -135,7 +135,10 @@ fn support_edge(obb: &Obb, axis: usize, direction: Vec3) -> (Vec3, Vec3, f32) {
 }
 
 /// Closest points between segments `center ± direction·half` (directions unit length).
-fn closest_points_on_segments(s1: (Vec3, Vec3, f32), s2: (Vec3, Vec3, f32)) -> (Vec3, Vec3) {
+pub(crate) fn closest_points_on_segments(
+    s1: (Vec3, Vec3, f32),
+    s2: (Vec3, Vec3, f32),
+) -> (Vec3, Vec3) {
     let ((p1, d1, h1), (p2, d2, h2)) = (s1, s2);
     let r = p1 - p2;
     let b = d1.dot(d2);

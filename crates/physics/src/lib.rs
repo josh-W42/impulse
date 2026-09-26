@@ -7,6 +7,7 @@
 mod body;
 mod box_box;
 mod broadphase;
+mod capsule;
 mod collider;
 mod contact;
 mod gjk;

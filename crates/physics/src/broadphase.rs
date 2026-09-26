@@ -21,6 +21,10 @@ impl Aabb {
             Collider::Sphere { radius } => Vec3::splat(radius),
             // Projection of the box onto each world axis: |R|·h.
             Collider::Box { half_extents } => Mat3::from_quat(orientation).abs() * half_extents,
+            Collider::Capsule {
+                half_height,
+                radius,
+            } => (orientation * Vec3::Y * half_height).abs() + Vec3::splat(radius),
             Collider::Plane { .. } => return None,
         };
         Some(Aabb {

@@ -301,11 +301,47 @@ pub fn all_below(world: &World, objects: &[SceneObject], y: f32) -> bool {
 }
 
 /// Mesh and scale for drawing a collider; `None` for planes (drawn as scenery).
-fn collider_visual(collider: Collider) -> Option<(MeshKind, Vec3)> {
+/// Meshes (with transforms in body space) that draw a collider; empty for planes
+/// (drawn as scenery). A capsule is a cylinder plus a sphere at each end.
+fn collider_visual(collider: Collider) -> Vec<(MeshKind, Mat4)> {
     match collider {
-        Collider::Sphere { radius } => Some((MeshKind::Sphere, Vec3::splat(radius * 2.0))),
-        Collider::Box { half_extents } => Some((MeshKind::Cube, half_extents * 2.0)),
-        Collider::Plane { .. } => None,
+        Collider::Sphere { radius } => vec![(
+            MeshKind::Sphere,
+            Mat4::from_scale(Vec3::splat(radius * 2.0)),
+        )],
+        Collider::Box { half_extents } => {
+            vec![(MeshKind::Cube, Mat4::from_scale(half_extents * 2.0))]
+        }
+        Collider::Capsule {
+            half_height,
+            radius,
+        } => {
+            let cap = |y: f32| {
+                Mat4::from_translation(Vec3::Y * y) * Mat4::from_scale(Vec3::splat(radius * 2.0))
+            };
+            vec![
+                (
+                    MeshKind::Cylinder,
+                    Mat4::from_scale(Vec3::new(radius * 2.0, half_height * 2.0, radius * 2.0)),
+                ),
+                (MeshKind::Sphere, cap(half_height)),
+                (MeshKind::Sphere, cap(-half_height)),
+            ]
+        }
+        Collider::Plane { .. } => Vec::new(),
+    }
+}
+
+/// Rough size for drawing a body's axes.
+fn collider_extent(collider: Collider) -> f32 {
+    match collider {
+        Collider::Sphere { radius } => radius * 2.0,
+        Collider::Box { half_extents } => half_extents.max_element() * 2.0,
+        Collider::Capsule {
+            half_height,
+            radius,
+        } => (half_height + radius) * 2.0,
+        Collider::Plane { .. } => 0.0,
     }
 }
 
@@ -360,7 +396,7 @@ pub fn build_draw_list(
         let Some(body) = world.body(object.handle) else {
             continue;
         };
-        let Some((mesh, scale)) = body.collider().and_then(collider_visual) else {
+        let Some(collider) = body.collider() else {
             continue;
         };
         let current = Pose {
@@ -368,11 +404,12 @@ pub fn build_draw_list(
             orientation: body.orientation(),
         };
         let pose = interpolate(object.prev, current, alpha);
-        let transform =
-            Mat4::from_scale_rotation_translation(scale, pose.orientation, pose.position);
-        list.push_instance(mesh, transform, object.color);
+        let body_transform = Mat4::from_rotation_translation(pose.orientation, pose.position);
+        for (mesh, local) in collider_visual(collider) {
+            list.push_instance(mesh, body_transform * local, object.color);
+        }
         if show_axes {
-            let length = scale.max_element();
+            let length = collider_extent(collider);
             for (axis, color) in [
                 (Vec3::X, [1.0, 0.2, 0.2, 1.0]),
                 (Vec3::Y, [0.2, 1.0, 0.2, 1.0]),

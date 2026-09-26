@@ -10,6 +10,11 @@ pub enum Collider {
     Box {
         half_extents: Vec3,
     },
+    /// Segment of length `2·half_height` along the body's local Y, inflated by `radius`.
+    Capsule {
+        half_height: f32,
+        radius: f32,
+    },
     /// Infinite plane through the body's position. Static bodies only; the
     /// normal points out of the solid side and is normalized on creation.
     Plane {

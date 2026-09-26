@@ -242,6 +242,16 @@ fn validate_collider(collider: Collider, is_static: bool) -> Result<Collider, Bo
         {
             Ok(collider)
         }
+        Collider::Capsule {
+            half_height,
+            radius,
+        } if half_height.is_finite()
+            && half_height >= 0.0
+            && radius.is_finite()
+            && radius > 0.0 =>
+        {
+            Ok(collider)
+        }
         Collider::Plane { normal } if is_static && normal.is_finite() && normal.length() > 1e-6 => {
             Ok(Collider::Plane {
                 normal: normal.normalize(),
@@ -263,14 +273,41 @@ fn inverse_inertia(collider: Option<Collider>, inverse_mass: f32) -> Vec3 {
             let s = h * h;
             Vec3::new(s.y + s.z, s.x + s.z, s.x + s.y) * (mass / 3.0)
         }
+        Some(Collider::Capsule {
+            half_height: h,
+            radius: r,
+        }) => capsule_inertia(mass, h, r),
         _ => return Vec3::ZERO,
     };
     inertia.recip()
 }
 
+/// Capsule along Y: a cylinder (length 2h) plus two hemispheres, mass split by volume.
+fn capsule_inertia(mass: f32, h: f32, r: f32) -> Vec3 {
+    let cylinder_volume = std::f32::consts::PI * r * r * 2.0 * h;
+    let sphere_volume = 4.0 / 3.0 * std::f32::consts::PI * r * r * r;
+    let mc = mass * cylinder_volume / (cylinder_volume + sphere_volume);
+    let ms = mass - mc;
+    let axial = mc * r * r / 2.0 + ms * 0.4 * r * r;
+    // Hemispheres about the capsule's center (parallel-axis to their centroids).
+    let transverse = mc * (h * h / 3.0 + r * r / 4.0) + ms * (0.4 * r * r + h * h + 0.375 * h * r);
+    Vec3::new(transverse, axial, transverse)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capsule_inertia_approaches_sphere_and_rod_limits() {
+        // No cylinder: a solid sphere, 2/5·m·r² about every axis.
+        let sphere = capsule_inertia(2.0, 0.0, 0.5);
+        assert!(sphere.abs_diff_eq(Vec3::splat(0.4 * 2.0 * 0.25), 1e-6));
+        // Vanishing radius: a thin rod of length 2h, m·L²/12 transverse.
+        let rod = capsule_inertia(3.0, 1.0, 1e-4);
+        assert!((rod.x - 3.0 * 4.0 / 12.0).abs() < 1e-3, "{rod}");
+        assert!(rod.y < 1e-6);
+    }
 
     #[test]
     fn inertia_matches_textbook_formulas() {

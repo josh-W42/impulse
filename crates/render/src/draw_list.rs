@@ -5,6 +5,8 @@ use glam::{Mat3, Mat4, Vec3};
 
 use crate::mesh::MeshKind;
 
+pub const MESH_KINDS: usize = MeshKind::ALL.len();
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Instance {
     pub mesh: MeshKind,
@@ -69,8 +71,8 @@ impl InstanceRaw {
 }
 
 /// Splits instances by mesh (indexed by [`MeshKind::index`]), keeping their order.
-pub fn group_by_mesh(instances: &[Instance]) -> [Vec<InstanceRaw>; 3] {
-    let mut groups: [Vec<InstanceRaw>; 3] = Default::default();
+pub fn group_by_mesh(instances: &[Instance]) -> [Vec<InstanceRaw>; MESH_KINDS] {
+    let mut groups: [Vec<InstanceRaw>; MESH_KINDS] = Default::default();
     for instance in instances {
         groups[instance.mesh.index()].push(InstanceRaw::new(instance));
     }
