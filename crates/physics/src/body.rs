@@ -106,8 +106,9 @@ pub struct RigidBody {
     pub(crate) velocity: Vec3,
     pub(crate) angular_velocity: Vec3,
     inverse_mass: f32,
-    /// Diagonal of the inverse inertia tensor in body space (principal axes).
-    inverse_inertia_local: Vec3,
+    /// Inverse inertia tensor in body space. Diagonal for primitives; full for
+    /// convex hulls, whose principal axes needn't match the body axes.
+    inverse_inertia_local: Mat3,
     /// Sleeping bodies skip gravity, solving, and integration until woken.
     pub(crate) asleep: bool,
     /// Seconds spent below the sleep speed thresholds.
@@ -140,10 +141,10 @@ impl RigidBody {
             .collider
             .map(|c| validate_collider(c, inverse_mass == 0.0))
             .transpose()?;
-        let inverse_inertia_local = inverse_inertia(collider, inverse_mass);
+        let inverse_inertia_local = Mat3::from_diagonal(inverse_inertia(collider, inverse_mass));
         let (velocity, angular_velocity) = if inverse_mass == 0.0 {
             (Vec3::ZERO, Vec3::ZERO)
-        } else if inverse_inertia_local == Vec3::ZERO {
+        } else if inverse_inertia_local == Mat3::ZERO {
             (desc.velocity, Vec3::ZERO)
         } else {
             (desc.velocity, desc.angular_velocity)
@@ -208,7 +209,7 @@ impl RigidBody {
     /// Inverse inertia tensor in world space: `R·I⁻¹·Rᵀ`. Zero if the body can't rotate.
     pub fn inverse_inertia_world(&self) -> Mat3 {
         let r = Mat3::from_quat(self.orientation);
-        r * Mat3::from_diagonal(self.inverse_inertia_local) * r.transpose()
+        r * self.inverse_inertia_local * r.transpose()
     }
 
     /// First half of semi-implicit Euler: forces change velocity.
