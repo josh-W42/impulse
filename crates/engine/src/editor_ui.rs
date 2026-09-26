@@ -6,7 +6,7 @@ use impulse_physics::World;
 
 use crate::editor::Editor;
 use crate::scene::{SceneObject, default_name};
-use crate::scene_desc::{BodyType, JointKindSpec, ObjectDesc, ShapeDesc};
+use crate::scene_desc::{BodyType, JointKindSpec, ObjectDesc, SceneDesc, ShapeDesc};
 
 /// Requests from the inspector that the app carries out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +171,77 @@ fn joint_label(kind: &JointKindSpec) -> &'static str {
         JointKindSpec::Distance { .. } => "distance",
     }
 }
+
+/// Indices of the objects whose names contain `filter` (ignoring case), in
+/// scene order; every object when the filter is blank.
+pub fn filtered_objects(desc: &SceneDesc, filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    desc.objects
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| needle.is_empty() || o.name.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn kind_tag(shape: &Option<ShapeDesc>) -> &'static str {
+    match ShapeKind::of(shape) {
+        ShapeKind::Anchor => "anchor",
+        ShapeKind::Sphere => "sphere",
+        ShapeKind::Box => "box",
+        ShapeKind::Capsule => "capsule",
+        ShapeKind::Gem => "gem",
+    }
+}
+
+/// Every object by name; clicking a row selects it. `follow` scrolls the list
+/// to the selection (when it was picked in the viewport). Only visible rows
+/// are laid out, so a 1,000-object scene stays cheap.
+pub fn outliner(ctx: &egui::Context, editor: &mut Editor, filter: &mut String, follow: bool) {
+    egui::Window::new("objects")
+        .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(filter)
+                    .hint_text("filter by name")
+                    .desired_width(200.0),
+            );
+            let rows = filtered_objects(editor.desc(), filter);
+            let row_height =
+                ui.text_style_height(&egui::TextStyle::Button) + ui.spacing().item_spacing.y;
+            let mut area = egui::ScrollArea::vertical()
+                .max_height(ROWS_SHOWN * row_height)
+                .auto_shrink([false, true]);
+            if follow
+                && let Some(selected) = editor.selected()
+                && let Some(row) = rows.iter().position(|&i| i == selected)
+            {
+                // Put the selection a couple of rows below the top.
+                area = area.vertical_scroll_offset((row as f32 - 2.0).max(0.0) * row_height);
+            }
+            let mut clicked = None;
+            area.show_rows(ui, row_height, rows.len(), |ui, range| {
+                for &index in &rows[range] {
+                    let object = &editor.desc().objects[index];
+                    let label = format!("{}   {}", object.name, kind_tag(&object.shape));
+                    let selected = editor.selected() == Some(index);
+                    if ui.selectable_label(selected, label).clicked() {
+                        clicked = Some(index);
+                    }
+                }
+            });
+            if rows.is_empty() {
+                ui.label("no matching objects");
+            }
+            if let Some(index) = clicked {
+                editor.select(Some(index));
+            }
+        });
+}
+
+/// Rows visible in the objects list before it scrolls.
+const ROWS_SHOWN: f32 = 12.0;
 
 /// The inspector for the selected object; edits go straight into `editor` as
 /// part of the current gesture (the caller commits when interaction ends).
@@ -365,6 +436,51 @@ mod tests {
                 assert_eq!(editor.revision(), revision, "{demo:?} object {index}");
             }
         }
+    }
+
+    #[test]
+    fn the_filter_matches_names_ignoring_case_and_tracks_edits() {
+        let mut editor = Editor::new(crate::scene::demo_desc(crate::scene::Demo::Joints));
+        let all = filtered_objects(editor.desc(), "  ");
+        assert_eq!(all.len(), editor.desc().objects.len());
+        let boxes = filtered_objects(editor.desc(), "BOX");
+        assert!(!boxes.is_empty());
+        assert!(
+            boxes
+                .iter()
+                .all(|&i| editor.desc().objects[i].name.contains("box"))
+        );
+        assert!(filtered_objects(editor.desc(), "no such thing").is_empty());
+
+        // Rows always index the current scene: after a delete and an undo the
+        // same row selects the same object again.
+        let first_box = boxes[0];
+        let name = editor.desc().objects[first_box].name.clone();
+        editor.select(Some(first_box));
+        editor.delete_selected();
+        assert!(!filtered_objects(editor.desc(), &name).contains(&first_box));
+        editor.undo();
+        let row = filtered_objects(editor.desc(), &name);
+        assert_eq!(row, [first_box]);
+        editor.select(Some(row[0]));
+        assert_eq!(editor.desc().objects[editor.selected().unwrap()].name, name);
+    }
+
+    /// The list's idle frames must not touch the scene either.
+    #[test]
+    fn the_outliner_changes_nothing_by_itself() {
+        let ctx = egui::Context::default();
+        let mut editor = Editor::new(crate::scene::demo_desc(crate::scene::Demo::Rain));
+        editor.select(Some(500));
+        let mut filter = String::new();
+        for follow in [true, false, false] {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                outliner(ui.ctx(), &mut editor, &mut filter, follow);
+            });
+            output.textures_delta.clear();
+        }
+        assert_eq!(editor.revision(), 0);
+        assert_eq!(editor.selected(), Some(500));
     }
 
     #[test]
