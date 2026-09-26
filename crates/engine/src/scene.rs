@@ -15,7 +15,7 @@ pub struct SceneObject {
     pub prev: Pose,
 }
 
-/// Alternating spheres and boxes.
+/// Spheres, boxes, and capsules in turn.
 pub const BODY_COUNT: usize = 30;
 /// Inner half-width of the pit (walls are planes at ±PIT).
 const PIT: f32 = 6.0;
@@ -228,12 +228,28 @@ fn pit_bodies(world: &mut World) -> Vec<SceneObject> {
                 spread(i, 0.79) * 4.0 - 2.0,
             );
             // Even: sphere. Odd: box of similar size, spawned tilted and spinning.
-            let (collider, mass, orientation, spin) = if i % 2 == 0 {
+            // Cycle sphere, box, capsule; boxes and capsules spawn tilted and spinning.
+            let (collider, mass, orientation, spin) = if i % 3 == 0 {
                 (
                     Collider::Sphere { radius },
                     8.0 * radius.powi(3),
                     glam::Quat::IDENTITY,
                     Vec3::ZERO,
+                )
+            } else if i % 3 == 2 {
+                let half_height = radius * (1.0 + spread(i, 0.43));
+                (
+                    Collider::Capsule {
+                        half_height,
+                        radius: radius * 0.6,
+                    },
+                    8.0 * radius.powi(3),
+                    glam::Quat::from_axis_angle(Vec3::X, spread(i, 0.53) * std::f32::consts::TAU),
+                    Vec3::new(
+                        spread(i, 0.31) - 0.5,
+                        spread(i, 0.47) - 0.5,
+                        spread(i, 0.71) - 0.5,
+                    ) * 4.0,
                 )
             } else {
                 let half_extents =
@@ -453,6 +469,10 @@ mod tests {
             let radius = match body.collider() {
                 Some(Collider::Sphere { radius }) => radius,
                 Some(Collider::Box { half_extents }) => half_extents.length(),
+                Some(Collider::Capsule {
+                    half_height,
+                    radius,
+                }) => half_height + radius,
                 other => panic!("unexpected collider {other:?}"),
             };
             let p = body.position();
@@ -516,7 +536,13 @@ mod tests {
         world.step(0.1);
         let mut list = DrawList::default();
         build_draw_list(&mut list, &world, &objects, PIT, 0.0, true, false);
-        assert_eq!(list.instances.len(), SCENERY + BODY_COUNT);
+        // One instance per body, except capsules: cylinder + two end spheres.
+        let expected: usize = objects
+            .iter()
+            .map(|o| collider_visual(world.body(o.handle).unwrap().collider().unwrap()).len())
+            .sum();
+        assert!(expected > BODY_COUNT, "the pit should include capsules");
+        assert_eq!(list.instances.len(), SCENERY + expected);
         assert_eq!(list.instances[0].mesh, MeshKind::Plane);
         // alpha 0 draws the pre-step pose, not the current one.
         assert_eq!(
