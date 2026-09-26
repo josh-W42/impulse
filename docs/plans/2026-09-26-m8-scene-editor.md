@@ -54,7 +54,9 @@ struct JointSpec { a: usize, b: usize, kind: JointKindSpec, collide_connected: b
   Browser: download the file, or upload one through a file picker (web-sys
   features only). The demos stay available as templates, and `?scene=` still
   works.
-- **Deferred** — gizmos, joint authoring, multi-select, hierarchy, prefabs.
+- **Deferred** — gizmos, joint authoring, multi-select, hierarchy (backlog M10?), prefabs.
+- **Added after review** — a flat objects list (Edit mode): select by name, filter,
+  follows viewport picks; invisible anchors become selectable.
 
 ## Tasks (TDD; fmt + clippy ×2; commit each)
 

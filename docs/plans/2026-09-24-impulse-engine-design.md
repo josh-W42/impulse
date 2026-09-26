@@ -102,6 +102,14 @@ Each milestone ends with a deployed live demo.
 | M6 | Generic convex: GJK + EPA, capsules, convex hulls, raycasts, mouse-drag picking | Advanced collision algorithms | Throw arbitrary shapes |
 | M7 | Joints: ball-socket, hinge, distance | Constraint generalization | Rope bridge, chain, simple ragdoll |
 
+After M7 (engine usability, chosen 2026-09-26):
+
+| # | Milestone | Status |
+|---|---|---|
+| M8 | RON scene format + edit/play editor, save/load (`2026-09-26-m8-scene-editor.md`); plus a flat objects list | Done |
+| M9 | glTF models + textures; mesh-derived colliders (fitted primitives, or a hull from sampled extreme points) as a new object kind | Next |
+| M10? | **Scene hierarchy** (possible): a tree in the objects list. Needs a design pass first: groups vs. real parenting (do children move with parents? world or local poses in the file?), a format version bump with migration, drag-to-reparent, and how joints and physics interact with nested transforms (physics bodies stay flat). | Backlog |
+
 Stretch (only if wanted):
 
 - Continuous collision detection (speculative contacts).
