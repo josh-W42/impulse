@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use glam::{Mat4, Vec3};
 use impulse_assets::{MaterialData, ModelData, ModelError, extreme_points, load_glb, mip_chain};
@@ -62,6 +62,7 @@ impl ModelAsset {
     }
 }
 
+#[derive(Clone)]
 struct Entry {
     name: String,
     asset: Arc<ModelAsset>,
@@ -97,18 +98,24 @@ impl std::fmt::Display for ImportError {
 }
 
 impl ModelRegistry {
-    /// The bundled library.
+    /// The bundled library. Parsed once per process and shared (cheap to call).
     pub fn bundled() -> Self {
-        let mut registry = Self::default();
-        for (name, bytes) in BUNDLED {
-            let data = load_glb(bytes).expect("bundled models are valid");
-            registry.entries.push(Entry {
-                name: name.to_string(),
-                asset: Arc::new(ModelAsset::new(data)),
-                bundled: true,
-            });
+        static PARSED: OnceLock<Vec<Entry>> = OnceLock::new();
+        let entries = PARSED.get_or_init(|| {
+            BUNDLED
+                .iter()
+                .map(|(name, bytes)| Entry {
+                    name: name.to_string(),
+                    asset: Arc::new(ModelAsset::new(
+                        load_glb(bytes).expect("bundled models are valid"),
+                    )),
+                    bundled: true,
+                })
+                .collect()
+        });
+        Self {
+            entries: entries.clone(),
         }
-        registry
     }
 
     /// Adds (or replaces) an imported model named after `file_name`'s stem;
