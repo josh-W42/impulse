@@ -24,11 +24,13 @@ pub struct Sky {
 impl Default for Sky {
     fn default() -> Self {
         Self {
-            zenith: Vec3::new(0.22, 0.42, 0.85),
-            horizon: Vec3::new(0.62, 0.72, 0.86),
-            ground: Vec3::new(0.20, 0.19, 0.18),
+            // Sky light about a third of the sun's on a level surface, as
+            // on a clear day; brighter reads flat and washed out.
+            zenith: Vec3::new(0.12, 0.24, 0.50),
+            horizon: Vec3::new(0.36, 0.40, 0.46),
+            ground: Vec3::new(0.12, 0.11, 0.10),
             sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(),
-            sun_color: Vec3::new(3.2, 3.0, 2.7),
+            sun_color: Vec3::new(3.0, 2.85, 2.6),
         }
     }
 }

@@ -197,8 +197,12 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
     let mut desc = SceneDesc {
         version: SCENE_VERSION,
         name: demo.label().to_string(),
-        arena: Arena::Pit {
-            half: pit_half(demo),
+        // The chart is for looking at: no walls in the way.
+        arena: match demo {
+            Demo::Materials => Arena::Floor,
+            _ => Arena::Pit {
+                half: pit_half(demo),
+            },
         },
         objects,
         joints,
