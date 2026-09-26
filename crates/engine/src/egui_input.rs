@@ -12,7 +12,10 @@ use winit::keyboard::{KeyCode, ModifiersState};
 #[derive(Debug)]
 pub struct EguiInput {
     raw: RawInput,
-    pixels_per_point: f32,
+    /// The display's scale factor (physical pixels per logical pixel).
+    scale_factor: f32,
+    /// The user's UI size multiplier on top of it.
+    ui_scale: f32,
     pointer: Option<Pos2>,
     focused: bool,
     touch_id: Option<u64>,
@@ -20,10 +23,11 @@ pub struct EguiInput {
 }
 
 impl EguiInput {
-    pub fn new(pixels_per_point: f32) -> Self {
+    pub fn new(scale_factor: f32) -> Self {
         Self {
             raw: RawInput::default(),
-            pixels_per_point: sanitize_ppp(pixels_per_point),
+            scale_factor: sanitize_ppp(scale_factor),
+            ui_scale: 1.0,
             pointer: None,
             focused: true,
             touch_id: None,
@@ -31,15 +35,29 @@ impl EguiInput {
         }
     }
 
-    pub fn set_pixels_per_point(&mut self, pixels_per_point: f32) {
-        self.pixels_per_point = sanitize_ppp(pixels_per_point);
+    pub fn set_pixels_per_point(&mut self, scale_factor: f32) {
+        self.scale_factor = sanitize_ppp(scale_factor);
+    }
+
+    /// Scales the whole UI (text, windows, hit areas). Applied here rather than
+    /// with egui's own zoom so pointer positions are converted with the same
+    /// factor the UI is laid out with.
+    pub fn set_ui_scale(&mut self, ui_scale: f32) {
+        self.ui_scale = if ui_scale.is_finite() {
+            ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
+        } else {
+            1.0
+        };
+    }
+
+    /// Physical pixels per egui point.
+    fn pixels_per_point(&self) -> f32 {
+        self.scale_factor * self.ui_scale
     }
 
     fn to_points(&self, physical: (f64, f64)) -> Pos2 {
-        Pos2::new(
-            physical.0 as f32 / self.pixels_per_point,
-            physical.1 as f32 / self.pixels_per_point,
-        )
+        let ppp = self.pixels_per_point();
+        Pos2::new(physical.0 as f32 / ppp, physical.1 as f32 / ppp)
     }
 
     /// `physical` is the cursor position in physical pixels.
@@ -72,7 +90,7 @@ impl EguiInput {
 
     /// Pixel deltas arrive in physical pixels; egui wants points.
     pub fn on_wheel_pixels(&mut self, x: f64, y: f64) {
-        let delta = Vec2::new(x as f32, y as f32) / self.pixels_per_point;
+        let delta = Vec2::new(x as f32, y as f32) / self.pixels_per_point();
         self.push_wheel(MouseWheelUnit::Point, delta);
     }
 
@@ -152,14 +170,14 @@ impl EguiInput {
         let size = Vec2::new(size_in_pixels[0] as f32, size_in_pixels[1] as f32);
         raw.screen_rect = Some(Rect::from_min_size(
             Pos2::ZERO,
-            size / self.pixels_per_point,
+            size / self.pixels_per_point(),
         ));
         raw.time = Some(time);
         raw.focused = self.focused;
         raw.viewports
             .entry(raw.viewport_id)
             .or_default()
-            .native_pixels_per_point = Some(self.pixels_per_point);
+            .native_pixels_per_point = Some(self.pixels_per_point());
         raw
     }
 }
@@ -192,6 +210,9 @@ fn egui_key(code: KeyCode) -> Option<Key> {
         _ => return None,
     })
 }
+
+pub const MIN_UI_SCALE: f32 = 0.75;
+pub const MAX_UI_SCALE: f32 = 2.0;
 
 fn sanitize_ppp(pixels_per_point: f32) -> f32 {
     if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
@@ -301,6 +322,36 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn ui_scale_enlarges_the_ui_and_pointer_positions_follow() {
+        let mut input = EguiInput::new(2.0);
+        input.set_ui_scale(1.5);
+        input.on_cursor_moved((300.0, 150.0));
+        let raw = input.take([900, 600], 0.0);
+        // 3 physical pixels per point: the cursor and screen shrink in points,
+        // so everything drawn in points comes out 1.5x larger.
+        assert_eq!(
+            raw.events,
+            vec![Event::PointerMoved(Pos2::new(100.0, 50.0))]
+        );
+        assert_eq!(
+            raw.screen_rect,
+            Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 200.0)))
+        );
+        assert_eq!(
+            raw.viewports[&raw.viewport_id].native_pixels_per_point,
+            Some(3.0)
+        );
+        input.set_ui_scale(10.0);
+        input.on_cursor_moved((200.0, 0.0));
+        let raw = input.take([10, 10], 0.0);
+        assert_eq!(
+            raw.events,
+            vec![Event::PointerMoved(Pos2::new(50.0, 0.0))],
+            "clamped to 2x"
+        );
     }
 
     #[test]

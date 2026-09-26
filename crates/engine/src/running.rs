@@ -114,6 +114,8 @@ struct Settings {
     /// Desktop: `.glb` files in `models/`, refreshed when the import list opens.
     model_files: Vec<String>,
     show_colliders: bool,
+    /// UI size multiplier (A−/A+ in the panel).
+    ui_scale: f32,
     warm_starting: bool,
     iterations: usize,
     sleeping: bool,
@@ -194,7 +196,13 @@ impl Running {
                 distance: 28.0,
             }),
             input: InputState::new(),
-            egui_ctx: egui::Context::default(),
+            egui_ctx: {
+                let ctx = egui::Context::default();
+                // UI size is ours (see EguiInput::set_ui_scale); egui's own
+                // Ctrl +/- zoom would desync pointer positions from the layout.
+                ctx.options_mut(|o| o.zoom_with_keyboard = false);
+                ctx
+            },
             egui_input: EguiInput::new(window.scale_factor() as f32),
             draw_list: DrawList::default(),
             settings: Settings {
@@ -208,6 +216,7 @@ impl Running {
                 saved: Vec::new(),
                 model_files: Vec::new(),
                 show_colliders: false,
+                ui_scale: platform::DEFAULT_UI_SCALE,
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
                 sleeping: SolverSettings::default().sleeping,
@@ -906,6 +915,7 @@ impl Running {
         }
 
         let (width, height) = self.gpu.size();
+        self.egui_input.set_ui_scale(self.settings.ui_scale);
         let raw = self
             .egui_input
             .take([width, height], self.start.elapsed().as_secs_f64());
@@ -1219,6 +1229,26 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");
             ui.checkbox(&mut s.show_colliders, "model colliders");
+            ui.horizontal(|ui| {
+                use crate::egui_input::{MAX_UI_SCALE, MIN_UI_SCALE};
+                ui.label("UI size");
+                let step = |scale: f32, by: f32| {
+                    ((scale + by) * 20.0).round() / 20.0
+                };
+                if ui
+                    .add_enabled(s.ui_scale > MIN_UI_SCALE, egui::Button::new("A−"))
+                    .clicked()
+                {
+                    s.ui_scale = step(s.ui_scale, -0.1).max(MIN_UI_SCALE);
+                }
+                ui.label(format!("{:.0}%", s.ui_scale * 100.0));
+                if ui
+                    .add_enabled(s.ui_scale < MAX_UI_SCALE, egui::Button::new("A+"))
+                    .clicked()
+                {
+                    s.ui_scale = step(s.ui_scale, 0.1).min(MAX_UI_SCALE);
+                }
+            });
             ui.label(match (stats.camera, stats.mode) {
                 (CameraMode::Orbit, Mode::Play) => {
                     "Drag a body: grab / throw · drag empty space: orbit · right-drag: pan · wheel: zoom · F: fly"

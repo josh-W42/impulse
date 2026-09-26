@@ -20,7 +20,7 @@ mod mips;
 pub use colliders::{
     bounding_box, bounding_capsule, bounding_sphere, extreme_points, fibonacci_directions,
 };
-pub use mips::{MipLevel, mip_chain};
+pub use mips::{ColorSpace, MipLevel, mip_chain};
 
 /// Size and complexity caps for loading untrusted files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,8 @@ pub struct ModelVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// Tangent along +U (xyz) and bitangent sign (w), for normal maps.
+    pub tangent: [f32; 4],
 }
 
 /// One triangle list with one material.
@@ -61,14 +63,47 @@ pub struct ModelMesh {
 pub struct MaterialData {
     /// Linear RGBA multiplier.
     pub base_color: [f32; 4],
-    /// Index into [`ModelData::textures`] (sRGB), sampled with UV set 0.
+    /// Indices into [`ModelData::textures`], all sampled with UV set 0.
     pub base_color_texture: Option<usize>,
+    pub metallic: f32,
+    pub roughness: f32,
+    /// Roughness in G, metalness in B (glTF packing), linear.
+    pub metallic_roughness_texture: Option<usize>,
+    pub normal_texture: Option<usize>,
+    pub normal_scale: f32,
+    /// Ambient occlusion in R, linear.
+    pub occlusion_texture: Option<usize>,
+    pub occlusion_strength: f32,
+    /// Linear RGB emitted light (multiplies the emissive texture).
+    pub emissive: [f32; 3],
+    pub emissive_texture: Option<usize>,
+}
+
+impl Default for MaterialData {
+    /// glTF's default material.
+    fn default() -> Self {
+        Self {
+            base_color: [1.0; 4],
+            base_color_texture: None,
+            metallic: 1.0,
+            roughness: 1.0,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
+            occlusion_texture: None,
+            occlusion_strength: 1.0,
+            emissive: [0.0; 3],
+            emissive_texture: None,
+        }
+    }
 }
 
 /// An RGBA8 texture with its full mip chain (level 0 first, down to 1×1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextureData {
     pub mips: Vec<MipLevel>,
+    /// sRGB colour (sample as sRGB) or linear data.
+    pub space: ColorSpace,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,31 +203,51 @@ pub fn load_glb_with(bytes: &[u8], limits: &Limits) -> Result<ModelData, ModelEr
         BufferSource::Uri(_) => None,
     };
 
-    // Textures: decode each image used as a base colour, once.
-    let mut textures = Vec::new();
-    let mut texture_of_image = vec![None; gltf.images().len()];
+    // Textures: decode each (image, colour space) pair once.
+    let mut textures: Vec<TextureData> = Vec::new();
+    let mut decoded: Vec<(usize, ColorSpace)> = Vec::new();
+    let mut texture = |image: gltf::Image, space: ColorSpace| -> Result<usize, ModelError> {
+        let key = (image.index(), space);
+        if let Some(i) = decoded.iter().position(|k| *k == key) {
+            return Ok(i);
+        }
+        let (rgba, width, height) = decode_image(&image, blob, limits)?;
+        textures.push(TextureData {
+            mips: mip_chain(rgba, width, height, space),
+            space,
+        });
+        decoded.push(key);
+        Ok(textures.len() - 1)
+    };
     let mut materials = Vec::new();
     for material in gltf.materials() {
         let pbr = material.pbr_metallic_roughness();
-        let base_color_texture = match pbr.base_color_texture() {
-            Some(info) => {
-                let image = info.texture().source();
-                let slot = &mut texture_of_image[image.index()];
-                if slot.is_none() {
-                    let rgba = decode_image(&image, blob, limits)?;
-                    textures.push(TextureData {
-                        mips: mip_chain(rgba.0, rgba.1, rgba.2, true),
-                    });
-                    *slot = Some(textures.len() - 1);
-                }
-                *slot
-            }
-            None => None,
-        };
-        materials.push(MaterialData {
+        let mut data = MaterialData {
             base_color: pbr.base_color_factor(),
-            base_color_texture,
-        });
+            metallic: pbr.metallic_factor(),
+            roughness: pbr.roughness_factor(),
+            emissive: material.emissive_factor(),
+            ..MaterialData::default()
+        };
+        if let Some(info) = pbr.base_color_texture() {
+            data.base_color_texture = Some(texture(info.texture().source(), ColorSpace::Srgb)?);
+        }
+        if let Some(info) = pbr.metallic_roughness_texture() {
+            data.metallic_roughness_texture =
+                Some(texture(info.texture().source(), ColorSpace::Linear)?);
+        }
+        if let Some(info) = material.normal_texture() {
+            data.normal_texture = Some(texture(info.texture().source(), ColorSpace::Normal)?);
+            data.normal_scale = info.scale();
+        }
+        if let Some(info) = material.occlusion_texture() {
+            data.occlusion_texture = Some(texture(info.texture().source(), ColorSpace::Linear)?);
+            data.occlusion_strength = info.strength();
+        }
+        if let Some(info) = material.emissive_texture() {
+            data.emissive_texture = Some(texture(info.texture().source(), ColorSpace::Srgb)?);
+        }
+        materials.push(data);
     }
 
     // Geometry: walk the scene graph, baking each node's world transform.
@@ -289,14 +344,33 @@ where
     if normals.len() != positions.len() || uvs.len() != positions.len() {
         return Err(ModelError::BadGeometry("attribute counts differ".into()));
     }
+    let tangents: Vec<[f32; 4]> = match reader.read_tangents() {
+        Some(read) => {
+            let flip = if world.determinant() < 0.0 { -1.0 } else { 1.0 };
+            read.zip(&normals)
+                .map(|(t, n)| {
+                    let dir = Mat3::from_mat4(world) * Vec3::new(t[0], t[1], t[2]);
+                    let dir = (dir - *n * n.dot(dir)).normalize_or(any_perpendicular(*n));
+                    let sign = if t[3] < 0.0 { -flip } else { flip };
+                    [dir.x, dir.y, dir.z, sign]
+                })
+                .collect()
+        }
+        None => generate_tangents(&positions, &normals, &uvs, &indices),
+    };
+    if tangents.len() != positions.len() {
+        return Err(ModelError::BadGeometry("attribute counts differ".into()));
+    }
     let vertices = positions
         .iter()
         .zip(&normals)
         .zip(&uvs)
-        .map(|((p, n), uv)| ModelVertex {
+        .zip(&tangents)
+        .map(|(((p, n), uv), t)| ModelVertex {
             position: p.to_array(),
             normal: n.to_array(),
             uv: *uv,
+            tangent: *t,
         })
         .collect();
     Ok(ModelMesh {
@@ -304,6 +378,56 @@ where
         indices,
         material: primitive.material().index(),
     })
+}
+
+/// Some unit vector perpendicular to unit `n`.
+fn any_perpendicular(n: Vec3) -> Vec3 {
+    let other = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    n.cross(other).normalize()
+}
+
+/// Per-vertex tangents from UVs (a simplified MikkTSpace): each triangle's
+/// ∂position/∂u and ∂position/∂v are summed per vertex, then the tangent is
+/// made perpendicular to the normal; `w` is the bitangent's handedness.
+/// Triangles with degenerate UVs contribute nothing; vertices with no usable
+/// tangent get any perpendicular.
+pub fn generate_tangents(
+    positions: &[Vec3],
+    normals: &[Vec3],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+) -> Vec<[f32; 4]> {
+    let mut tan = vec![Vec3::ZERO; positions.len()];
+    let mut bit = vec![Vec3::ZERO; positions.len()];
+    for tri in indices.as_chunks::<3>().0 {
+        let [a, b, c] = tri.map(|i| i as usize);
+        let (e1, e2) = (positions[b] - positions[a], positions[c] - positions[a]);
+        let (du1, dv1) = (uvs[b][0] - uvs[a][0], uvs[b][1] - uvs[a][1]);
+        let (du2, dv2) = (uvs[c][0] - uvs[a][0], uvs[c][1] - uvs[a][1]);
+        let det = du1 * dv2 - du2 * dv1;
+        if det.abs() < 1e-12 {
+            continue;
+        }
+        let t = (e1 * dv2 - e2 * dv1) / det;
+        let bt = (e2 * du1 - e1 * du2) / det;
+        for i in [a, b, c] {
+            tan[i] += t;
+            bit[i] += bt;
+        }
+    }
+    normals
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let t = (tan[i] - n * n.dot(tan[i])).normalize_or(any_perpendicular(n));
+            let w = if n.cross(t).dot(bit[i]) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            [t.x, t.y, t.z, w]
+        })
+        .collect()
 }
 
 /// Area-weighted vertex normals, for files that omit them.

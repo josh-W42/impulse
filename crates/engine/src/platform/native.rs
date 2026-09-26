@@ -34,6 +34,10 @@ pub fn scene_override() -> Option<String> {
 }
 
 /// Desktop lists saved scenes itself; the browser uses a file picker.
+/// Starting UI size: browsers set body text around 16 px, larger than egui's
+/// default, so the web build starts bigger.
+pub const DEFAULT_UI_SCALE: f32 = 1.0;
+
 pub const HAS_SCENE_FOLDER: bool = true;
 /// Saved scenes live here, relative to the working directory.
 const SCENE_DIR: &str = "scenes";

@@ -219,6 +219,7 @@ fn materials_and_textures_come_through_with_mips() {
         [MaterialData {
             base_color: [0.5, 1.0, 1.0, 1.0],
             base_color_texture: Some(0),
+            ..MaterialData::default()
         }]
     );
     let mips = &model.textures[0].mips;
@@ -229,15 +230,120 @@ fn materials_and_textures_come_through_with_mips() {
 
 #[test]
 fn srgb_mips_average_in_linear_light() {
-    let levels = mip_chain(vec![0, 0, 0, 0, 255, 255, 255, 255], 2, 1, true);
+    let levels = mip_chain(vec![0, 0, 0, 0, 255, 255, 255, 255], 2, 1, ColorSpace::Srgb);
     // Half black, half white is 0.5 linear: sRGB 188, not 128.
     assert_eq!(levels[1].rgba, [188, 188, 188, 128]);
-    let linear = mip_chain(vec![0, 0, 0, 0, 255, 255, 255, 255], 2, 1, false);
+    let linear = mip_chain(
+        vec![0, 0, 0, 0, 255, 255, 255, 255],
+        2,
+        1,
+        ColorSpace::Linear,
+    );
     assert_eq!(linear[1].rgba, [128, 128, 128, 128]);
-    let odd = mip_chain(vec![9; 3 * 5 * 4], 3, 5, false);
+    let odd = mip_chain(vec![9; 3 * 5 * 4], 3, 5, ColorSpace::Linear);
     let sizes: Vec<_> = odd.iter().map(|m| (m.width, m.height)).collect();
     assert_eq!(sizes, [(3, 5), (1, 2), (1, 1)]);
     assert!(odd.iter().all(|m| m.rgba.iter().all(|&c| c == 9)));
+}
+
+#[test]
+fn normal_map_mips_stay_unit_length() {
+    // +X and +Z normals average to the 45° direction, not a shortened vector.
+    let encode = |v: f32| ((v + 1.0) * 127.5).round() as u8;
+    let texels = vec![
+        encode(1.0),
+        encode(0.0),
+        encode(0.0),
+        255,
+        encode(0.0),
+        encode(0.0),
+        encode(1.0),
+        255,
+    ];
+    let levels = mip_chain(texels, 2, 1, ColorSpace::Normal);
+    let n = levels[1].rgba[..3]
+        .iter()
+        .map(|&c| c as f32 / 127.5 - 1.0)
+        .collect::<Vec<_>>();
+    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    assert!((length - 1.0).abs() < 0.02, "{n:?}");
+    assert!((n[0] - n[2]).abs() < 0.02 && n[0] > 0.69, "{n:?}");
+}
+
+fn quad(uvs: [[f32; 2]; 4]) -> Vec<[f32; 4]> {
+    let positions = [Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y];
+    generate_tangents(&positions, &[Vec3::Z; 4], &uvs, &[0, 1, 2, 0, 2, 3])
+}
+
+#[test]
+fn tangents_follow_u_and_flip_with_mirrored_uvs() {
+    for t in quad([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]) {
+        assert!(
+            Vec3::new(t[0], t[1], t[2]).abs_diff_eq(Vec3::X, 1e-5) && t[3] == 1.0,
+            "{t:?}"
+        );
+    }
+    // U runs the other way: the tangent turns around and handedness flips.
+    for t in quad([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]]) {
+        assert!(
+            Vec3::new(t[0], t[1], t[2]).abs_diff_eq(Vec3::NEG_X, 1e-5) && t[3] == -1.0,
+            "{t:?}"
+        );
+    }
+    // Degenerate UVs: still a unit tangent perpendicular to the normal.
+    for t in quad([[0.5, 0.5]; 4]) {
+        let v = Vec3::new(t[0], t[1], t[2]);
+        assert!(
+            v.is_finite() && (v.length() - 1.0).abs() < 1e-5 && v.dot(Vec3::Z).abs() < 1e-5,
+            "{t:?}"
+        );
+    }
+}
+
+#[test]
+fn full_materials_load_with_their_colour_spaces() {
+    let image = png(2, 2, |_, _| [128, 200, 50, 255]);
+    let mut glb = Glb::default();
+    let prim = triangle(&mut glb, true).replace(r#","indices""#, r#","material":0,"indices""#);
+    let view = glb.view(&image);
+    let bytes = glb.build(&format!(
+        r#""meshes":[{{"primitives":[{prim}]}}],"nodes":[{{"mesh":0}}],"scenes":[{{"nodes":[0]}}],
+        "materials":[{{
+            "pbrMetallicRoughness":{{"metallicFactor":0.25,"roughnessFactor":0.75,
+                "baseColorTexture":{{"index":0}},"metallicRoughnessTexture":{{"index":0}}}},
+            "normalTexture":{{"index":0,"scale":0.5}},
+            "occlusionTexture":{{"index":0,"strength":0.8}},
+            "emissiveTexture":{{"index":0}},"emissiveFactor":[1,0.5,0]}}],
+        "textures":[{{"source":0}}],"images":[{{"bufferView":{view},"mimeType":"image/png"}}]"#
+    ));
+    let model = load_glb(&bytes).unwrap();
+    let m = &model.materials[0];
+    assert_eq!((m.metallic, m.roughness), (0.25, 0.75));
+    assert_eq!((m.normal_scale, m.occlusion_strength), (0.5, 0.8));
+    assert_eq!(m.emissive, [1.0, 0.5, 0.0]);
+    let space = |i: Option<usize>| model.textures[i.unwrap()].space;
+    assert_eq!(space(m.base_color_texture), ColorSpace::Srgb);
+    assert_eq!(space(m.metallic_roughness_texture), ColorSpace::Linear);
+    assert_eq!(space(m.normal_texture), ColorSpace::Normal);
+    assert_eq!(space(m.occlusion_texture), ColorSpace::Linear);
+    assert_eq!(space(m.emissive_texture), ColorSpace::Srgb);
+    // One image in three colour spaces: decoded once per space, shared within one.
+    assert_eq!(model.textures.len(), 3);
+    assert_eq!(m.base_color_texture, m.emissive_texture);
+    assert_eq!(m.metallic_roughness_texture, m.occlusion_texture);
+}
+
+#[test]
+fn absent_properties_take_gltf_defaults() {
+    let mut glb = Glb::default();
+    let prim = triangle(&mut glb, true).replace(r#","indices""#, r#","material":0,"indices""#);
+    let bytes = glb.build(&format!(
+        r#""meshes":[{{"primitives":[{prim}]}}],"nodes":[{{"mesh":0}}],"scenes":[{{"nodes":[0]}}],"materials":[{{}}]"#
+    ));
+    assert_eq!(
+        load_glb(&bytes).unwrap().materials,
+        [MaterialData::default()]
+    );
 }
 
 #[test]

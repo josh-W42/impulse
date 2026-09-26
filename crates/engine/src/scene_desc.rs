@@ -53,6 +53,9 @@ pub struct ObjectDesc {
     pub color: [f32; 3],
     pub velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
+    /// Surface for built-in shapes (models use their file's material).
+    pub roughness: f32,
+    pub metallic: f32,
 }
 
 impl Default for ObjectDesc {
@@ -69,6 +72,8 @@ impl Default for ObjectDesc {
             color: [0.7, 0.7, 0.7],
             velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
+            roughness: impulse_render::DEFAULT_ROUGHNESS,
+            metallic: impulse_render::DEFAULT_METALLIC,
         }
     }
 }
@@ -448,6 +453,8 @@ fn populate(
                 orientation,
             },
             model,
+            roughness: object.roughness,
+            metallic: object.metallic,
         });
     }
     for (index, joint) in desc.joints.iter().enumerate() {
@@ -731,6 +738,21 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn surfaces_round_trip_and_older_files_get_the_defaults() {
+        let mut desc = sampler();
+        desc.objects[1].roughness = 0.2;
+        desc.objects[1].metallic = 1.0;
+        assert_eq!(from_ron(&to_ron(&desc)).unwrap(), desc);
+        // A file from before M9b: no roughness or metallic fields.
+        let old = r#"(version: 1, name: "old", arena: Floor,
+            objects: [(shape: Some(Sphere(radius: 0.5)), position: (0.0, 1.0, 0.0))])"#;
+        let o = &from_ron(old).unwrap().objects[0];
+        assert_eq!((o.roughness, o.metallic), (0.6, 0.0));
+        let (_, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
+        assert_eq!((objects[1].roughness, objects[1].metallic), (0.2, 1.0));
     }
 
     #[test]

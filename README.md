@@ -30,6 +30,7 @@ to exactly what you authored.
   drag elsewhere to orbit; the inspector
   edits shape, pose, body, material, colour, and starting velocity
 - Add sphere/box/capsule, Ctrl+D duplicate, Del delete, Ctrl+Z / Ctrl+Y undo/redo
+- **UI size** (A−/A+ in the panel) scales the interface, 75–200%; the browser starts at 125%
 - **New** starts a blank scene with a finite floor object (a static box you can
   resize, move, or delete; things fall off its edges). In Edit mode, **arena** adds
   built-in surroundings to any scene: none, an infinite floor, or a walled pit
