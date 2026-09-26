@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use glam::Vec3;
 
 use crate::body::{BodyDesc, BodyError, RigidBody};
@@ -6,6 +8,7 @@ use crate::collider::HullId;
 use crate::contact::Contact;
 use crate::contact::contacts_for_pairs;
 use crate::hull::{ConvexHull, HullError};
+use crate::joint::{Joint, JointDesc, JointError, JointId};
 use crate::raycast::{RayHit, ray_shape};
 use crate::solver::{self, ContactCache, SolverSettings};
 use crate::union_find::UnionFind;
@@ -68,6 +71,8 @@ pub struct World {
     cache: ContactCache,
     tree: AabbTree,
     hulls: Vec<ConvexHull>,
+    /// Removed joints leave `None` so ids stay unique until `clear`.
+    joints: Vec<Option<Joint>>,
 }
 
 impl Default for World {
@@ -86,6 +91,7 @@ impl World {
             cache: ContactCache::default(),
             tree: AabbTree::default(),
             hulls: Vec::new(),
+            joints: Vec::new(),
         }
     }
 
@@ -107,6 +113,48 @@ impl World {
 
     pub(crate) fn hulls(&self) -> &[ConvexHull] {
         &self.hulls
+    }
+
+    /// Joins two bodies (see [`JointDesc`]) and wakes them. Joints whose body is
+    /// later removed go inert.
+    pub fn add_joint(&mut self, desc: JointDesc) -> Result<JointId, JointError> {
+        let joint = Joint::new(&desc, self)?;
+        self.joints.push(Some(joint));
+        self.wake(desc.a);
+        self.wake(desc.b);
+        Ok(JointId((self.joints.len() - 1) as u32))
+    }
+
+    /// Removes a joint and wakes its bodies; false if it was already gone.
+    pub fn remove_joint(&mut self, id: JointId) -> bool {
+        let Some(joint) = self.joints.get_mut(id.0 as usize).and_then(Option::take) else {
+            return false;
+        };
+        let (a, b) = joint.bodies();
+        self.wake(a);
+        self.wake(b);
+        true
+    }
+
+    pub fn joints(&self) -> impl Iterator<Item = JointId> + '_ {
+        self.joints
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| j.is_some())
+            .map(|(i, _)| JointId(i as u32))
+    }
+
+    /// World-space anchor points on each of the joint's bodies (equal when the
+    /// joint is satisfied); `None` if the joint or either body is gone.
+    pub fn joint_anchors(&self, id: JointId) -> Option<(Vec3, Vec3)> {
+        self.joints.get(id.0 as usize)?.as_ref()?.anchors(self)
+    }
+
+    fn wake(&mut self, handle: BodyHandle) {
+        if let Some(body) = self.body_mut(handle) {
+            body.asleep = false;
+            body.sleep_timer = 0.0;
+        }
     }
 
     pub fn solver_settings(&self) -> SolverSettings {
@@ -190,9 +238,11 @@ impl World {
         self.len() == 0
     }
 
-    /// Removes every body and hull shape; all existing handles and hull ids become stale.
+    /// Removes every body, hull shape, and joint; all existing handles and ids
+    /// become stale.
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.joints.clear();
         self.tree = AabbTree::default();
         self.hulls.clear();
         for (index, slot) in self.slots.iter_mut().enumerate() {
@@ -219,7 +269,8 @@ impl World {
     pub fn step_profiled(&mut self, dt: f32, clock: &mut dyn FnMut() -> f64) -> StepStats {
         debug_assert!(dt.is_finite() && dt >= 0.0, "invalid timestep {dt}");
         let t0 = clock();
-        let pairs = self.candidate_pairs();
+        let mut pairs = self.candidate_pairs();
+        self.drop_joined_pairs(&mut pairs);
         let t1 = clock();
         let contacts = contacts_for_pairs(self, &pairs);
         let t2 = clock();
@@ -235,7 +286,9 @@ impl World {
             .filter(|c| self.is_active(c.a) || self.is_active(c.b))
             .collect();
         let mut cache = std::mem::take(&mut self.cache);
-        solver::solve(self, &active, &mut cache, dt);
+        let mut joints = std::mem::take(&mut self.joints);
+        solver::solve(self, &active, &mut cache, &mut joints, dt);
+        self.joints = joints;
         self.cache = cache;
         let t3 = clock();
         for body in self.bodies_mut() {
@@ -272,17 +325,35 @@ impl World {
         self.body(handle).is_some_and(RigidBody::is_active)
     }
 
-    /// Islands: dynamic bodies connected through contacts. Static bodies do not
-    /// link islands (the floor would otherwise join everything).
+    /// Islands: dynamic bodies connected through contacts or joints. Static bodies
+    /// do not link islands (the floor would otherwise join everything).
     fn islands(&self, contacts: &[Contact]) -> UnionFind {
         let mut islands = UnionFind::new(self.slots.len());
-        for c in contacts {
-            let dynamic = |h: BodyHandle| self.body(h).is_some_and(|b| b.inverse_mass() != 0.0);
-            if dynamic(c.a) && dynamic(c.b) {
-                islands.union(c.a.index as usize, c.b.index as usize);
+        let dynamic = |h: BodyHandle| self.body(h).is_some_and(|b| b.inverse_mass() != 0.0);
+        let joined = self.joints.iter().flatten().map(Joint::bodies);
+        for (a, b) in contacts.iter().map(|c| (c.a, c.b)).chain(joined) {
+            if dynamic(a) && dynamic(b) {
+                islands.union(a.index as usize, b.index as usize);
             }
         }
         islands
+    }
+
+    /// Removes pairs joined by a joint that doesn't collide its bodies.
+    fn drop_joined_pairs(&self, pairs: &mut Vec<(BodyHandle, BodyHandle)>) {
+        let joined: HashSet<(BodyHandle, BodyHandle)> = self
+            .joints
+            .iter()
+            .flatten()
+            .filter(|j| !j.collide_connected())
+            .map(|j| {
+                let (a, b) = j.bodies();
+                (a.min(b), a.max(b))
+            })
+            .collect();
+        if !joined.is_empty() {
+            pairs.retain(|p| !joined.contains(p));
+        }
     }
 
     /// Wakes every island that contains an awake dynamic body (e.g. something

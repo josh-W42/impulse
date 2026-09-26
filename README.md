@@ -3,7 +3,23 @@
 A 3D game engine in Rust + wgpu whose deep spike is rigid-body physics.
 Runs natively and in the browser (WebGPU, falling back to WebGL2).
 
-Design: `docs/plans/2026-09-24-impulse-engine-design.md`
+Live demo: https://impulse-engine.web.app (scenes: `?scene=pit|tower|pyramid|rain|joints`)
+
+Design: `docs/plans/2026-09-24-impulse-engine-design.md` (one plan per milestone
+in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
+
+## Physics (written from scratch; depends only on `glam`)
+
+- Sequential-impulse solver: accumulated clamping, warm starting, Baumgarte
+  correction, symmetric Gauss–Seidel, friction
+- Shapes: sphere, box, capsule, convex hull, plane; box–box SAT with clipped
+  manifolds, GJK + EPA for general convex pairs, manifolds reduced to 4 points
+- Joints: ball-socket (3×3 block) with cone limits, hinge with angle limits,
+  distance; soft (spring-regularized) rows so closed loops stay stable; joined
+  bodies skip collision and share a sleep island
+- Scale: dynamic AABB-tree broadphase, island sleeping, raycasts, per-phase profiler
+- Engine: fixed timestep with interpolation, instanced renderer, egui panel,
+  mouse grab/throw
 
 ## Prerequisites
 
