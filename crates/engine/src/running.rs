@@ -587,11 +587,11 @@ impl Running {
                 );
             }
             Action::LoadSaved(index) => {
-                let Some(stem) = self.settings.saved.get(index).cloned() else {
+                let Some(file) = self.settings.saved.get(index).cloned() else {
                     return;
                 };
-                match platform::read_scene(&stem) {
-                    Ok(text) => self.load_scene_text(&stem, &text),
+                match platform::read_scene(&file) {
+                    Ok(text) => self.load_scene_text(&file, &text),
                     Err(e) => self.message = Some(e),
                 }
             }
@@ -611,12 +611,12 @@ impl Running {
                 }
             }
             Action::ImportFile(index) => {
-                let Some(stem) = self.settings.model_files.get(index).cloned() else {
+                let Some(file) = self.settings.model_files.get(index).cloned() else {
                     return;
                 };
-                match platform::read_model(&stem) {
+                match platform::read_model(&file) {
                     Ok(bytes) => {
-                        if let Some(id) = self.import_model(&format!("{stem}.glb"), &bytes) {
+                        if let Some(id) = self.import_model(&file, &bytes) {
                             self.apply(Action::AddModel(id));
                         }
                     }
@@ -882,7 +882,7 @@ impl Running {
             models: self
                 .models
                 .list()
-                .map(|(id, name, _)| (id, name.to_string()))
+                .map(|(id, name, bundled)| (id, name.to_string(), bundled))
                 .collect(),
         };
         let mut actions = Vec::new();
@@ -897,7 +897,7 @@ impl Running {
             panel(ui, settings, &stats, &mut actions);
             if mode == Mode::Edit {
                 editor_ui::outliner(ui.ctx(), editor, filter, follow);
-                let names: Vec<&str> = stats.models.iter().map(|(_, n)| n.as_str()).collect();
+                let names: Vec<&str> = stats.models.iter().map(|(_, n, _)| n.as_str()).collect();
                 if let Some(action) = editor_ui::inspector(ui.ctx(), editor, &names) {
                     actions.push(Action::Inspector(action));
                 }
@@ -953,8 +953,8 @@ struct Stats {
     can_undo: bool,
     can_redo: bool,
     message: Option<String>,
-    /// Every model's id and name, for the Model… picker.
-    models: Vec<(crate::models::ModelId, String)>,
+    /// Every model's id, name, and whether it is bundled (Model… picker).
+    models: Vec<(crate::models::ModelId, String, bool)>,
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<Action>) {
@@ -1002,30 +1002,40 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     let list = egui::ComboBox::from_id_salt("add model")
                         .selected_text("Model…")
                         .show_ui(ui, |ui| {
-                            for (id, name) in &stats.models {
+                            for (id, name, _) in &stats.models {
                                 if ui.selectable_label(false, name).clicked() {
                                     actions.push(Action::AddModel(*id));
                                 }
                             }
                             if platform::HAS_SCENE_FOLDER {
                                 ui.separator();
-                                let loaded = |stem: &str| {
-                                    scene_desc::file_stem(stem)
-                                        .is_some_and(|n| stats.models.iter().any(|(_, m)| *m == n))
-                                };
-                                let mut any = false;
+                                ui.weak(format!("from {}", platform::model_folder()));
+                                let mut listed = false;
                                 for (i, file) in s.model_files.iter().enumerate() {
-                                    if loaded(file) {
-                                        continue;
+                                    let stem = file.rsplit_once('.').map_or(file.as_str(), |(s, _)| s);
+                                    let name = scene_desc::file_stem(stem);
+                                    let clash = stats
+                                        .models
+                                        .iter()
+                                        .find(|(_, m, _)| Some(m) == name.as_ref());
+                                    match clash {
+                                        // Already imported: listed above.
+                                        Some((_, _, false)) => continue,
+                                        Some((_, taken, true)) => {
+                                            ui.weak(format!(
+                                                "{file}: a bundled model is already called {taken}; rename the file"
+                                            ));
+                                        }
+                                        None => {
+                                            if ui.selectable_label(false, file).clicked() {
+                                                actions.push(Action::ImportFile(i));
+                                            }
+                                        }
                                     }
-                                    any = true;
-                                    let label = format!("{file}.glb (models/)");
-                                    if ui.selectable_label(false, label).clicked() {
-                                        actions.push(Action::ImportFile(i));
-                                    }
+                                    listed = true;
                                 }
-                                if !any {
-                                    ui.label("more: put .glb files in models/");
+                                if !listed {
+                                    ui.weak("no new .glb files there");
                                 }
                             }
                         });

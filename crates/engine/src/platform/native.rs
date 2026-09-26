@@ -45,23 +45,31 @@ pub fn save_scene(stem: &str, text: &str) -> Result<String, String> {
     save_scene_in(Path::new(SCENE_DIR), stem, text)
 }
 
-/// Stems of the `.ron` files in `scenes/`, sorted.
+/// Names of the `.ron` files in `scenes/`, sorted.
 pub fn saved_scenes() -> Vec<String> {
     list_in(Path::new(SCENE_DIR), "ron")
 }
 
-pub fn read_scene(stem: &str) -> Result<String, String> {
-    let bytes = read_in(Path::new(SCENE_DIR), stem, "ron")?;
-    String::from_utf8(bytes).map_err(|_| format!("{stem}.ron is not text"))
+/// Reads a file name from [`saved_scenes`].
+pub fn read_scene(file_name: &str) -> Result<String, String> {
+    let bytes = read_in(Path::new(SCENE_DIR), file_name)?;
+    String::from_utf8(bytes).map_err(|_| format!("{file_name} is not text"))
 }
 
-/// Stems of the `.glb` files in `models/`, sorted.
+/// Names of the `.glb` files in `models/`, sorted.
 pub fn model_files() -> Vec<String> {
     list_in(Path::new(MODEL_DIR), "glb")
 }
 
-pub fn read_model(stem: &str) -> Result<Vec<u8>, String> {
-    read_in(Path::new(MODEL_DIR), stem, "glb")
+/// Reads a file name from [`model_files`].
+pub fn read_model(file_name: &str) -> Result<Vec<u8>, String> {
+    read_in(Path::new(MODEL_DIR), file_name)
+}
+
+/// Where `models/` resolves to (it is relative to the working directory).
+pub fn model_folder() -> String {
+    std::path::absolute(MODEL_DIR)
+        .map_or_else(|_| MODEL_DIR.to_string(), |p| p.display().to_string())
 }
 
 /// The browser's file picker; nothing to do on desktop.
@@ -78,22 +86,32 @@ fn save_scene_in(dir: &Path, stem: &str, text: &str) -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
+/// File names in `dir` with `extension`, ignoring case (`.GLB` counts).
 fn list_in(dir: &Path, extension: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut stems: Vec<String> = entries
+    let mut names: Vec<String> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == extension))
-        .filter_map(|p| p.file_stem()?.to_str().map(str::to_owned))
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case(extension))
+        })
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
         .collect();
-    stems.sort();
-    stems
+    names.sort();
+    names
 }
 
-fn read_in(dir: &Path, stem: &str, extension: &str) -> Result<Vec<u8>, String> {
-    let path = dir.join(format!("{stem}.{extension}"));
+/// Reads `file_name` (a bare name, as listed) from `dir`.
+fn read_in(dir: &Path, file_name: &str) -> Result<Vec<u8>, String> {
+    if Path::new(file_name).file_name().and_then(|n| n.to_str()) != Some(file_name) {
+        return Err(format!("not a plain file name: {file_name}"));
+    }
+    let path = dir.join(file_name);
     let size = std::fs::metadata(&path)
         .map_err(|e| format!("can't read {}: {e}", path.display()))?
         .len();
@@ -126,10 +144,20 @@ mod tests {
         save_scene_in(&dir, "b_scene", "(b)").unwrap();
         save_scene_in(&dir, "a_scene", "(a)").unwrap();
         std::fs::write(dir.join("notes.txt"), "not a scene").unwrap();
-        assert_eq!(list_in(&dir, "ron"), ["a_scene", "b_scene"]);
-        assert_eq!(list_in(&dir, "txt"), ["notes"]);
-        assert_eq!(read_in(&dir, "b_scene", "ron").unwrap(), b"(b)");
-        assert!(read_in(&dir, "missing", "ron").is_err());
+        std::fs::write(dir.join("Shouty.RON"), "(s)").unwrap();
+        assert_eq!(
+            list_in(&dir, "ron"),
+            ["Shouty.RON", "a_scene.ron", "b_scene.ron"],
+            "extensions match ignoring case"
+        );
+        assert_eq!(list_in(&dir, "txt"), ["notes.txt"]);
+        assert_eq!(read_in(&dir, "b_scene.ron").unwrap(), b"(b)");
+        assert_eq!(read_in(&dir, "Shouty.RON").unwrap(), b"(s)");
+        assert!(read_in(&dir, "missing.ron").is_err());
+        assert!(
+            read_in(&dir, "../b_scene.ron").is_err(),
+            "names only, no paths"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -104,8 +104,12 @@ pub fn model_files() -> Vec<String> {
     Vec::new()
 }
 
-pub fn read_model(_stem: &str) -> Result<Vec<u8>, String> {
+pub fn read_model(_file_name: &str) -> Result<Vec<u8>, String> {
     Err("use Import… to load a model in the browser".into())
+}
+
+pub fn model_folder() -> String {
+    String::new()
 }
 
 /// Opens the browser's file picker; the chosen file arrives later through

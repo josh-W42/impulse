@@ -2,5 +2,5 @@
 /web/dist
 /.firebase
 firebase-debug.log
-scenes/
-models/
+/scenes/
+/models/
