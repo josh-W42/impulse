@@ -79,7 +79,8 @@ impl ObjectDesc {
 
     pub fn set_orientation(&mut self, q: Quat) {
         let (x, y, z) = q.to_euler(EulerRot::XYZ);
-        self.rotation_deg = [x, y, z].map(f32::to_degrees);
+        // `+ 0.0` turns -0 into 0 for display.
+        self.rotation_deg = [x, y, z].map(|a| a.to_degrees() + 0.0);
     }
 }
 

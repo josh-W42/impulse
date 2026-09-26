@@ -275,7 +275,12 @@ pub fn inspector(ctx: &egui::Context, editor: &mut Editor) -> Option<InspectorAc
                 ui.label("friction");
                 number(ui, &mut o.friction, 0.01, 0.0..=2.0);
                 ui.label("color");
-                ui.color_edit_button_rgb(&mut o.color);
+                // The picker round-trips through other color types each frame,
+                // nudging the low bits; only take the value on a real change.
+                let mut color = o.color;
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    o.color = color;
+                }
             });
             vec3_row(ui, "velocity", &mut o.velocity, 0.05, -1000.0);
             vec3_row(ui, "spin", &mut o.angular_velocity, 0.05, -1000.0);
@@ -340,6 +345,26 @@ mod tests {
             Some(0)
         );
         assert_eq!(object_at(&world, &objects, eye, Vec3::NEG_Y), None, "floor");
+    }
+
+    /// Idle frames must not touch the scene (each touch rebuilds the world).
+    #[test]
+    fn the_inspector_changes_nothing_by_itself() {
+        let ctx = egui::Context::default();
+        for demo in crate::scene::Demo::ALL {
+            let mut editor = Editor::new(crate::scene::demo_desc(demo));
+            for index in 0..editor.desc().objects.len().min(12) {
+                editor.select(Some(index));
+                let revision = editor.revision();
+                for _ in 0..3 {
+                    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        inspector(ui.ctx(), &mut editor);
+                    });
+                    output.textures_delta.clear(); // no renderer to apply them
+                }
+                assert_eq!(editor.revision(), revision, "{demo:?} object {index}");
+            }
+        }
     }
 
     #[test]
