@@ -4,6 +4,7 @@ use crate::body::{BodyDesc, BodyError, RigidBody};
 use crate::broadphase::{Aabb, AabbTree};
 use crate::contact::Contact;
 use crate::contact::contacts_for_pairs;
+use crate::raycast::{RayHit, ray_shape};
 use crate::solver::{self, ContactCache, SolverSettings};
 use crate::union_find::UnionFind;
 
@@ -319,6 +320,58 @@ impl World {
                 body.velocity = Vec3::ZERO;
                 body.angular_velocity = Vec3::ZERO;
             }
+        }
+    }
+
+    /// Nearest body hit by a ray within `max_distance` (the direction needn't be
+    /// unit length; `RayHit::t` is a distance). Rays starting inside a shape skip it.
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        let dir = direction.try_normalize()?;
+        if !origin.is_finite() || max_distance.is_nan() || max_distance < 0.0 {
+            return None;
+        }
+        // Large finite stand-in for 1/0 keeps the slab test free of 0·∞ = NaN.
+        let inv_dir = Vec3::select(
+            dir.abs().cmpgt(Vec3::splat(1e-12)),
+            dir.recip(),
+            Vec3::splat(1e30),
+        );
+        let mut candidates = Vec::new();
+        self.tree
+            .ray_candidates(origin, inv_dir, max_distance, |h| candidates.push(h));
+        candidates.extend(self.bodies().filter_map(|(h, b)| {
+            matches!(b.collider(), Some(crate::collider::Collider::Plane { .. })).then_some(h)
+        }));
+        candidates
+            .into_iter()
+            .filter_map(|body| {
+                let b = self.body(body)?;
+                let (t, normal) =
+                    ray_shape(origin, dir, b.collider()?, b.position(), b.orientation())?;
+                (t <= max_distance).then_some(RayHit {
+                    body,
+                    t,
+                    point: origin + dir * t,
+                    normal,
+                })
+            })
+            .min_by(|a, b| a.t.total_cmp(&b.t))
+    }
+
+    /// Applies an impulse at a world-space point (changing linear and angular
+    /// velocity) and wakes the body. No effect on static or unknown bodies.
+    pub fn apply_impulse_at(&mut self, handle: BodyHandle, impulse: Vec3, point: Vec3) {
+        if let Some(body) = self.body_mut(handle)
+            && body.inverse_mass() != 0.0
+            && impulse.is_finite()
+            && point.is_finite()
+        {
+            let r = point - body.position();
+            let inv_inertia = body.inverse_inertia_world();
+            body.velocity += impulse * body.inverse_mass();
+            body.angular_velocity += inv_inertia * r.cross(impulse);
+            body.asleep = false;
+            body.sleep_timer = 0.0;
         }
     }
 

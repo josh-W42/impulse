@@ -295,6 +295,31 @@ impl AabbTree {
         }
     }
 
+    /// Calls `visit` for every leaf whose fat box the ray enters within `max_t`.
+    pub(crate) fn ray_candidates(
+        &self,
+        origin: Vec3,
+        inv_dir: Vec3,
+        max_t: f32,
+        mut visit: impl FnMut(BodyHandle),
+    ) {
+        let Some(root) = self.root else {
+            return;
+        };
+        let mut stack = vec![root];
+        while let Some(i) = stack.pop() {
+            let node = &self.nodes[i];
+            if !crate::raycast::ray_aabb(origin, inv_dir, node.aabb, max_t) {
+                continue;
+            }
+            if let Some(body) = node.body {
+                visit(body);
+            } else {
+                stack.extend(node.children);
+            }
+        }
+    }
+
     /// Tree height (0 for a single leaf, -1 when empty).
     #[cfg(test)]
     pub(crate) fn height(&self) -> i32 {
