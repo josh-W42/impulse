@@ -13,6 +13,8 @@ glam.workspace = true
 egui.workspace = true
 web-time.workspace = true
 impulse-physics.workspace = true
+serde.workspace = true
+ron.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger.workspace = true
@@ -23,11 +25,21 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 console_error_panic_hook.workspace = true
 console_log.workspace = true
+js-sys.workspace = true
 web-sys = { workspace = true, features = [
+    "Blob",
+    "BlobPropertyBag",
     "Document",
     "Element",
+    "Event",
+    "File",
+    "FileList",
+    "HtmlAnchorElement",
     "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlInputElement",
     "Location",
     "Node",
+    "Url",
     "Window",
 ] }

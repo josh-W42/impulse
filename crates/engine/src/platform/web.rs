@@ -1,8 +1,10 @@
 //! Browser platform glue: canvas lookup, async spawning, and on-page status text.
 
+use std::cell::RefCell;
 use std::future::Future;
 
-use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use winit::platform::web::WindowAttributesExtWebSys;
 use winit::window::{Window, WindowAttributes};
 
@@ -49,6 +51,96 @@ pub fn backend_override() -> Option<BackendOverride> {
 pub fn scene_override() -> Option<String> {
     let search = web_sys::window()?.location().search().ok()?;
     query_value(&search, "scene").map(str::to_owned)
+}
+
+/// Desktop lists saved scenes itself; the browser uses a file picker.
+pub const HAS_SCENE_FOLDER: bool = false;
+
+thread_local! {
+    /// A scene file the picker delivered: (file name, contents) or an error.
+    static PICKED: RefCell<Option<Result<(String, String), String>>> = const { RefCell::new(None) };
+}
+
+/// Downloads `text` as `<stem>.ron`.
+pub fn save_scene(stem: &str, text: &str) -> Result<String, String> {
+    let js = |e: JsValue| format!("download failed: {e:?}");
+    let doc = document().ok_or("no document")?;
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type("text/plain");
+    let parts = js_sys::Array::of1(&JsValue::from_str(text));
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options).map_err(js)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
+    let link: web_sys::HtmlAnchorElement = doc
+        .create_element("a")
+        .map_err(js)?
+        .dyn_into()
+        .map_err(|_| "not an anchor")?;
+    let file = format!("{stem}.ron");
+    link.set_href(&url);
+    link.set_download(&file);
+    link.click();
+    // Free the blob once the download has had time to start.
+    let revoke = Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000);
+    }
+    Ok(file)
+}
+
+/// The browser has no scene folder to list.
+pub fn saved_scenes() -> Vec<String> {
+    Vec::new()
+}
+
+pub fn read_scene(_stem: &str) -> Result<String, String> {
+    Err("use Open… to load a scene file in the browser".into())
+}
+
+/// Opens the browser's file picker; the chosen file arrives later through
+/// [`take_picked_scene`].
+pub fn pick_scene_file() {
+    let Some(doc) = document() else {
+        return;
+    };
+    let Ok(input) = doc
+        .create_element("input")
+        .map(|e| e.unchecked_into::<web_sys::HtmlInputElement>())
+    else {
+        return;
+    };
+    input.set_type("file");
+    input.set_accept(".ron,text/plain");
+    let picker = input.clone();
+    let on_change = Closure::once_into_js(move || {
+        let Some(file) = picker.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        if file.size() > crate::scene_desc::MAX_SCENE_BYTES as f64 {
+            deliver(Err(format!("{} is too large", file.name())));
+            return;
+        }
+        wasm_bindgen_futures::spawn_local(async move {
+            let text = wasm_bindgen_futures::JsFuture::from(file.text()).await;
+            deliver(match text.ok().and_then(|t| t.as_string()) {
+                Some(text) => Ok((file.name(), text)),
+                None => Err(format!("couldn't read {}", file.name())),
+            });
+        });
+    });
+    input.set_onchange(Some(on_change.unchecked_ref()));
+    input.click();
+}
+
+fn deliver(result: Result<(String, String), String>) {
+    PICKED.with(|picked| *picked.borrow_mut() = Some(result));
+}
+
+/// The file the picker delivered since the last call, if any.
+pub fn take_picked_scene() -> Option<Result<(String, String), String>> {
+    PICKED.with(|picked| picked.borrow_mut().take())
 }
 
 pub fn report_status(message: &str) {

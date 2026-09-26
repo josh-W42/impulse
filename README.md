@@ -21,6 +21,18 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
 - Engine: fixed timestep with interpolation, instanced renderer, egui panel,
   mouse grab/throw
 
+## Editor
+
+Press **■ Edit** to author the scene; **▶ Play** simulates it and **■ Edit** returns
+to exactly what you authored.
+
+- Click to select; drag to move it across the floor (Shift: up/down); the inspector
+  edits shape, pose, body, material, colour, and starting velocity
+- Add sphere/box/capsule, Ctrl+D duplicate, Del delete, Ctrl+Z / Ctrl+Y undo/redo
+- **Capture pose** (in Play) writes the simulated poses back as the starting scene
+- Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
+  opens them. The demos are available as starting points.
+
 ## Prerequisites
 
 - rustup (the pinned toolchain in `rust-toolchain.toml` installs automatically)
