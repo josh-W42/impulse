@@ -11,9 +11,7 @@ use impulse_render::{DrawList, MeshData, MeshId, MeshKind, Vertex};
 pub type HullMeshes = HashMap<HullId, MeshId>;
 
 use crate::pose::{Pose, interpolate};
-use crate::scene_desc::{
-    Arena, BodyType, ObjectDesc, SCENE_VERSION, SceneDesc, ShapeDesc, rebuild,
-};
+use crate::scene_desc::{Arena, BodyType, ObjectDesc, SCENE_VERSION, SceneDesc, ShapeDesc};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneObject {
@@ -178,8 +176,9 @@ pub fn default_name(object: &ObjectDesc, index: usize) -> String {
 }
 
 /// Replaces everything in `world` with `demo`, keeping its solver settings.
+#[cfg(test)]
 pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
-    rebuild(world, &demo_desc(demo)).expect("demo scenes are valid")
+    crate::scene_desc::rebuild(world, &demo_desc(demo)).expect("demo scenes are valid")
 }
 
 /// A demo object from physics-style values.
@@ -476,12 +475,15 @@ fn collider_extent(collider: Collider) -> f32 {
     }
 }
 
-fn push_scenery(list: &mut DrawList, pit: f32) {
+fn push_scenery(list: &mut DrawList, arena: Arena) {
     list.push_instance(
         MeshKind::Plane,
         Mat4::from_scale(Vec3::new(FLOOR_SIZE, 1.0, FLOOR_SIZE)),
         FLOOR_COLOR,
     );
+    let Arena::Pit { half: pit } = arena else {
+        return;
+    };
     // Thin boxes just outside each wall plane, so their inner faces sit on it.
     let length = 2.0 * (pit + WALL_THICKNESS);
     let offset = pit + WALL_THICKNESS / 2.0;
@@ -512,11 +514,48 @@ fn push_scenery(list: &mut DrawList, pit: f32) {
     }
 }
 
+/// How far a selected object's color moves toward white.
+const SELECTED_TINT: f32 = 0.35;
+const OUTLINE_COLOR: [f32; 4] = [1.0, 0.85, 0.2, 1.0];
+
+/// Half extents of a collider's bounding box in body space.
+fn local_half_extents(collider: Collider, world: &World) -> Vec3 {
+    match collider {
+        Collider::Sphere { radius } => Vec3::splat(radius),
+        Collider::Box { half_extents } => half_extents,
+        Collider::Capsule {
+            half_height,
+            radius,
+        } => Vec3::new(radius, half_height + radius, radius),
+        Collider::Hull { hull } => world.hull(hull).map_or(Vec3::splat(0.5), |h| {
+            h.vertices().iter().fold(Vec3::ZERO, |m, v| m.max(v.abs()))
+        }),
+        Collider::Plane { .. } => Vec3::ZERO,
+    }
+}
+
+/// The 12 edges of a box of `half` extents placed by `transform`.
+fn push_box_outline(list: &mut DrawList, transform: Mat4, half: Vec3) {
+    let corner = |i: usize| {
+        let s = |bit: usize| if i & bit == 0 { -1.0 } else { 1.0 };
+        transform.transform_point3(half * Vec3::new(s(1), s(2), s(4)))
+    };
+    for i in 0..8 {
+        for bit in [1, 2, 4] {
+            if i & bit == 0 {
+                list.push_line(corner(i), corner(i | bit), OUTLINE_COLOR);
+            }
+        }
+    }
+}
+
 /// How to draw a frame of the scene.
 #[derive(Debug, Clone, Copy)]
 pub struct DrawOptions {
-    /// Pit half-width (walls are drawn to match).
-    pub pit: f32,
+    /// The scene's surroundings (walls are drawn to match the pit).
+    pub arena: Arena,
+    /// Object to highlight (edit mode).
+    pub selected: Option<usize>,
     /// Interpolation between the previous and current physics states.
     pub alpha: f32,
     pub show_grid: bool,
@@ -531,14 +570,15 @@ pub fn build_draw_list(
     options: DrawOptions,
 ) {
     let DrawOptions {
-        pit,
+        arena,
+        selected,
         alpha,
         show_grid,
         show_axes,
     } = options;
     list.clear();
-    push_scenery(list, pit);
-    for object in objects {
+    push_scenery(list, arena);
+    for (index, object) in objects.iter().enumerate() {
         let Some(body) = world.body(object.handle) else {
             continue;
         };
@@ -551,8 +591,17 @@ pub fn build_draw_list(
         };
         let pose = interpolate(object.prev, current, alpha);
         let body_transform = Mat4::from_rotation_translation(pose.orientation, pose.position);
+        let selected = selected == Some(index);
+        let color = if selected {
+            object.color.map(|c| c + (1.0 - c) * SELECTED_TINT)
+        } else {
+            object.color
+        };
         for (mesh, local) in collider_visual(collider, hull_meshes) {
-            list.push_instance(mesh, body_transform * local, object.color);
+            list.push_instance(mesh, body_transform * local, color);
+        }
+        if selected {
+            push_box_outline(list, body_transform, local_half_extents(collider, world));
         }
         if show_axes {
             let length = collider_extent(collider);
@@ -752,7 +801,8 @@ mod tests {
             &objects,
             &HullMeshes::new(),
             DrawOptions {
-                pit: PIT,
+                arena: Arena::Pit { half: PIT },
+                selected: None,
                 alpha: 0.0,
                 show_grid: true,
                 show_axes: false,

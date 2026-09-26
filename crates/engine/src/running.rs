@@ -11,10 +11,13 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window};
 
 use crate::camera::{self, CameraMode, CameraRig, OrbitCamera};
+use crate::editor::Editor;
+use crate::editor_ui::{self, InspectorAction, NewShape};
 use crate::egui_input::EguiInput;
 use crate::input::InputState;
 use crate::platform;
 use crate::scene::{self, Demo, SceneObject};
+use crate::scene_desc;
 use crate::timestep::FixedTimestep;
 
 const FIXED_STEP: f32 = 1.0 / 60.0;
@@ -22,6 +25,8 @@ const MAX_STEPS_PER_FRAME: u32 = 5;
 /// Bodies below this height count as gone; once all are, the scene re-drops.
 const RESET_HEIGHT: f32 = -30.0;
 const FLY_SPEED: f32 = 8.0;
+/// Farthest an edit drag moves an object from where it started (m).
+const MAX_EDIT_DRAG: f32 = 100.0;
 /// Drag spring stiffness (1/s²) and damping (1/s, slightly above critical 2·√k).
 const DRAG_STIFFNESS: f32 = 80.0;
 const DRAG_DAMPING: f32 = 18.0;
@@ -39,6 +44,37 @@ struct Drag {
     target: Vec3,
 }
 
+/// Edit authors the scene (physics paused); Play simulates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Edit,
+    Play,
+}
+
+/// A selected object being dragged in edit mode, on a horizontal plane (or a
+/// vertical one facing the camera).
+struct EditDrag {
+    object: usize,
+    /// Where the cursor ray first hit the object.
+    grab: Vec3,
+    /// The object's authored position at that moment.
+    start: Vec3,
+    vertical: bool,
+}
+
+/// Panel requests carried out after the UI pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Action {
+    Play,
+    Stop,
+    Capture,
+    Undo,
+    Redo,
+    Add(NewShape),
+    LoadDemo(Demo),
+    Inspector(InspectorAction),
+}
+
 /// Panel-controlled settings plus one-shot requests the panel raises.
 struct Settings {
     paused: bool,
@@ -47,7 +83,6 @@ struct Settings {
     show_axes: bool,
     step_requested: bool,
     reset_requested: bool,
-    scene: Demo,
     warm_starting: bool,
     iterations: usize,
     sleeping: bool,
@@ -77,10 +112,19 @@ pub struct Running {
     frame_ms: f32,
     /// Physics work this frame (timings summed over its fixed steps).
     physics: StepStats,
-    /// The scene currently in the world (the panel choice applies on reset).
-    loaded: Demo,
     drag: Option<Drag>,
     hull_meshes: scene::HullMeshes,
+    mode: Mode,
+    /// The authored scene, selection, and undo history.
+    editor: Editor,
+    /// Editor revision the world was last built from.
+    built_revision: u64,
+    edit_drag: Option<EditDrag>,
+    /// The demo the authored scene was loaded from, and the editor revision
+    /// then (it stays highlighted until the scene is edited).
+    demo: Option<(Demo, u64)>,
+    /// Last error or status for the panel.
+    message: Option<String>,
 }
 
 impl Running {
@@ -89,7 +133,8 @@ impl Running {
         let initial = platform::scene_override()
             .and_then(|name| Demo::from_name(&name))
             .unwrap_or(Demo::Pit);
-        let objects = scene::build(&mut world, initial);
+        let desc = scene::demo_desc(initial);
+        let objects = scene_desc::rebuild(&mut world, &desc).expect("demo scenes are valid");
         let now = Instant::now();
         Self {
             renderer: Renderer::new(&gpu),
@@ -116,7 +161,6 @@ impl Running {
                 show_axes: false,
                 step_requested: false,
                 reset_requested: false,
-                scene: initial,
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
                 sleeping: SolverSettings::default().sleeping,
@@ -125,9 +169,14 @@ impl Running {
             last_frame: now,
             frame_ms: 0.0,
             physics: StepStats::default(),
-            loaded: initial,
             drag: None,
             hull_meshes: scene::HullMeshes::new(),
+            mode: Mode::Play,
+            editor: Editor::new(desc),
+            built_revision: 0,
+            edit_drag: None,
+            demo: Some((initial, 0)),
+            message: None,
         }
         .with_hull_meshes()
     }
@@ -182,9 +231,15 @@ impl Running {
                 }
                 if *button == MouseButton::Left {
                     if pressed {
-                        self.try_grab();
+                        match self.mode {
+                            Mode::Play => self.try_grab(),
+                            Mode::Edit => self.try_select(),
+                        }
                     } else {
                         self.drag = None; // release: the body keeps its velocity (throw)
+                        if self.edit_drag.take().is_some() {
+                            self.editor.commit();
+                        }
                     }
                 }
                 self.input.on_mouse_button(*button, pressed);
@@ -223,6 +278,10 @@ impl Running {
                     if code == KeyCode::KeyF || (fly && code == KeyCode::Escape) {
                         self.toggle_camera(window);
                     }
+                }
+                if pressed && self.mode == Mode::Edit && !self.egui_ctx.egui_wants_keyboard_input()
+                {
+                    self.edit_shortcut(code, event.repeat);
                 }
                 self.input.on_key(code, pressed);
             }
@@ -307,6 +366,161 @@ impl Running {
         });
     }
 
+    /// Left click in edit mode: select the object under the cursor and start
+    /// dragging it (Shift: vertically); empty space clears the selection.
+    fn try_select(&mut self) {
+        if self.camera.mode != CameraMode::Orbit || self.egui_ctx.egui_wants_pointer_input() {
+            return;
+        }
+        let Some((origin, dir)) = self.cursor_ray() else {
+            return;
+        };
+        match editor_ui::object_at(&self.world, &self.objects, origin, dir) {
+            Some((index, point)) => {
+                self.editor.select(Some(index));
+                let start = Vec3::from_array(self.editor.desc().objects[index].position);
+                let vertical = self.input.key_held(KeyCode::ShiftLeft)
+                    || self.input.key_held(KeyCode::ShiftRight);
+                self.editor.begin();
+                self.edit_drag = Some(EditDrag {
+                    object: index,
+                    grab: point,
+                    start,
+                    vertical,
+                });
+            }
+            None => self.editor.select(None),
+        }
+    }
+
+    /// Moves the dragged object to follow the cursor on its drag plane.
+    fn update_edit_drag(&mut self) {
+        let Some(drag) = &self.edit_drag else {
+            return;
+        };
+        let Some((origin, dir)) = self.cursor_ray() else {
+            return;
+        };
+        let normal = if drag.vertical {
+            let mut facing = self.camera.eye() - drag.grab;
+            facing.y = 0.0;
+            facing.try_normalize().unwrap_or(Vec3::Z)
+        } else {
+            Vec3::Y
+        };
+        let Some(hit) = editor_ui::ray_plane(origin, dir, drag.grab, normal) else {
+            return;
+        };
+        let mut delta = (hit - drag.grab).clamp_length_max(MAX_EDIT_DRAG);
+        if drag.vertical {
+            delta = Vec3::new(0.0, delta.y, 0.0);
+        }
+        let position = (drag.start + delta).to_array();
+        let index = drag.object;
+        if self
+            .editor
+            .desc()
+            .objects
+            .get(index)
+            .is_some_and(|o| o.position != position)
+        {
+            self.editor.modify(|d| d.objects[index].position = position);
+        }
+    }
+
+    /// Delete/Backspace, Ctrl+D, Ctrl+Z, Ctrl+Y (or Ctrl+Shift+Z).
+    fn edit_shortcut(&mut self, code: KeyCode, repeat: bool) {
+        let held = |a, b| self.input.key_held(a) || self.input.key_held(b);
+        let ctrl = held(KeyCode::ControlLeft, KeyCode::ControlRight);
+        let shift = held(KeyCode::ShiftLeft, KeyCode::ShiftRight);
+        match code {
+            KeyCode::Delete | KeyCode::Backspace if !repeat => {
+                self.editor.delete_selected();
+            }
+            KeyCode::KeyD if ctrl && !repeat => {
+                self.editor.duplicate_selected();
+            }
+            KeyCode::KeyZ if ctrl && shift => {
+                self.editor.redo();
+            }
+            KeyCode::KeyZ if ctrl => {
+                self.editor.undo();
+            }
+            KeyCode::KeyY if ctrl => {
+                self.editor.redo();
+            }
+            _ => {}
+        }
+    }
+
+    /// Rebuilds the world from the authored scene (keeping the old world and
+    /// reporting why if the scene is invalid).
+    fn rebuild_scene(&mut self) {
+        match scene_desc::rebuild(&mut self.world, self.editor.desc()) {
+            Ok(objects) => {
+                self.objects = objects;
+                self.sync_hull_meshes();
+                self.timestep.reset();
+                self.alpha = 0.0;
+                self.drag = None;
+                self.message = None;
+            }
+            Err(e) => self.message = Some(e.to_string()),
+        }
+        self.built_revision = self.editor.revision();
+    }
+
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Play => {
+                self.editor.commit();
+                self.edit_drag = None;
+                self.mode = Mode::Play;
+                self.settings.paused = false;
+                self.rebuild_scene();
+            }
+            Action::Stop => {
+                self.mode = Mode::Edit;
+                self.rebuild_scene();
+            }
+            Action::Capture => {
+                let poses: Vec<_> = self
+                    .objects
+                    .iter()
+                    .map(|o| scene::current_pose(&self.world, o.handle))
+                    .map(|p| p.map(|p| (p.position, p.orientation)))
+                    .collect();
+                let captured = self.editor.capture_poses(&poses);
+                self.message = Some(format!(
+                    "captured {captured} poses (jointed bodies keep their authored pose)"
+                ));
+            }
+            Action::Undo => {
+                self.editor.undo();
+            }
+            Action::Redo => {
+                self.editor.redo();
+            }
+            Action::Add(shape) => {
+                let target = self.camera.orbit.target;
+                let at = Vec3::new(target.x, 1.0, target.z);
+                let index = self.editor.desc().objects.len();
+                self.editor.add(editor_ui::new_object(shape, at, index));
+            }
+            Action::LoadDemo(demo) => {
+                self.editor.replace(scene::demo_desc(demo));
+                self.demo = Some((demo, self.editor.revision()));
+                self.rebuild_scene();
+            }
+            Action::Inspector(InspectorAction::Duplicate) => {
+                self.editor.duplicate_selected();
+            }
+            Action::Inspector(InspectorAction::Delete) => {
+                self.editor.delete_selected();
+            }
+        }
+    }
+
     /// Spring-damper impulse pulling the grab point toward the cursor (gravity
     /// cancelled so the body doesn't sag). Called before every fixed step.
     fn apply_drag(&mut self, dt: f32) {
@@ -330,7 +544,7 @@ impl Running {
     }
 
     fn update_camera(&mut self, dt: f32, egui_has_pointer: bool) {
-        let dragging = self.drag.is_some();
+        let dragging = self.drag.is_some() || self.edit_drag.is_some();
         let input = &self.input;
         match self.camera.mode {
             CameraMode::Orbit if !egui_has_pointer => {
@@ -370,24 +584,29 @@ impl Running {
     }
 
     fn step_physics(&mut self, dt: f32) {
-        let settings = &mut self.settings;
         let solver = SolverSettings {
-            iterations: settings.iterations,
-            warm_starting: settings.warm_starting,
-            sleeping: settings.sleeping,
+            iterations: self.settings.iterations,
+            warm_starting: self.settings.warm_starting,
+            sleeping: self.settings.sleeping,
         };
         if self.world.solver_settings() != solver {
             self.world.set_solver_settings(solver);
         }
-        let rebuild =
-            settings.reset_requested || scene::all_below(&self.world, &self.objects, RESET_HEIGHT);
-        if rebuild {
-            settings.reset_requested = false;
-            self.objects = scene::build(&mut self.world, settings.scene);
-            self.loaded = settings.scene;
-            self.timestep.reset();
-            self.alpha = 0.0;
+        if self.mode == Mode::Edit {
+            self.settings.reset_requested = false;
+            self.settings.step_requested = false;
+            if self.editor.revision() != self.built_revision {
+                self.rebuild_scene();
+            }
+            return;
         }
+        let fell =
+            !self.objects.is_empty() && scene::all_below(&self.world, &self.objects, RESET_HEIGHT);
+        if self.settings.reset_requested || fell {
+            self.settings.reset_requested = false;
+            self.rebuild_scene();
+        }
+        let settings = &mut self.settings;
         let steps = if settings.paused {
             if settings.step_requested {
                 self.alpha = 1.0;
@@ -401,9 +620,6 @@ impl Running {
             plan.steps
         };
         settings.step_requested = false;
-        if rebuild {
-            self.sync_hull_meshes(); // after the last use of `settings`
-        }
 
         let start = self.start;
         let mut clock = || start.elapsed().as_secs_f64() * 1000.0;
@@ -449,6 +665,7 @@ impl Running {
         let egui_has_pointer =
             self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.egui_is_using_pointer();
         self.update_camera(dt, egui_has_pointer);
+        self.update_edit_drag();
         if let Some((origin, dir)) = self.cursor_ray()
             && let Some(drag) = &mut self.drag
         {
@@ -461,7 +678,11 @@ impl Running {
             &self.objects,
             &self.hull_meshes,
             scene::DrawOptions {
-                pit: scene::pit_half(self.loaded),
+                arena: self.editor.desc().arena,
+                selected: match self.mode {
+                    Mode::Edit => self.editor.selected(),
+                    Mode::Play => None,
+                },
                 alpha: self.alpha,
                 show_grid: self.settings.show_grid,
                 show_axes: self.settings.show_axes,
@@ -479,17 +700,41 @@ impl Running {
         let raw = self
             .egui_input
             .take([width, height], self.start.elapsed().as_secs_f64());
-        let (settings, stats) = (
-            &mut self.settings,
-            Stats {
-                backend: self.backend,
-                frame_ms: self.frame_ms,
-                bodies: self.world.len(),
-                mode: self.camera.mode,
-                physics: self.physics,
-            },
-        );
-        let output = self.egui_ctx.run_ui(raw, |ui| panel(ui, settings, &stats));
+        let stats = Stats {
+            backend: self.backend,
+            frame_ms: self.frame_ms,
+            bodies: self.world.len(),
+            camera: self.camera.mode,
+            physics: self.physics,
+            mode: self.mode,
+            demo: self
+                .demo
+                .filter(|&(_, revision)| revision == self.editor.revision())
+                .map(|(demo, _)| demo),
+            can_undo: self.editor.can_undo(),
+            can_redo: self.editor.can_redo(),
+            message: self.message.clone(),
+        };
+        let mut actions = Vec::new();
+        let (settings, editor, mode) = (&mut self.settings, &mut self.editor, self.mode);
+        let output = self.egui_ctx.run_ui(raw, |ui| {
+            panel(ui, settings, &stats, &mut actions);
+            if mode == Mode::Edit
+                && let Some(action) = editor_ui::inspector(ui.ctx(), editor)
+            {
+                actions.push(Action::Inspector(action));
+            }
+        });
+        for action in actions {
+            self.apply(action);
+        }
+        // A gesture ends when nothing is being dragged or typed into.
+        if self.edit_drag.is_none()
+            && !self.egui_ctx.egui_is_using_pointer()
+            && self.egui_ctx.memory(|m| m.focused().is_none())
+        {
+            self.editor.commit();
+        }
         let ui = UiFrame {
             primitives: self
                 .egui_ctx
@@ -522,15 +767,72 @@ struct Stats {
     backend: &'static str,
     frame_ms: f32,
     bodies: usize,
-    mode: CameraMode,
+    camera: CameraMode,
     physics: StepStats,
+    mode: Mode,
+    demo: Option<Demo>,
+    can_undo: bool,
+    can_redo: bool,
+    message: Option<String>,
 }
 
-fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
+fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<Action>) {
     egui::Window::new("impulse")
         .default_pos([12.0, 12.0])
         .resizable(false)
         .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| match stats.mode {
+                Mode::Play => {
+                    if ui.button("■ Edit").clicked() {
+                        actions.push(Action::Stop);
+                    }
+                    if ui.button("Capture pose").clicked() {
+                        actions.push(Action::Capture);
+                    }
+                }
+                Mode::Edit => {
+                    if ui.button("▶ Play").clicked() {
+                        actions.push(Action::Play);
+                    }
+                    if ui
+                        .add_enabled(stats.can_undo, egui::Button::new("Undo"))
+                        .clicked()
+                    {
+                        actions.push(Action::Undo);
+                    }
+                    if ui
+                        .add_enabled(stats.can_redo, egui::Button::new("Redo"))
+                        .clicked()
+                    {
+                        actions.push(Action::Redo);
+                    }
+                }
+            });
+            if stats.mode == Mode::Edit {
+                ui.horizontal(|ui| {
+                    ui.label("add");
+                    for shape in NewShape::ALL {
+                        if ui.button(shape.label()).clicked() {
+                            actions.push(Action::Add(shape));
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("scene");
+                for demo in Demo::ALL {
+                    if ui
+                        .selectable_label(stats.demo == Some(demo), demo.label())
+                        .clicked()
+                    {
+                        actions.push(Action::LoadDemo(demo));
+                    }
+                }
+            });
+            if let Some(message) = &stats.message {
+                ui.colored_label(egui::Color32::from_rgb(240, 190, 90), message);
+            }
+            ui.separator();
             ui.label(format!("{} · {:.1} ms", stats.backend, stats.frame_ms));
             let p = &stats.physics;
             ui.label(format!(
@@ -549,35 +851,26 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
                 "{} pairs · {} contacts ({} solved)",
                 p.pairs, p.contacts, p.active_contacts
             ));
-            ui.horizontal(|ui| {
-                if ui
-                    .button(if s.paused { "Resume" } else { "Pause" })
-                    .clicked()
-                {
-                    s.paused = !s.paused;
-                }
-                if ui
-                    .add_enabled(s.paused, egui::Button::new("Step"))
-                    .clicked()
-                {
-                    s.step_requested = true;
-                }
-                if ui.button("Reset").clicked() {
-                    s.reset_requested = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("scene");
-                for demo in Demo::ALL {
+            ui.add_enabled_ui(stats.mode == Mode::Play, |ui| {
+                ui.horizontal(|ui| {
                     if ui
-                        .selectable_value(&mut s.scene, demo, demo.label())
-                        .changed()
+                        .button(if s.paused { "Resume" } else { "Pause" })
+                        .clicked()
                     {
+                        s.paused = !s.paused;
+                    }
+                    if ui
+                        .add_enabled(s.paused, egui::Button::new("Step"))
+                        .clicked()
+                    {
+                        s.step_requested = true;
+                    }
+                    if ui.button("Reset").clicked() {
                         s.reset_requested = true;
                     }
-                }
+                });
+                ui.add(egui::Slider::new(&mut s.time_scale, 0.1..=2.0).text("time scale"));
             });
-            ui.add(egui::Slider::new(&mut s.time_scale, 0.1..=2.0).text("time scale"));
             ui.separator();
             ui.checkbox(&mut s.warm_starting, "warm starting");
             ui.checkbox(&mut s.sleeping, "sleeping");
@@ -585,11 +878,14 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
             ui.separator();
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");
-            ui.label(match stats.mode {
-                CameraMode::Orbit => {
+            ui.label(match (stats.camera, stats.mode) {
+                (CameraMode::Orbit, Mode::Play) => {
                     "Drag a body: grab / throw · drag empty space: orbit · right-drag: pan · wheel: zoom · F: fly"
                 },
-                CameraMode::Fly => "WASD / Space / Shift: move · mouse: look · F or Esc: orbit",
+                (CameraMode::Orbit, Mode::Edit) => {
+                    "Click: select · drag it: move (Shift: up/down) · Del · Ctrl+D · Ctrl+Z / Ctrl+Y · drag empty space: orbit"
+                },
+                (CameraMode::Fly, _) => "WASD / Space / Shift: move · mouse: look · F or Esc: orbit",
             });
         });
 }

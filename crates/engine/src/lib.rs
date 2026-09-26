@@ -8,6 +8,8 @@ mod platform;
 mod app;
 
 mod camera;
+mod editor;
+mod editor_ui;
 mod egui_input;
 mod input;
 mod joint_scene;

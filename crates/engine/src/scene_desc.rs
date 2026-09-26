@@ -545,6 +545,43 @@ mod tests {
         assert!(objects.iter().all(|o| world.body(o.handle).is_none()));
     }
 
+    /// Stop after Play: rebuilding from the description restores the authored
+    /// scene exactly, whatever the simulation did.
+    #[test]
+    fn rebuild_after_simulating_restores_the_authored_scene_bit_for_bit() {
+        let desc = sampler();
+        let state = |w: &World| -> Vec<[u32; 13]> {
+            w.bodies()
+                .map(|(_, b)| {
+                    let mut s = [0; 13];
+                    let values = [
+                        b.position().to_array().as_slice(),
+                        &b.orientation().to_array(),
+                        &b.velocity().to_array(),
+                        &b.angular_velocity().to_array(),
+                    ]
+                    .concat();
+                    for (slot, v) in s.iter_mut().zip(values) {
+                        *slot = v.to_bits();
+                    }
+                    s
+                })
+                .collect()
+        };
+        let (fresh, _) = build_world(&desc).unwrap();
+        let (mut world, _) = build_world(&desc).unwrap();
+        for _ in 0..120 {
+            world.step(1.0 / 60.0);
+        }
+        assert_ne!(
+            state(&world),
+            state(&fresh),
+            "the simulation should move things"
+        );
+        rebuild(&mut world, &desc).unwrap();
+        assert_eq!(state(&world), state(&fresh));
+    }
+
     #[test]
     fn ron_round_trips() {
         let desc = sampler();
