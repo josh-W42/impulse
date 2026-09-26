@@ -88,6 +88,7 @@ mod tests {
                 position: p.to_array(),
                 normal: [0.0, 1.0, 0.0],
                 uv: [0.0; 2],
+                tangent: [1.0, 0.0, 0.0, 1.0],
             })
             .collect();
         let (min, max) = points.iter().fold(

@@ -6,7 +6,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use glam::{Mat4, Vec3};
-use impulse_assets::{MaterialData, ModelData, ModelError, extreme_points, load_glb, mip_chain};
+use impulse_assets::{
+    ColorSpace, MaterialData, ModelData, ModelError, extreme_points, load_glb, mip_chain,
+};
 use impulse_physics::{Collider, World};
 use impulse_render::{Gpu, MeshData, MeshId, Renderer, TextureId, Vertex};
 
@@ -245,7 +247,7 @@ fn material_texture(
         Some(texture) => {
             let base = &texture.mips[0];
             let tinted = tint(&base.rgba, factor);
-            let mips = mip_chain(tinted, base.width, base.height, true);
+            let mips = mip_chain(tinted, base.width, base.height, ColorSpace::Srgb);
             let levels: Vec<&[u8]> = mips.iter().map(|m| m.rgba.as_slice()).collect();
             renderer.add_texture(gpu, base.width, base.height, &levels)
         }

@@ -18,8 +18,10 @@ mod gpu;
 mod mesh;
 mod renderer;
 mod shaders;
+mod sky;
 
 pub use draw_list::{DebugLine, DrawList, Instance, InstanceRaw, group_by_mesh};
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};
 pub use mesh::{MeshData, MeshId, MeshKind, Vertex};
 pub use renderer::{CameraData, Renderer, TextureId, UiFrame};
+pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};
