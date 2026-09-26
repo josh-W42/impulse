@@ -21,19 +21,32 @@ impl BackendOverride {
 /// Reads `backend=webgpu` or `backend=webgl` from a URL query string such as `?backend=webgl`.
 /// Returns `None` when the parameter is absent or has any other value.
 pub fn parse_backend_override(query: &str) -> Option<BackendOverride> {
-    query
-        .trim_start_matches('?')
-        .split('&')
-        .find_map(|pair| match pair.split_once('=') {
-            Some(("backend", "webgpu")) => Some(BackendOverride::WebGpu),
-            Some(("backend", "webgl")) => Some(BackendOverride::WebGl),
-            _ => None,
-        })
+    match query_value(query, "backend")? {
+        "webgpu" => Some(BackendOverride::WebGpu),
+        "webgl" => Some(BackendOverride::WebGl),
+        _ => None,
+    }
+}
+
+/// The value of `key` in a URL query string such as `?scene=rain&debug=1`.
+pub fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.trim_start_matches('?').split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_value_finds_keys_anywhere() {
+        assert_eq!(query_value("?a=1&scene=rain", "scene"), Some("rain"));
+        assert_eq!(query_value("?scene", "scene"), None);
+        assert_eq!(query_value("", "scene"), None);
+    }
 
     #[test]
     fn empty_query_has_no_override() {

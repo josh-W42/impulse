@@ -19,6 +19,15 @@ pub struct SceneObject {
 pub const BODY_COUNT: usize = 30;
 /// Inner half-width of the pit (walls are planes at ±PIT).
 const PIT: f32 = 6.0;
+const RAIN_PIT: f32 = 14.0;
+pub const RAIN_COUNT: usize = 1000;
+const PALETTE_RAIN: [[f32; 4]; 5] = [
+    [0.85, 0.35, 0.30, 1.0],
+    [0.95, 0.70, 0.30, 1.0],
+    [0.35, 0.65, 0.40, 1.0],
+    [0.30, 0.50, 0.85, 1.0],
+    [0.70, 0.45, 0.80, 1.0],
+];
 const WALL_HEIGHT: f32 = 2.0;
 const WALL_THICKNESS: f32 = 0.2;
 const FLOOR_SIZE: f32 = 40.0;
@@ -38,14 +47,22 @@ fn spread(i: usize, k: f32) -> f32 {
 }
 
 /// The floor plane and the four inward-facing wall planes: `(point, normal)`.
-fn pit_planes() -> [(Vec3, Vec3); 5] {
+fn pit_planes(half: f32) -> [(Vec3, Vec3); 5] {
     [
         (Vec3::ZERO, Vec3::Y),
-        (Vec3::new(-PIT, 0.0, 0.0), Vec3::X),
-        (Vec3::new(PIT, 0.0, 0.0), Vec3::NEG_X),
-        (Vec3::new(0.0, 0.0, -PIT), Vec3::Z),
-        (Vec3::new(0.0, 0.0, PIT), Vec3::NEG_Z),
+        (Vec3::new(-half, 0.0, 0.0), Vec3::X),
+        (Vec3::new(half, 0.0, 0.0), Vec3::NEG_X),
+        (Vec3::new(0.0, 0.0, -half), Vec3::Z),
+        (Vec3::new(0.0, 0.0, half), Vec3::NEG_Z),
     ]
+}
+
+/// Inner half-width of the pit for a scene (Rain needs room for 1,000 bodies).
+pub fn pit_half(demo: Demo) -> f32 {
+    match demo {
+        Demo::Rain => RAIN_PIT,
+        _ => PIT,
+    }
 }
 
 /// The demo scenes offered in the panel.
@@ -57,17 +74,27 @@ pub enum Demo {
     Tower,
     /// Fifteen cubes in a five-row pyramid.
     Pyramid,
+    /// 1,000 mixed bodies (M5's scale showcase).
+    Rain,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 3] = [Demo::Pit, Demo::Tower, Demo::Pyramid];
+    pub const ALL: [Demo; 4] = [Demo::Pit, Demo::Tower, Demo::Pyramid, Demo::Rain];
 
     pub fn label(self) -> &'static str {
         match self {
             Demo::Pit => "Pit",
             Demo::Tower => "Tower",
             Demo::Pyramid => "Pyramid",
+            Demo::Rain => "Rain",
         }
+    }
+
+    /// Parses a scene name, e.g. from `?scene=rain` (case-insensitive).
+    pub fn from_name(name: &str) -> Option<Demo> {
+        Demo::ALL
+            .into_iter()
+            .find(|d| d.label().eq_ignore_ascii_case(name))
     }
 }
 
@@ -82,7 +109,7 @@ const STACK_COLORS: [[f32; 4]; 3] = [
 /// Replaces everything in `world` with `demo`. Deterministic.
 pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
     world.clear();
-    add_pit(world);
+    add_pit(world, pit_half(demo));
     match demo {
         Demo::Pit => pit_bodies(world),
         Demo::Tower => (0..TOWER_HEIGHT)
@@ -99,10 +126,57 @@ pub fn build(world: &mut World, demo: Demo) -> Vec<SceneObject> {
             }
             objects
         }
+        Demo::Rain => rain_bodies(world),
     }
 }
 
-/// The pit demo (kept as the default scene).
+/// Layers of mixed spheres and boxes filling the Rain pit (same recipe as the
+/// physics benchmark, so browser and native numbers are comparable).
+fn rain_bodies(world: &mut World) -> Vec<SceneObject> {
+    let per_row = ((2.0 * RAIN_PIT - 2.0) / 1.2).floor() as usize;
+    (0..RAIN_COUNT)
+        .map(|i| {
+            let (col, row, layer) = (
+                i % per_row,
+                (i / per_row) % per_row,
+                i / (per_row * per_row),
+            );
+            let position = Vec3::new(
+                -RAIN_PIT + 1.0 + col as f32 * 1.2,
+                1.0 + layer as f32 * 1.2,
+                -RAIN_PIT + 1.0 + row as f32 * 1.2,
+            );
+            let size = 0.25 + 0.2 * spread(i, 0.37);
+            let collider = if i % 2 == 0 {
+                Collider::Sphere { radius: size }
+            } else {
+                Collider::Box {
+                    half_extents: Vec3::new(size, size * 0.8, size * 0.9),
+                }
+            };
+            let desc = BodyDesc {
+                orientation: glam::Quat::from_rotation_y(spread(i, 0.53) * 6.0),
+                ..BodyDesc::dynamic(1.0, position)
+            }
+            .with_collider(collider)
+            .with_material(Material {
+                restitution: 0.2,
+                friction: 0.5,
+            });
+            SceneObject {
+                handle: world.add_body(desc).expect("rain bodies are valid"),
+                color: PALETTE_RAIN[i % PALETTE_RAIN.len()],
+                prev: Pose {
+                    position,
+                    orientation: desc.orientation,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The pit demo (tests use it as the canonical scene).
+#[cfg(test)]
 pub fn demo_scene(world: &mut World) -> Vec<SceneObject> {
     build(world, Demo::Pit)
 }
@@ -126,8 +200,8 @@ fn stack_cube(world: &mut World, position: Vec3, layer: usize) -> SceneObject {
     }
 }
 
-fn add_pit(world: &mut World) {
-    for (point, normal) in pit_planes() {
+fn add_pit(world: &mut World, half: f32) {
+    for (point, normal) in pit_planes(half) {
         world
             .add_body(
                 BodyDesc::fixed(point)
@@ -235,15 +309,15 @@ fn collider_visual(collider: Collider) -> Option<(MeshKind, Vec3)> {
     }
 }
 
-fn push_scenery(list: &mut DrawList) {
+fn push_scenery(list: &mut DrawList, pit: f32) {
     list.push_instance(
         MeshKind::Plane,
         Mat4::from_scale(Vec3::new(FLOOR_SIZE, 1.0, FLOOR_SIZE)),
         FLOOR_COLOR,
     );
     // Thin boxes just outside each wall plane, so their inner faces sit on it.
-    let length = 2.0 * (PIT + WALL_THICKNESS);
-    let offset = PIT + WALL_THICKNESS / 2.0;
+    let length = 2.0 * (pit + WALL_THICKNESS);
+    let offset = pit + WALL_THICKNESS / 2.0;
     let y = WALL_HEIGHT / 2.0;
     for (center, size) in [
         (
@@ -275,12 +349,13 @@ pub fn build_draw_list(
     list: &mut DrawList,
     world: &World,
     objects: &[SceneObject],
+    pit: f32,
     alpha: f32,
     show_grid: bool,
     show_axes: bool,
 ) {
     list.clear();
-    push_scenery(list);
+    push_scenery(list, pit);
     for object in objects {
         let Some(body) = world.body(object.handle) else {
             continue;
@@ -353,6 +428,22 @@ mod tests {
     }
 
     #[test]
+    fn rain_drops_a_thousand_bodies_inside_its_pit() {
+        let mut world = World::default();
+        let objects = build(&mut world, Demo::Rain);
+        assert_eq!(objects.len(), RAIN_COUNT);
+        for o in &objects {
+            let p = world.body(o.handle).unwrap().position();
+            assert!(
+                p.x.abs() < RAIN_PIT - 0.5 && p.z.abs() < RAIN_PIT - 0.5 && p.y > 0.5,
+                "{p}"
+            );
+        }
+        assert_eq!(Demo::from_name("RAIN"), Some(Demo::Rain));
+        assert_eq!(Demo::from_name("nope"), None);
+    }
+
+    #[test]
     fn stack_scenes_build_the_expected_bodies() {
         let mut world = World::default();
         assert_eq!(build(&mut world, Demo::Tower).len(), TOWER_HEIGHT);
@@ -387,7 +478,7 @@ mod tests {
         snapshot(&world, &mut objects);
         world.step(0.1);
         let mut list = DrawList::default();
-        build_draw_list(&mut list, &world, &objects, 0.0, true, false);
+        build_draw_list(&mut list, &world, &objects, PIT, 0.0, true, false);
         assert_eq!(list.instances.len(), SCENERY + BODY_COUNT);
         assert_eq!(list.instances[0].mesh, MeshKind::Plane);
         // alpha 0 draws the pre-step pose, not the current one.

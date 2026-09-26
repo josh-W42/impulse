@@ -6,7 +6,7 @@ use wasm_bindgen::JsCast;
 use winit::platform::web::WindowAttributesExtWebSys;
 use winit::window::{Window, WindowAttributes};
 
-use crate::backend::{BackendOverride, parse_backend_override};
+use crate::backend::{BackendOverride, parse_backend_override, query_value};
 
 /// Id of the `<canvas>` in `web/index.html` that the engine renders into.
 const CANVAS_ID: &str = "impulse-canvas";
@@ -43,6 +43,12 @@ pub fn window_attributes(title: &str) -> WindowAttributes {
 pub fn backend_override() -> Option<BackendOverride> {
     let search = web_sys::window()?.location().search().ok()?;
     parse_backend_override(&search)
+}
+
+/// `?scene=tower` etc. opens a specific demo scene.
+pub fn scene_override() -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    query_value(&search, "scene").map(str::to_owned)
 }
 
 pub fn report_status(message: &str) {

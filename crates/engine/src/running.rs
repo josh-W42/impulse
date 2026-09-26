@@ -13,6 +13,7 @@ use winit::window::{CursorGrabMode, Window};
 use crate::camera::{CameraMode, CameraRig, OrbitCamera};
 use crate::egui_input::EguiInput;
 use crate::input::InputState;
+use crate::platform;
 use crate::scene::{self, Demo, SceneObject};
 use crate::timestep::FixedTimestep;
 
@@ -60,12 +61,17 @@ pub struct Running {
     frame_ms: f32,
     /// Physics work this frame (timings summed over its fixed steps).
     physics: StepStats,
+    /// The scene currently in the world (the panel choice applies on reset).
+    loaded: Demo,
 }
 
 impl Running {
     pub fn new(gpu: Gpu, window: &Window) -> Self {
         let mut world = World::default();
-        let objects = scene::demo_scene(&mut world);
+        let initial = platform::scene_override()
+            .and_then(|name| Demo::from_name(&name))
+            .unwrap_or(Demo::Pit);
+        let objects = scene::build(&mut world, initial);
         let now = Instant::now();
         Self {
             renderer: Renderer::new(&gpu),
@@ -92,7 +98,7 @@ impl Running {
                 show_axes: false,
                 step_requested: false,
                 reset_requested: false,
-                scene: Demo::Pit,
+                scene: initial,
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
                 sleeping: SolverSettings::default().sleeping,
@@ -101,6 +107,7 @@ impl Running {
             last_frame: now,
             frame_ms: 0.0,
             physics: StepStats::default(),
+            loaded: initial,
         }
     }
 
@@ -265,6 +272,7 @@ impl Running {
         if settings.reset_requested || scene::all_below(&self.world, &self.objects, RESET_HEIGHT) {
             settings.reset_requested = false;
             self.objects = scene::build(&mut self.world, settings.scene);
+            self.loaded = settings.scene;
             self.timestep.reset();
             self.alpha = 0.0;
         }
@@ -330,6 +338,7 @@ impl Running {
             &mut self.draw_list,
             &self.world,
             &self.objects,
+            scene::pit_half(self.loaded),
             self.alpha,
             self.settings.show_grid,
             self.settings.show_axes,
