@@ -26,6 +26,8 @@ pub struct SolverSettings {
     pub iterations: usize,
     /// Start each step from last step's impulses.
     pub warm_starting: bool,
+    /// Let resting islands fall asleep.
+    pub sleeping: bool,
 }
 
 impl Default for SolverSettings {
@@ -33,6 +35,7 @@ impl Default for SolverSettings {
         Self {
             iterations: 10,
             warm_starting: true,
+            sleeping: true,
         }
     }
 }

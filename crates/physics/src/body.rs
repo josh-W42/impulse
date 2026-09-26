@@ -108,6 +108,10 @@ pub struct RigidBody {
     inverse_mass: f32,
     /// Diagonal of the inverse inertia tensor in body space (principal axes).
     inverse_inertia_local: Vec3,
+    /// Sleeping bodies skip gravity, solving, and integration until woken.
+    pub(crate) asleep: bool,
+    /// Seconds spent below the sleep speed thresholds.
+    pub(crate) sleep_timer: f32,
     collider: Option<Collider>,
     material: Material,
 }
@@ -152,6 +156,8 @@ impl RigidBody {
             angular_velocity,
             inverse_mass,
             inverse_inertia_local,
+            asleep: false,
+            sleep_timer: 0.0,
             collider,
             material: desc.material,
         })
@@ -186,6 +192,15 @@ impl RigidBody {
         self.inverse_mass
     }
 
+    pub fn is_asleep(&self) -> bool {
+        self.asleep
+    }
+
+    /// Dynamic and awake: gets integrated and solved this step.
+    pub(crate) fn is_active(&self) -> bool {
+        self.inverse_mass != 0.0 && !self.asleep
+    }
+
     pub fn angular_velocity(&self) -> Vec3 {
         self.angular_velocity
     }
@@ -198,14 +213,14 @@ impl RigidBody {
 
     /// First half of semi-implicit Euler: forces change velocity.
     pub(crate) fn apply_gravity(&mut self, gravity: Vec3, dt: f32) {
-        if self.inverse_mass != 0.0 {
+        if self.is_active() {
             self.velocity += gravity * dt;
         }
     }
 
     /// Second half: move with the (contact-corrected) new velocity.
     pub(crate) fn advance(&mut self, dt: f32) {
-        if self.inverse_mass != 0.0 {
+        if self.is_active() {
             self.position += self.velocity * dt;
             // dq/dt = ½·(ω, 0)·q; renormalize to stop drift. (No gyroscopic term.)
             let w = self.angular_velocity;

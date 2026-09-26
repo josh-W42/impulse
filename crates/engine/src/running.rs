@@ -33,6 +33,7 @@ struct Settings {
     scene: Demo,
     warm_starting: bool,
     iterations: usize,
+    sleeping: bool,
 }
 
 pub enum FrameResult {
@@ -92,6 +93,7 @@ impl Running {
                 scene: Demo::Pit,
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
+                sleeping: SolverSettings::default().sleeping,
             },
             start: now,
             last_frame: now,
@@ -252,6 +254,7 @@ impl Running {
         let solver = SolverSettings {
             iterations: settings.iterations,
             warm_starting: settings.warm_starting,
+            sleeping: settings.sleeping,
         };
         if self.world.solver_settings() != solver {
             self.world.set_solver_settings(solver);
@@ -400,6 +403,7 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
             ui.add(egui::Slider::new(&mut s.time_scale, 0.1..=2.0).text("time scale"));
             ui.separator();
             ui.checkbox(&mut s.warm_starting, "warm starting");
+            ui.checkbox(&mut s.sleeping, "sleeping");
             ui.add(egui::Slider::new(&mut s.iterations, 1..=30).text("solver iterations"));
             ui.separator();
             ui.checkbox(&mut s.show_grid, "grid");

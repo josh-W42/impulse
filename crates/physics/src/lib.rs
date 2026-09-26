@@ -10,6 +10,7 @@ mod broadphase;
 mod collider;
 mod contact;
 mod solver;
+mod union_find;
 mod world;
 
 pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};

@@ -2,10 +2,17 @@ use glam::Vec3;
 
 use crate::body::{BodyDesc, BodyError, RigidBody};
 use crate::broadphase::{Aabb, AabbTree};
+use crate::contact::Contact;
 use crate::contact::find_contacts;
 use crate::solver::{self, ContactCache, SolverSettings};
+use crate::union_find::UnionFind;
 
 pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
+
+/// Below these speeds (m/s, rad/s) for `SLEEP_TIME` seconds, an island may sleep.
+const SLEEP_LINEAR_SPEED: f32 = 0.05;
+const SLEEP_ANGULAR_SPEED: f32 = 0.1;
+const SLEEP_TIME: f32 = 0.5;
 
 /// Refers to a body in a [`World`]. Stays safe after removal: a stale handle
 /// never reaches a different body that later reuses the same slot.
@@ -158,18 +165,103 @@ impl World {
     /// with the contact solve between the velocity and position updates.
     pub fn step(&mut self, dt: f32) {
         debug_assert!(dt.is_finite() && dt >= 0.0, "invalid timestep {dt}");
+        let contacts = find_contacts(self);
+        self.wake_touched_islands(&contacts);
         let gravity = self.gravity;
         for body in self.bodies_mut() {
             body.apply_gravity(gravity, dt);
         }
-        let contacts = find_contacts(self);
+        // Contacts among sleeping (or static) bodies need no solving.
+        let active: Vec<Contact> = contacts
+            .into_iter()
+            .filter(|c| self.is_active(c.a) || self.is_active(c.b))
+            .collect();
         let mut cache = std::mem::take(&mut self.cache);
-        solver::solve(self, &contacts, &mut cache, dt);
+        solver::solve(self, &active, &mut cache, dt);
         self.cache = cache;
         for body in self.bodies_mut() {
             body.advance(dt);
         }
+        if self.settings.sleeping {
+            self.fall_asleep(&active, dt);
+        }
         self.sync_broadphase();
+    }
+
+    fn is_active(&self, handle: BodyHandle) -> bool {
+        self.body(handle).is_some_and(RigidBody::is_active)
+    }
+
+    /// Islands: dynamic bodies connected through contacts. Static bodies do not
+    /// link islands (the floor would otherwise join everything).
+    fn islands(&self, contacts: &[Contact]) -> UnionFind {
+        let mut islands = UnionFind::new(self.slots.len());
+        for c in contacts {
+            let dynamic = |h: BodyHandle| self.body(h).is_some_and(|b| b.inverse_mass() != 0.0);
+            if dynamic(c.a) && dynamic(c.b) {
+                islands.union(c.a.index as usize, c.b.index as usize);
+            }
+        }
+        islands
+    }
+
+    /// Wakes every island that contains an awake dynamic body (e.g. something
+    /// landing on a sleeping stack). With sleeping disabled, wakes everything.
+    fn wake_touched_islands(&mut self, contacts: &[Contact]) {
+        if !self.settings.sleeping {
+            for body in self.bodies_mut() {
+                body.asleep = false;
+            }
+            return;
+        }
+        let mut islands = self.islands(contacts);
+        let mut has_awake = vec![false; self.slots.len()];
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.body.as_ref().is_some_and(RigidBody::is_active) {
+                has_awake[islands.find(i)] = true;
+            }
+        }
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(body) = &mut slot.body
+                && body.asleep
+                && has_awake[islands.find(i)]
+            {
+                body.asleep = false;
+                body.sleep_timer = 0.0;
+            }
+        }
+    }
+
+    /// Advances sleep timers; an island whose bodies have all rested long enough
+    /// goes to sleep together.
+    fn fall_asleep(&mut self, contacts: &[Contact], dt: f32) {
+        for body in self.bodies_mut() {
+            if body.is_active() {
+                let resting = body.velocity.length() < SLEEP_LINEAR_SPEED
+                    && body.angular_velocity.length() < SLEEP_ANGULAR_SPEED;
+                body.sleep_timer = if resting { body.sleep_timer + dt } else { 0.0 };
+            }
+        }
+        let mut islands = self.islands(contacts);
+        let mut ready = vec![true; self.slots.len()];
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(body) = &slot.body
+                && body.is_active()
+                && body.sleep_timer < SLEEP_TIME
+            {
+                ready[islands.find(i)] = false;
+            }
+        }
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(body) = &mut slot.body
+                && body.is_active()
+                && ready[islands.find(i)]
+            {
+                body.asleep = true;
+                body.velocity = Vec3::ZERO;
+                body.angular_velocity = Vec3::ZERO;
+            }
+        }
     }
 
     /// Refits broadphase leaves after bodies moved (cheap when they stay in their margin).
