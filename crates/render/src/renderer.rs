@@ -12,6 +12,7 @@ use crate::draw_list::{DrawList, InstanceRaw, group_by_mesh};
 use crate::gpu::Gpu;
 use crate::mesh::{MeshData, MeshId, MeshKind, Vertex};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
+use crate::sky::Sky;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Within WebGL2's guaranteed texture size.
@@ -23,16 +24,17 @@ const SKY: wgpu::Color = wgpu::Color {
     b: 0.38,
     a: 1.0,
 };
-const LIGHT_COLOR: [f32; 4] = [1.0, 0.96, 0.9, 1.0];
 /// Half-width of the square the shadow map covers, centered on the origin.
 const SHADOW_EXTENT: f32 = 25.0;
 
-const MESH_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 10 => Float32x2];
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+const MESH_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 10 => Float32x2, 11 => Float32x4];
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
     2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
-    6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4
+    6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4, 12 => Float32x4
 ];
+/// Linear HDR → display: a fixed exposure before the tonemapper.
+const EXPOSURE: f32 = 1.0;
 const LINE_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
 
@@ -55,9 +57,76 @@ pub struct UiFrame {
 struct GlobalsRaw {
     view_proj: [[f32; 4]; 4],
     light_view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
+    /// xyz: direction sunlight travels; w: exposure.
     light_dir: [f32; 4],
     light_color: [f32; 4],
+    sky_zenith: [f32; 4],
+    sky_horizon: [f32; 4],
+    sky_ground: [f32; 4],
+    sh: [[f32; 4]; 9],
+}
+
+/// A material's factors as the shader reads them (see `Material` in scene.wgsl).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct MaterialRaw {
+    base_color: [f32; 4],
+    emissive: [f32; 4],
+    /// metallic, roughness, normal scale, occlusion strength
+    params: [f32; 4],
+}
+
+/// A glTF metallic-roughness material. Textures are optional (defaults:
+/// white, flat normal); factors default to glTF's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterialDesc {
+    pub base_color: [f32; 4],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub normal_scale: f32,
+    pub occlusion_strength: f32,
+    /// Linear RGB.
+    pub emissive: [f32; 3],
+    /// sRGB.
+    pub base_color_texture: Option<TextureId>,
+    /// Linear: roughness in G, metallic in B.
+    pub metallic_roughness_texture: Option<TextureId>,
+    /// Linear, tangent space.
+    pub normal_texture: Option<TextureId>,
+    /// Linear, occlusion in R.
+    pub occlusion_texture: Option<TextureId>,
+    /// sRGB.
+    pub emissive_texture: Option<TextureId>,
+}
+
+impl Default for MaterialDesc {
+    fn default() -> Self {
+        Self {
+            base_color: [1.0; 4],
+            metallic: 1.0,
+            roughness: 1.0,
+            normal_scale: 1.0,
+            occlusion_strength: 1.0,
+            emissive: [0.0; 3],
+            base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
+        }
+    }
+}
+
+/// A material handle from [`Renderer::add_material`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MaterialId(pub u32);
+
+impl MaterialId {
+    /// White, factors 1: built-in meshes, which take roughness and metallic
+    /// from their instances.
+    pub const DEFAULT: MaterialId = MaterialId(0);
 }
 
 #[repr(C)]
@@ -71,8 +140,8 @@ struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
-    /// Index into `Renderer::textures`.
-    texture: usize,
+    /// Index into `Renderer::materials`.
+    material: usize,
 }
 
 impl GpuMesh {
@@ -89,7 +158,7 @@ impl GpuMesh {
                 usage: wgpu::BufferUsages::INDEX,
             }),
             index_count: data.indices.len() as u32,
-            texture: 0,
+            material: 0,
         }
     }
 }
@@ -169,14 +238,20 @@ pub struct Renderer {
     /// Globals only: the shadow pass can't bind the texture it renders into.
     globals_bind_group: wgpu::BindGroup,
     lit_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
+    sky: Sky,
+    sky_sh: [[f32; 4]; 9],
     /// Layout and shared sampler for per-material bind groups (group 1).
     material_bgl: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
-    /// Material bind groups; 0 is a 1×1 white texture (untextured meshes).
-    textures: Vec<wgpu::BindGroup>,
-    /// Meshes/textures below these counts survive `clear_custom_meshes`.
+    /// Texture views; 0 white sRGB, 1 white linear, 2 flat normal.
+    textures: Vec<wgpu::TextureView>,
+    /// Material bind groups; 0 is [`MaterialId::DEFAULT`].
+    materials: Vec<wgpu::BindGroup>,
+    /// Meshes/textures/materials below these counts survive `clear_custom_meshes`.
     pinned_meshes: usize,
     pinned_textures: usize,
+    pinned_materials: usize,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
@@ -238,7 +313,9 @@ impl Renderer {
         };
         let globals_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
-            entries: &[globals_entry(wgpu::ShaderStages::VERTEX)],
+            entries: &[globals_entry(
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            )],
         });
         let scene_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
@@ -296,21 +373,36 @@ impl Renderer {
                 immediate_size: 0,
             })
         };
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        };
         let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(size_of::<MaterialRaw>() as u64),
                     },
                     count: None,
                 },
+                texture_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                texture_entry(4),
+                texture_entry(5),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -419,6 +511,33 @@ impl Renderer {
             cache: None,
         });
 
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky"),
+            layout: Some(&globals_layout),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vs_sky"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(gpu.view_format().into())],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // At the far plane, after the scene: only uncovered pixels pass.
+            depth_stencil: depth(
+                false,
+                wgpu::CompareFunction::LessEqual,
+                wgpu::DepthBiasState::default(),
+            ),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("lines"),
             layout: Some(&globals_layout),
@@ -460,24 +579,35 @@ impl Renderer {
             .map(|_| GrowableBuffer::new(device, "instances", INITIAL_INSTANCE_BYTES))
             .collect();
 
-        let white = texture_bind_group(
+        let textures = vec![
+            upload_texture(gpu, 1, 1, &[&[255, 255, 255, 255]], true),
+            upload_texture(gpu, 1, 1, &[&[255, 255, 255, 255]], false),
+            upload_texture(gpu, 1, 1, &[&[128, 128, 255, 255]], false),
+        ];
+        let default_material = material_bind_group(
             gpu,
             &material_bgl,
             &material_sampler,
-            1,
-            1,
-            &[&[255, 255, 255, 255]],
+            &textures,
+            &MaterialDesc::default(),
         );
+        let sky = Sky::default();
+        let sky_sh = sky.irradiance_sh().map(|c| [c.x, c.y, c.z, 0.0]);
         Self {
+            sky_pipeline,
+            sky,
+            sky_sh,
             globals,
             scene_bind_group,
             globals_bind_group,
             lit_pipeline,
             material_bgl,
             material_sampler,
-            textures: vec![white],
+            textures,
+            materials: vec![default_material],
             pinned_meshes: MeshKind::ALL.len(),
-            pinned_textures: 1,
+            pinned_textures: 3,
+            pinned_materials: 1,
             shadow_pipeline,
             line_pipeline,
             shadow_view,
@@ -509,13 +639,19 @@ impl Renderer {
             self.depth = DepthTarget::new(device, gpu.size());
         }
 
-        let light_dir = Vec3::new(-0.4, -1.0, -0.3).normalize();
+        let light_dir = -self.sky.sun_direction;
+        let rgba = |v: Vec3| v.extend(1.0).to_array();
         let globals = GlobalsRaw {
             view_proj: camera.view_proj.to_cols_array_2d(),
             light_view_proj: light_view_proj(light_dir).to_cols_array_2d(),
+            inv_view_proj: camera.view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).to_array(),
-            light_dir: light_dir.extend(0.0).to_array(),
-            light_color: LIGHT_COLOR,
+            light_dir: light_dir.extend(EXPOSURE).to_array(),
+            light_color: rgba(self.sky.sun_color),
+            sky_zenith: rgba(self.sky.zenith),
+            sky_horizon: rgba(self.sky.horizon),
+            sky_ground: rgba(self.sky.ground),
+            sh: self.sky_sh,
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
@@ -594,6 +730,10 @@ impl Renderer {
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
             self.draw_meshes(&mut pass, &groups, true);
 
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
             if !line_vertices.is_empty() {
                 let bytes = std::mem::size_of_val(line_vertices.as_slice()) as u64;
                 pass.set_pipeline(&self.line_pipeline);
@@ -639,31 +779,56 @@ impl Renderer {
         }
     }
 
-    /// Uploads an RGBA8 sRGB texture with its mip chain (`mips[0]` is
-    /// `width`×`height`, each next level half the size, down to 1×1).
-    pub fn add_texture(&mut self, gpu: &Gpu, width: u32, height: u32, mips: &[&[u8]]) -> TextureId {
-        let group = texture_bind_group(
-            gpu,
-            &self.material_bgl,
-            &self.material_sampler,
-            width,
-            height,
-            mips,
-        );
-        self.textures.push(group);
+    /// Uploads an RGBA8 texture with its mip chain (`mips[0]` is
+    /// `width`×`height`, each next level half the size, down to 1×1). `srgb`:
+    /// colour (sampled as sRGB) rather than linear data.
+    pub fn add_texture(
+        &mut self,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        mips: &[&[u8]],
+        srgb: bool,
+    ) -> TextureId {
+        self.textures
+            .push(upload_texture(gpu, width, height, mips, srgb));
         TextureId((self.textures.len() - 1) as u32)
     }
 
-    /// Uploads an untextured mesh for later instancing (e.g. a convex hull's shape).
-    pub fn add_mesh(&mut self, gpu: &Gpu, data: &MeshData) -> MeshId {
-        self.add_textured_mesh(gpu, data, TextureId::WHITE)
+    /// Creates a material from textures added with [`Renderer::add_texture`]
+    /// (unknown ids fall back to the defaults).
+    pub fn add_material(&mut self, gpu: &Gpu, desc: &MaterialDesc) -> MaterialId {
+        let group = material_bind_group(
+            gpu,
+            &self.material_bgl,
+            &self.material_sampler,
+            &self.textures,
+            desc,
+        );
+        self.materials.push(group);
+        MaterialId((self.materials.len() - 1) as u32)
     }
 
-    /// Uploads a mesh drawn with `texture` (from [`Renderer::add_texture`]).
-    pub fn add_textured_mesh(&mut self, gpu: &Gpu, data: &MeshData, texture: TextureId) -> MeshId {
+    /// The sky lighting the scene.
+    pub fn sky(&self) -> Sky {
+        self.sky
+    }
+
+    /// Uploads a mesh with the default material (e.g. a convex hull's shape).
+    pub fn add_mesh(&mut self, gpu: &Gpu, data: &MeshData) -> MeshId {
+        self.add_mesh_with_material(gpu, data, MaterialId::DEFAULT)
+    }
+
+    /// Uploads a mesh drawn with `material` (from [`Renderer::add_material`]).
+    pub fn add_mesh_with_material(
+        &mut self,
+        gpu: &Gpu,
+        data: &MeshData,
+        material: MaterialId,
+    ) -> MeshId {
         let mut mesh = GpuMesh::new(gpu.device(), data);
-        mesh.texture = if (texture.0 as usize) < self.textures.len() {
-            texture.0 as usize
+        mesh.material = if (material.0 as usize) < self.materials.len() {
+            material.0 as usize
         } else {
             0
         };
@@ -683,6 +848,7 @@ impl Renderer {
         self.meshes.truncate(self.pinned_meshes);
         self.instances.truncate(self.pinned_meshes);
         self.textures.truncate(self.pinned_textures);
+        self.materials.truncate(self.pinned_materials);
     }
 
     /// Keeps everything uploaded so far (e.g. model meshes) through later
@@ -690,12 +856,14 @@ impl Renderer {
     pub fn pin_custom_meshes(&mut self) {
         self.pinned_meshes = self.meshes.len();
         self.pinned_textures = self.textures.len();
+        self.pinned_materials = self.materials.len();
     }
 
     /// Frees every runtime-added mesh and texture, pinned or not.
     pub fn reset_custom_meshes(&mut self) {
         self.pinned_meshes = MeshKind::ALL.len();
-        self.pinned_textures = 1;
+        self.pinned_textures = 3;
+        self.pinned_materials = 1;
         self.clear_custom_meshes();
     }
 
@@ -717,7 +885,7 @@ impl Renderer {
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, self.instances[index].buffer.slice(..bytes));
             if with_material {
-                pass.set_bind_group(1, &self.textures[mesh.texture], &[]);
+                pass.set_bind_group(1, &self.materials[mesh.material], &[]);
             }
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..count);
@@ -729,22 +897,15 @@ impl Renderer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureId(pub u32);
 
-impl TextureId {
-    /// The built-in 1×1 white texture.
-    pub const WHITE: TextureId = TextureId(0);
-}
-
-/// Uploads an sRGB RGBA8 mip chain and binds it with the shared sampler.
-fn texture_bind_group(
+/// Uploads an RGBA8 mip chain (sRGB colour or linear data).
+fn upload_texture(
     gpu: &Gpu,
-    layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
     width: u32,
     height: u32,
     mips: &[&[u8]],
-) -> wgpu::BindGroup {
-    let device = gpu.device();
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
+    srgb: bool,
+) -> wgpu::TextureView {
+    let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("material"),
         size: wgpu::Extent3d {
             width,
@@ -754,7 +915,11 @@ fn texture_bind_group(
         mip_level_count: mips.len().max(1) as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: if srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        },
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -780,17 +945,58 @@ fn texture_bind_group(
             },
         );
     }
-    let view = texture.create_view(&Default::default());
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    texture.create_view(&Default::default())
+}
+
+/// A material's factors buffer and textures (missing ones → defaults:
+/// textures[0] white sRGB, [1] white linear, [2] flat normal).
+fn material_bind_group(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    textures: &[wgpu::TextureView],
+    desc: &MaterialDesc,
+) -> wgpu::BindGroup {
+    let raw = MaterialRaw {
+        base_color: desc.base_color,
+        emissive: [desc.emissive[0], desc.emissive[1], desc.emissive[2], 0.0],
+        params: [
+            desc.metallic,
+            desc.roughness,
+            desc.normal_scale,
+            desc.occlusion_strength,
+        ],
+    };
+    let factors = gpu
+        .device()
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("material"),
+            contents: bytemuck::bytes_of(&raw),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let pick = |id: Option<TextureId>, fallback: usize| {
+        id.and_then(|t| textures.get(t.0 as usize))
+            .unwrap_or(&textures[fallback])
+    };
+    let view = |binding, texture| wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(texture),
+    };
+    gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("material"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
+                resource: factors.as_entire_binding(),
             },
+            view(1, pick(desc.base_color_texture, 0)),
+            view(2, pick(desc.metallic_roughness_texture, 1)),
+            view(3, pick(desc.normal_texture, 2)),
+            view(4, pick(desc.occlusion_texture, 1)),
+            view(5, pick(desc.emissive_texture, 0)),
             wgpu::BindGroupEntry {
-                binding: 1,
+                binding: 6,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
         ],

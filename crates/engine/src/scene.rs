@@ -24,6 +24,9 @@ pub struct SceneObject {
     pub prev: Pose,
     /// Model objects draw their mesh here instead of their collider.
     pub model: Option<ModelVisual>,
+    /// Surface for built-in shapes (models use their own material).
+    pub roughness: f32,
+    pub metallic: f32,
 }
 
 /// Spheres, boxes, and capsules in turn.
@@ -92,16 +95,19 @@ pub enum Demo {
     Joints,
     /// Bundled glTF models tumbling into the pit (M9's models showcase).
     Props,
+    /// A roughness × metallic sphere chart and props (M9b's PBR showcase).
+    Materials,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 6] = [
+    pub const ALL: [Demo; 7] = [
         Demo::Pit,
         Demo::Tower,
         Demo::Pyramid,
         Demo::Rain,
         Demo::Joints,
         Demo::Props,
+        Demo::Materials,
     ];
 
     pub fn label(self) -> &'static str {
@@ -112,6 +118,7 @@ impl Demo {
             Demo::Rain => "Rain",
             Demo::Joints => "Joints",
             Demo::Props => "Props",
+            Demo::Materials => "Materials",
         }
     }
 
@@ -185,6 +192,7 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
         Demo::Rain => (rain_objects(), Vec::new()),
         Demo::Joints => crate::joint_scene::joint_objects(),
         Demo::Props => (props_objects(), Vec::new()),
+        Demo::Materials => (materials_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
         version: SCENE_VERSION,
@@ -252,6 +260,48 @@ fn demo_object(
     };
     object.set_orientation(orientation);
     object
+}
+
+/// Sphere chart columns (roughness) and rows (metallic).
+pub const CHART_COLUMNS: usize = 6;
+pub const CHART_ROWS: usize = 3;
+
+/// The classic material chart: roughness rises left to right, metallic front to
+/// back, all one warm colour; static so it stays put. Props sit beside it.
+fn materials_objects() -> Vec<ObjectDesc> {
+    let mut objects = Vec::new();
+    for row in 0..CHART_ROWS {
+        for column in 0..CHART_COLUMNS {
+            let roughness = 0.05 + 0.95 * column as f32 / (CHART_COLUMNS - 1) as f32;
+            let metallic = row as f32 / (CHART_ROWS - 1) as f32;
+            objects.push(ObjectDesc {
+                name: format!("r{roughness:.2} m{metallic:.1}"),
+                shape: Some(ShapeDesc::Sphere { radius: 0.4 }),
+                position: [column as f32 * 1.1 - 2.75, 0.4, row as f32 * 1.1 - 3.0],
+                body: BodyType::Static,
+                color: [0.95, 0.64, 0.38],
+                roughness,
+                metallic,
+                ..ObjectDesc::default()
+            });
+        }
+    }
+    let registry = crate::models::ModelRegistry::bundled();
+    for (i, name) in ["barrel", "chest", "rock-a"].iter().enumerate() {
+        let id = registry.id(name).expect("bundled");
+        let scale = crate::models::fitting_scale(registry.get(id).expect("bundled"), 1.0);
+        objects.push(ObjectDesc {
+            shape: Some(ShapeDesc::Model {
+                name: name.to_string(),
+                scale,
+                collider: ModelCollider::Hull,
+            }),
+            position: [i as f32 * 1.8 - 1.8, 0.8, 1.8],
+            color: [1.0; 3],
+            ..ObjectDesc::default()
+        });
+    }
+    objects
 }
 
 /// Models dropped into the pit
@@ -371,6 +421,7 @@ pub fn hull_mesh(hull: &ConvexHull) -> MeshData {
             position: hull.vertices()[v].to_array(),
             normal: face.normal.to_array(),
             uv: [0.0; 2],
+            tangent: impulse_render::perpendicular_tangent(face.normal.to_array()),
         }));
         for k in 1..face.vertices.len() as u32 - 1 {
             mesh.indices.extend([base, base + k, base + k + 1]);
@@ -776,7 +827,14 @@ pub fn build_draw_list(
         match object.model {
             Some(visual) => {
                 for &mesh in model_meshes.get(&visual.model).into_iter().flatten() {
-                    list.push_instance(mesh, body_transform * visual.transform, color);
+                    // 1, 1: the model's own material decides.
+                    list.push_instance_pbr(
+                        mesh,
+                        body_transform * visual.transform,
+                        color,
+                        1.0,
+                        1.0,
+                    );
                 }
                 if show_colliders {
                     push_collider_wireframe(list, world, collider, body_transform);
@@ -784,7 +842,13 @@ pub fn build_draw_list(
             }
             None => {
                 for (mesh, local) in collider_visual(collider, hull_meshes) {
-                    list.push_instance(mesh, body_transform * local, color);
+                    list.push_instance_pbr(
+                        mesh,
+                        body_transform * local,
+                        color,
+                        object.roughness,
+                        object.metallic,
+                    );
                 }
             }
         }
@@ -946,6 +1010,31 @@ mod tests {
             );
             assert!(desc.objects.iter().all(|o| !o.name.is_empty()));
         }
+    }
+
+    #[test]
+    fn materials_chart_spans_roughness_and_metallic() {
+        let desc = demo_desc(Demo::Materials);
+        let spheres: Vec<_> = desc
+            .objects
+            .iter()
+            .filter(|o| matches!(o.shape, Some(ShapeDesc::Sphere { .. })))
+            .collect();
+        assert_eq!(spheres.len(), CHART_COLUMNS * CHART_ROWS);
+        let range = |f: fn(&ObjectDesc) -> f32| {
+            let values: Vec<f32> = spheres.iter().map(|o| f(o)).collect();
+            (
+                values.iter().copied().fold(f32::MAX, f32::min),
+                values.iter().copied().fold(f32::MIN, f32::max),
+            )
+        };
+        assert_eq!(range(|o| o.metallic), (0.0, 1.0));
+        let (lo, hi) = range(|o| o.roughness);
+        assert!(lo < 0.1 && hi == 1.0);
+        let mut world = World::default();
+        let objects = build(&mut world, Demo::Materials);
+        assert_eq!(objects.len(), desc.objects.len());
+        assert_eq!(Demo::from_name("materials"), Some(Demo::Materials));
     }
 
     #[test]

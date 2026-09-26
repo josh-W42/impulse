@@ -6,11 +6,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use glam::{Mat4, Vec3};
-use impulse_assets::{
-    ColorSpace, MaterialData, ModelData, ModelError, extreme_points, load_glb, mip_chain,
-};
+use impulse_assets::{ColorSpace, ModelData, ModelError, TextureData, extreme_points, load_glb};
 use impulse_physics::{Collider, World};
-use impulse_render::{Gpu, MeshData, MeshId, Renderer, TextureId, Vertex};
+use impulse_render::{
+    Gpu, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureId, Vertex,
+};
 
 use crate::scene_desc::{ModelCollider, ObjectError};
 
@@ -184,20 +184,51 @@ pub fn fitting_scale(asset: &ModelAsset, target: f32) -> f32 {
 /// Render meshes per model (one per glTF primitive).
 pub type ModelMeshes = HashMap<ModelId, Vec<MeshId>>;
 
-/// Uploads every model in `registry`. Identical textures (e.g. a kit's shared
-/// palette) are uploaded once. The material's base colour factor is baked into
-/// its texture, or into a 1×1 texture for untextured materials.
+/// Uploads every model in `registry` with its full material. Identical
+/// textures (same pixels, same colour space; e.g. a kit's shared palette) are
+/// uploaded once.
 pub fn upload_models(renderer: &mut Renderer, gpu: &Gpu, registry: &ModelRegistry) -> ModelMeshes {
     let mut textures: HashMap<u64, TextureId> = HashMap::new();
     let mut out = ModelMeshes::new();
     for (id, _, _) in registry.list() {
         let data = &registry.get(id).expect("listed").data;
+        let mut texture = |index: Option<usize>| {
+            let texture = data.textures.get(index?)?;
+            Some(upload_texture(renderer, gpu, texture, &mut textures))
+        };
+        let materials: Vec<MaterialDesc> = data
+            .materials
+            .iter()
+            .map(|m| MaterialDesc {
+                base_color: m.base_color,
+                metallic: m.metallic,
+                roughness: m.roughness,
+                normal_scale: m.normal_scale,
+                occlusion_strength: m.occlusion_strength,
+                emissive: m.emissive,
+                base_color_texture: texture(m.base_color_texture),
+                metallic_roughness_texture: texture(m.metallic_roughness_texture),
+                normal_texture: texture(m.normal_texture),
+                occlusion_texture: texture(m.occlusion_texture),
+                emissive_texture: texture(m.emissive_texture),
+            })
+            .collect();
+        let material_ids: Vec<MaterialId> = materials
+            .iter()
+            .map(|m| renderer.add_material(gpu, m))
+            .collect();
+        // Primitives without a material get glTF's default material.
+        let mut default = None;
         let meshes = data
             .meshes
             .iter()
             .map(|mesh| {
-                let material = mesh.material.and_then(|m| data.materials.get(m));
-                let texture = material_texture(renderer, gpu, data, material, &mut textures);
+                let material = match mesh.material.and_then(|m| material_ids.get(m)) {
+                    Some(&id) => id,
+                    None => *default.get_or_insert_with(|| {
+                        renderer.add_material(gpu, &MaterialDesc::default())
+                    }),
+                };
                 let mesh_data = MeshData {
                     vertices: mesh
                         .vertices
@@ -206,11 +237,12 @@ pub fn upload_models(renderer: &mut Renderer, gpu: &Gpu, registry: &ModelRegistr
                             position: v.position,
                             normal: v.normal,
                             uv: v.uv,
+                            tangent: v.tangent,
                         })
                         .collect(),
                     indices: mesh.indices.clone(),
                 };
-                renderer.add_textured_mesh(gpu, &mesh_data, texture)
+                renderer.add_mesh_with_material(gpu, &mesh_data, material)
             })
             .collect();
         out.insert(id, meshes);
@@ -218,75 +250,20 @@ pub fn upload_models(renderer: &mut Renderer, gpu: &Gpu, registry: &ModelRegistr
     out
 }
 
-fn material_texture(
+fn upload_texture(
     renderer: &mut Renderer,
     gpu: &Gpu,
-    data: &ModelData,
-    material: Option<&MaterialData>,
+    texture: &TextureData,
     uploaded: &mut HashMap<u64, TextureId>,
 ) -> TextureId {
-    let factor = material.map_or([1.0; 4], |m| m.base_color);
-    let texture = material
-        .and_then(|m| m.base_color_texture)
-        .and_then(|t| data.textures.get(t));
+    let base = &texture.mips[0];
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    factor.map(f32::to_bits).hash(&mut hasher);
-    if let Some(texture) = texture {
-        let base = &texture.mips[0];
-        (base.width, base.height, &base.rgba).hash(&mut hasher);
-    }
-    let key = hasher.finish();
-    if let Some(&id) = uploaded.get(&key) {
-        return id;
-    }
-    let id = match texture {
-        Some(texture) if factor == [1.0; 4] => {
-            let levels: Vec<&[u8]> = texture.mips.iter().map(|m| m.rgba.as_slice()).collect();
-            renderer.add_texture(gpu, texture.mips[0].width, texture.mips[0].height, &levels)
-        }
-        Some(texture) => {
-            let base = &texture.mips[0];
-            let tinted = tint(&base.rgba, factor);
-            let mips = mip_chain(tinted, base.width, base.height, ColorSpace::Srgb);
-            let levels: Vec<&[u8]> = mips.iter().map(|m| m.rgba.as_slice()).collect();
-            renderer.add_texture(gpu, base.width, base.height, &levels)
-        }
-        None => renderer.add_texture(gpu, 1, 1, &[&tint(&[255; 4], factor)]),
-    };
-    uploaded.insert(key, id);
-    id
-}
-
-/// Multiplies sRGB RGBA8 texels by a linear RGBA factor.
-fn tint(rgba: &[u8], factor: [f32; 4]) -> Vec<u8> {
-    let linear = |c: u8| {
-        let c = c as f32 / 255.0;
-        if c <= 0.040_45 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let srgb = |c: f32| {
-        let c = if c <= 0.003_130_8 {
-            c * 12.92
-        } else {
-            1.055 * c.powf(1.0 / 2.4) - 0.055
-        };
-        (c.clamp(0.0, 1.0) * 255.0).round() as u8
-    };
-    rgba.as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|p| {
-            [
-                srgb(linear(p[0]) * factor[0]),
-                srgb(linear(p[1]) * factor[1]),
-                srgb(linear(p[2]) * factor[2]),
-                (p[3] as f32 * factor[3]).round().clamp(0.0, 255.0) as u8,
-            ]
-        })
-        .collect()
+    (base.width, base.height, &base.rgba, texture.space).hash(&mut hasher);
+    *uploaded.entry(hasher.finish()).or_insert_with(|| {
+        let levels: Vec<&[u8]> = texture.mips.iter().map(|m| m.rgba.as_slice()).collect();
+        let srgb = texture.space == ColorSpace::Srgb;
+        renderer.add_texture(gpu, base.width, base.height, &levels, srgb)
+    })
 }
 
 /// Where a model's mesh sits on its body: `transform` maps model space to
@@ -380,15 +357,6 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e:?}"));
             }
         }
-    }
-
-    #[test]
-    fn tint_multiplies_in_linear_light() {
-        assert_eq!(
-            tint(&[255, 255, 255, 255], [1.0, 0.5, 0.0, 1.0]),
-            [255, 188, 0, 255]
-        );
-        assert_eq!(tint(&[188, 10, 0, 200], [1.0; 4]), [188, 10, 0, 200]);
     }
 
     #[test]

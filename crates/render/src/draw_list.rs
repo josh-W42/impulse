@@ -11,9 +11,17 @@ use crate::mesh::MeshKind;
 pub struct Instance {
     pub mesh: MeshId,
     pub transform: Mat4,
-    /// Linear RGBA.
+    /// Linear RGBA (multiplies the material's base colour).
     pub color: [f32; 4],
+    /// Multiply the material's roughness and metallic factors.
+    pub roughness: f32,
+    pub metallic: f32,
 }
+
+/// Roughness and metallic for built-in meshes drawn without their own values:
+/// a slightly rough non-metal.
+pub const DEFAULT_ROUGHNESS: f32 = 0.6;
+pub const DEFAULT_METALLIC: f32 = 0.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DebugLine {
@@ -34,11 +42,27 @@ impl DrawList {
         self.lines.clear();
     }
 
+    /// An instance with the default surface ([`DEFAULT_ROUGHNESS`], [`DEFAULT_METALLIC`]).
     pub fn push_instance(&mut self, mesh: impl Into<MeshId>, transform: Mat4, color: [f32; 4]) {
+        self.push_instance_pbr(mesh, transform, color, DEFAULT_ROUGHNESS, DEFAULT_METALLIC);
+    }
+
+    /// An instance whose roughness and metallic multiply its material's
+    /// (1, 1 keeps a model's own material).
+    pub fn push_instance_pbr(
+        &mut self,
+        mesh: impl Into<MeshId>,
+        transform: Mat4,
+        color: [f32; 4],
+        roughness: f32,
+        metallic: f32,
+    ) {
         self.instances.push(Instance {
             mesh: mesh.into(),
             transform,
             color,
+            roughness,
+            metallic,
         });
     }
 
@@ -47,7 +71,7 @@ impl DrawList {
     }
 }
 
-/// Per-instance vertex data as the shader reads it (128 bytes).
+/// Per-instance vertex data as the shader reads it (144 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct InstanceRaw {
@@ -56,6 +80,8 @@ pub struct InstanceRaw {
     /// to surfaces under non-uniform scale. Columns padded to vec4.
     pub normal: [[f32; 4]; 3],
     pub color: [f32; 4],
+    /// x: roughness, y: metallic.
+    pub pbr: [f32; 4],
 }
 
 impl InstanceRaw {
@@ -66,6 +92,7 @@ impl InstanceRaw {
             model: instance.transform.to_cols_array_2d(),
             normal: [pad(n.x_axis), pad(n.y_axis), pad(n.z_axis)],
             color: instance.color,
+            pbr: [instance.roughness, instance.metallic, 0.0, 0.0],
         }
     }
 }
@@ -92,6 +119,8 @@ mod tests {
         Instance {
             mesh: mesh.into(),
             transform: Mat4::from_translation(Vec3::X * x),
+            roughness: DEFAULT_ROUGHNESS,
+            metallic: DEFAULT_METALLIC,
             color: [1.0; 4],
         }
     }
@@ -121,6 +150,8 @@ mod tests {
         );
         let raw = InstanceRaw::new(&Instance {
             mesh: MeshKind::Cube.into(),
+            roughness: DEFAULT_ROUGHNESS,
+            metallic: DEFAULT_METALLIC,
             transform,
             color: [1.0; 4],
         });

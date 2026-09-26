@@ -59,6 +59,8 @@ mod tests {
                 ("vs_main", Vertex),
                 ("vs_shadow", Vertex),
                 ("fs_main", Fragment),
+                ("vs_sky", Vertex),
+                ("fs_sky", Fragment),
             ],
         );
     }

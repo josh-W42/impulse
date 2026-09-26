@@ -11,6 +11,18 @@ pub struct Vertex {
     pub normal: [f32; 3],
     /// Texture coordinates (zero on built-in meshes, which are untextured).
     pub uv: [f32; 2],
+    /// Tangent (xyz, along +U) and bitangent sign (w), for normal maps. Must
+    /// be a unit vector perpendicular to `normal`.
+    pub tangent: [f32; 4],
+}
+
+/// A unit tangent perpendicular to `normal` (for meshes without UV-derived
+/// tangents; any perpendicular works with the flat default normal map).
+pub fn perpendicular_tangent(normal: [f32; 3]) -> [f32; 4] {
+    let n = Vec3::from_array(normal).normalize_or(Vec3::Y);
+    let other = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let t = (other - n * n.dot(other)).normalize();
+    [t.x, t.y, t.z, 1.0]
 }
 
 /// Identifies a mesh the renderer can draw: a built-in [`MeshKind`] or one
@@ -66,6 +78,7 @@ fn vertex(position: Vec3, normal: Vec3) -> Vertex {
         position: position.to_array(),
         normal: normal.to_array(),
         uv: [0.0; 2],
+        tangent: perpendicular_tangent(normal.to_array()),
     }
 }
 

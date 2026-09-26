@@ -421,6 +421,16 @@ pub fn inspector(
                     o.color = color;
                 }
             });
+            if !matches!(o.shape, Some(ShapeDesc::Model { .. }) | None) {
+                ui.horizontal(|ui| {
+                    ui.label("roughness");
+                    ui.add(egui::Slider::new(&mut o.roughness, 0.0..=1.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("metallic");
+                    ui.add(egui::Slider::new(&mut o.metallic, 0.0..=1.0));
+                });
+            }
             vec3_row(ui, "velocity", &mut o.velocity, 0.05, -1000.0);
             vec3_row(ui, "spin", &mut o.angular_velocity, 0.05, -1000.0);
             if !joints.is_empty() {
