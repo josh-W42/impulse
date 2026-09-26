@@ -15,7 +15,8 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
 - Shapes: sphere, box, capsule, convex hull, plane; box–box SAT with clipped
   manifolds, GJK + EPA for general convex pairs, manifolds reduced to 4 points
 - Joints: ball-socket (3×3 block) with cone limits, hinge with angle limits,
-  distance; joined bodies skip collision and share a sleep island
+  distance; soft (spring-regularized) rows so closed loops stay stable; joined
+  bodies skip collision and share a sleep island
 - Scale: dynamic AABB-tree broadphase, island sleeping, raycasts, per-phase profiler
 - Engine: fixed timestep with interpolation, instanced renderer, egui panel,
   mouse grab/throw
