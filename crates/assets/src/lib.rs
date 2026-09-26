@@ -14,8 +14,12 @@ use gltf::buffer::Source as BufferSource;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::Mode;
 
+mod colliders;
 mod mips;
 
+pub use colliders::{
+    bounding_box, bounding_capsule, bounding_sphere, extreme_points, fibonacci_directions,
+};
 pub use mips::{MipLevel, mip_chain};
 
 /// Size and complexity caps for loading untrusted files.
