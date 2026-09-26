@@ -245,13 +245,15 @@ impl World {
         self.joints.clear();
         self.tree = AabbTree::default();
         self.hulls.clear();
-        for (index, slot) in self.slots.iter_mut().enumerate() {
+        for slot in &mut self.slots {
             slot.proxy = None;
             if slot.body.take().is_some() {
                 slot.generation = slot.generation.wrapping_add(1);
-                self.free.push(index as u32);
             }
         }
+        // Reused lowest-first, so a rebuilt scene gets the same slot order (and
+        // so the same solve order) as a fresh world: replays stay bit-identical.
+        self.free = (0..self.slots.len() as u32).rev().collect();
     }
 
     /// Advances the simulation by `dt` seconds.
@@ -679,6 +681,40 @@ mod tests {
         assert!(handles.iter().all(|&h| world.body(h).is_none()));
         world.add_body(BodyDesc::dynamic(1.0, Vec3::ZERO)).unwrap();
         assert!(handles.iter().all(|&h| world.body(h).is_none()));
+    }
+
+    #[test]
+    fn cleared_worlds_simulate_like_fresh_ones() {
+        let fill = |world: &mut World| {
+            for i in 0..10 {
+                let desc = BodyDesc {
+                    velocity: Vec3::new(i as f32 * 0.3, 2.0, -1.0),
+                    ..BodyDesc::dynamic(1.0 + i as f32, Vec3::new(i as f32, 5.0, 0.0))
+                };
+                world.add_body(desc).unwrap();
+            }
+        };
+        let run = |world: &mut World| {
+            for _ in 0..120 {
+                world.step(1.0 / 60.0);
+            }
+            world
+                .bodies()
+                .map(|(_, b)| b.position().to_array().map(f32::to_bits))
+                .collect::<Vec<_>>()
+        };
+        let mut fresh = World::default();
+        fill(&mut fresh);
+        let expected = run(&mut fresh);
+        let mut reused = World::default();
+        fill(&mut reused);
+        let fourth = reused.bodies().nth(3).unwrap().0;
+        reused.remove_body(fourth);
+        for _ in 0..2 {
+            reused.clear();
+            fill(&mut reused);
+            assert_eq!(run(&mut reused), expected);
+        }
     }
 
     #[test]
