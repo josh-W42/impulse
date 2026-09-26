@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use glam::{Vec2, Vec3};
-use impulse_physics::{SolverSettings, World};
+use impulse_physics::{SolverSettings, StepStats, World};
 use impulse_render::{CameraData, DrawList, FrameOutcome, Gpu, Renderer, UiFrame, backend_name};
 use web_time::Instant;
 use winit::event::{DeviceEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -58,6 +58,8 @@ pub struct Running {
     start: Instant,
     last_frame: Instant,
     frame_ms: f32,
+    /// Physics work this frame (timings summed over its fixed steps).
+    physics: StepStats,
 }
 
 impl Running {
@@ -98,6 +100,7 @@ impl Running {
             start: now,
             last_frame: now,
             frame_ms: 0.0,
+            physics: StepStats::default(),
         }
     }
 
@@ -265,21 +268,37 @@ impl Running {
             self.timestep.reset();
             self.alpha = 0.0;
         }
-        if settings.paused {
+        let steps = if settings.paused {
             if settings.step_requested {
-                scene::snapshot(&self.world, &mut self.objects);
-                self.world.step(self.timestep.step());
                 self.alpha = 1.0;
+                1
+            } else {
+                0
             }
         } else {
             let plan = self.timestep.advance(dt * settings.time_scale);
-            for _ in 0..plan.steps {
-                scene::snapshot(&self.world, &mut self.objects);
-                self.world.step(self.timestep.step());
-            }
             self.alpha = plan.alpha;
-        }
+            plan.steps
+        };
         settings.step_requested = false;
+
+        let start = self.start;
+        let mut clock = || start.elapsed().as_secs_f64() * 1000.0;
+        let mut frame = StepStats::default();
+        for _ in 0..steps {
+            scene::snapshot(&self.world, &mut self.objects);
+            let s = self.world.step_profiled(self.timestep.step(), &mut clock);
+            frame = StepStats {
+                broadphase_ms: frame.broadphase_ms + s.broadphase_ms,
+                narrowphase_ms: frame.narrowphase_ms + s.narrowphase_ms,
+                solve_ms: frame.solve_ms + s.solve_ms,
+                integrate_ms: frame.integrate_ms + s.integrate_ms,
+                ..s
+            };
+        }
+        if steps > 0 {
+            self.physics = frame;
+        }
     }
 
     /// Runs one frame. Skipped frames leave input queued for the next one.
@@ -327,6 +346,7 @@ impl Running {
                 frame_ms: self.frame_ms,
                 bodies: self.world.len(),
                 mode: self.camera.mode,
+                physics: self.physics,
             },
         );
         let output = self.egui_ctx.run_ui(raw, |ui| panel(ui, settings, &stats));
@@ -363,6 +383,7 @@ struct Stats {
     frame_ms: f32,
     bodies: usize,
     mode: CameraMode,
+    physics: StepStats,
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
@@ -371,7 +392,23 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
         .resizable(false)
         .show(ui.ctx(), |ui| {
             ui.label(format!("{} · {:.1} ms", stats.backend, stats.frame_ms));
-            ui.label(format!("{} bodies", stats.bodies));
+            let p = &stats.physics;
+            ui.label(format!(
+                "{} bodies · {} awake · {} asleep",
+                stats.bodies, p.awake, p.asleep
+            ));
+            ui.label(format!(
+                "physics {:.2} ms: broad {:.2} · narrow {:.2} · solve {:.2} · integrate {:.2}",
+                p.total_ms(),
+                p.broadphase_ms,
+                p.narrowphase_ms,
+                p.solve_ms,
+                p.integrate_ms
+            ));
+            ui.label(format!(
+                "{} pairs · {} contacts ({} solved)",
+                p.pairs, p.contacts, p.active_contacts
+            ));
             ui.horizontal(|ui| {
                 if ui
                     .button(if s.paused { "Resume" } else { "Pause" })

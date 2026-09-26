@@ -125,8 +125,16 @@ pub(crate) fn sphere_box(
 /// Every overlapping pair in the world. The broadphase proposes candidate pairs;
 /// the exact tests below confirm them.
 pub fn find_contacts(world: &World) -> Vec<Contact> {
+    contacts_for_pairs(world, &world.candidate_pairs())
+}
+
+/// Narrowphase over broadphase candidate pairs.
+pub(crate) fn contacts_for_pairs(
+    world: &World,
+    pairs: &[(BodyHandle, BodyHandle)],
+) -> Vec<Contact> {
     let mut contacts = Vec::new();
-    for (ha, hb) in world.candidate_pairs() {
+    for &(ha, hb) in pairs {
         let (Some(a), Some(b)) = (world.body(ha), world.body(hb)) else {
             continue;
         };

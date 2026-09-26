@@ -3,7 +3,7 @@ use glam::Vec3;
 use crate::body::{BodyDesc, BodyError, RigidBody};
 use crate::broadphase::{Aabb, AabbTree};
 use crate::contact::Contact;
-use crate::contact::find_contacts;
+use crate::contact::contacts_for_pairs;
 use crate::solver::{self, ContactCache, SolverSettings};
 use crate::union_find::UnionFind;
 
@@ -13,6 +13,30 @@ pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 const SLEEP_LINEAR_SPEED: f32 = 0.05;
 const SLEEP_ANGULAR_SPEED: f32 = 0.1;
 const SLEEP_TIME: f32 = 0.5;
+
+/// What one step did and how long each phase took (ms; zero without a clock).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepStats {
+    pub broadphase_ms: f64,
+    pub narrowphase_ms: f64,
+    /// Waking, the contact solve, and warm-start bookkeeping.
+    pub solve_ms: f64,
+    /// Integration, sleep updates, and broadphase refits.
+    pub integrate_ms: f64,
+    pub pairs: usize,
+    pub contacts: usize,
+    /// Contacts involving an awake body (the ones solved).
+    pub active_contacts: usize,
+    /// Awake dynamic bodies.
+    pub awake: usize,
+    pub asleep: usize,
+}
+
+impl StepStats {
+    pub fn total_ms(&self) -> f64 {
+        self.broadphase_ms + self.narrowphase_ms + self.solve_ms + self.integrate_ms
+    }
+}
 
 /// Refers to a body in a [`World`]. Stays safe after removal: a stale handle
 /// never reaches a different body that later reuses the same slot.
@@ -164,8 +188,20 @@ impl World {
     /// with position error fed back as a velocity bias) → move. Semi-implicit Euler
     /// with the contact solve between the velocity and position updates.
     pub fn step(&mut self, dt: f32) {
+        self.step_profiled(dt, &mut || 0.0);
+    }
+
+    /// [`World::step`] plus per-phase timings. `clock` returns milliseconds; it is
+    /// supplied by the caller because std timers panic on wasm and this crate
+    /// depends only on glam.
+    pub fn step_profiled(&mut self, dt: f32, clock: &mut dyn FnMut() -> f64) -> StepStats {
         debug_assert!(dt.is_finite() && dt >= 0.0, "invalid timestep {dt}");
-        let contacts = find_contacts(self);
+        let t0 = clock();
+        let pairs = self.candidate_pairs();
+        let t1 = clock();
+        let contacts = contacts_for_pairs(self, &pairs);
+        let t2 = clock();
+        let contact_count = contacts.len();
         self.wake_touched_islands(&contacts);
         let gravity = self.gravity;
         for body in self.bodies_mut() {
@@ -179,6 +215,7 @@ impl World {
         let mut cache = std::mem::take(&mut self.cache);
         solver::solve(self, &active, &mut cache, dt);
         self.cache = cache;
+        let t3 = clock();
         for body in self.bodies_mut() {
             body.advance(dt);
         }
@@ -186,6 +223,27 @@ impl World {
             self.fall_asleep(&active, dt);
         }
         self.sync_broadphase();
+        let t4 = clock();
+
+        let (mut awake, mut asleep) = (0, 0);
+        for (_, body) in self.bodies() {
+            if body.is_asleep() {
+                asleep += 1;
+            } else if body.inverse_mass() != 0.0 {
+                awake += 1;
+            }
+        }
+        StepStats {
+            broadphase_ms: t1 - t0,
+            narrowphase_ms: t2 - t1,
+            solve_ms: t3 - t2,
+            integrate_ms: t4 - t3,
+            pairs: pairs.len(),
+            contacts: contact_count,
+            active_contacts: active.len(),
+            awake,
+            asleep,
+        }
     }
 
     fn is_active(&self, handle: BodyHandle) -> bool {

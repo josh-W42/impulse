@@ -18,4 +18,4 @@ pub use broadphase::Aabb;
 pub use collider::{Collider, Material};
 pub use contact::{Contact, find_contacts};
 pub use solver::SolverSettings;
-pub use world::{BodyHandle, DEFAULT_GRAVITY, World};
+pub use world::{BodyHandle, DEFAULT_GRAVITY, StepStats, World};
