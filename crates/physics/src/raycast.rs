@@ -4,6 +4,7 @@ use glam::{Quat, Vec3};
 
 use crate::broadphase::Aabb;
 use crate::collider::Collider;
+use crate::hull::ConvexHull;
 use crate::world::BodyHandle;
 
 /// The nearest surface a ray reached.
@@ -34,12 +35,22 @@ pub(crate) fn ray_shape(
     collider: Collider,
     position: Vec3,
     orientation: Quat,
+    hulls: &[ConvexHull],
 ) -> Option<(f32, Vec3)> {
     match collider {
         Collider::Sphere { radius } => ray_sphere(origin, dir, position, radius),
         Collider::Box { half_extents } => {
             let inv = orientation.inverse();
             let (t, normal) = ray_local_box(inv * (origin - position), inv * dir, half_extents)?;
+            Some((t, orientation * normal))
+        }
+        Collider::Hull { hull } => {
+            let inv = orientation.inverse();
+            let (t, normal) = ray_local_hull(
+                inv * (origin - position),
+                inv * dir,
+                hulls.get(hull.0 as usize)?,
+            )?;
             Some((t, orientation * normal))
         }
         Collider::Plane { normal } => {
@@ -108,6 +119,35 @@ fn ray_local_box(origin: Vec3, dir: Vec3, half: Vec3) -> Option<(f32, Vec3)> {
             normal[axis] = sign;
         }
         t_exit = t_exit.min(t1);
+        if t_enter > t_exit {
+            return None;
+        }
+    }
+    // Zero normal: the ray started inside.
+    (normal != Vec3::ZERO).then_some((t_enter, normal))
+}
+
+/// Cyrus–Beck: clip the ray against every face plane of a convex hull.
+fn ray_local_hull(origin: Vec3, dir: Vec3, hull: &ConvexHull) -> Option<(f32, Vec3)> {
+    let (mut t_enter, mut t_exit, mut normal) = (0.0f32, f32::INFINITY, Vec3::ZERO);
+    for face in hull.faces() {
+        let distance = face.normal.dot(origin) - face.offset;
+        let facing = face.normal.dot(dir);
+        if facing.abs() < 1e-9 {
+            if distance > 0.0 {
+                return None; // parallel and outside this face
+            }
+            continue;
+        }
+        let t = -distance / facing;
+        if facing < 0.0 {
+            if t > t_enter {
+                t_enter = t;
+                normal = face.normal;
+            }
+        } else {
+            t_exit = t_exit.min(t);
+        }
         if t_enter > t_exit {
             return None;
         }

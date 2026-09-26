@@ -39,7 +39,7 @@ impl Capsule {
         self.center + self.axis * t
     }
 
-    fn convex(&self) -> Convex {
+    pub(crate) fn convex(&self) -> Convex<'static> {
         let [a, b] = self.ends();
         Convex::Capsule {
             a,
@@ -51,7 +51,7 @@ impl Capsule {
 
 /// Keeps at most two contacts: the deepest and the one farthest from it with the
 /// same normal (a capsule's patch is a line), dropping near-duplicates.
-fn keep_two(mut hits: Vec<Geometry>) -> Vec<Geometry> {
+pub(crate) fn keep_two(mut hits: Vec<Geometry>) -> Vec<Geometry> {
     let Some(first) = (0..hits.len()).max_by(|&i, &j| hits[i].1.total_cmp(&hits[j].1)) else {
         return hits;
     };

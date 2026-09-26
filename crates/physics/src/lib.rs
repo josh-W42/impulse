@@ -12,6 +12,7 @@ mod collider;
 mod contact;
 mod gjk;
 mod hull;
+mod polytope;
 mod raycast;
 mod solver;
 mod union_find;
@@ -19,7 +20,7 @@ mod world;
 
 pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};
 pub use broadphase::Aabb;
-pub use collider::{Collider, Material};
+pub use collider::{Collider, HullId, Material};
 pub use contact::{Contact, find_contacts};
 pub use hull::{ConvexHull, HullError, HullFace, MAX_HULL_POINTS};
 pub use raycast::RayHit;

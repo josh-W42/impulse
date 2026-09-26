@@ -5,6 +5,7 @@
 use glam::{Mat3, Quat, Vec3};
 
 use crate::collider::Collider;
+use crate::hull::ConvexHull;
 use crate::world::BodyHandle;
 
 /// Axis-aligned bounding box.
@@ -16,7 +17,13 @@ pub struct Aabb {
 
 impl Aabb {
     /// World bounds of a collider; `None` for unbounded shapes (planes).
-    pub fn of(collider: Collider, position: Vec3, orientation: Quat) -> Option<Aabb> {
+    /// `hulls` resolves `Collider::Hull` ids (conservative: the rotated local box).
+    pub fn of(
+        collider: Collider,
+        position: Vec3,
+        orientation: Quat,
+        hulls: &[ConvexHull],
+    ) -> Option<Aabb> {
         let extent = match collider {
             Collider::Sphere { radius } => Vec3::splat(radius),
             // Projection of the box onto each world axis: |R|·h.
@@ -25,6 +32,19 @@ impl Aabb {
                 half_height,
                 radius,
             } => (orientation * Vec3::Y * half_height).abs() + Vec3::splat(radius),
+            Collider::Hull { hull } => {
+                let vertices = hulls.get(hull.0 as usize)?.vertices();
+                let (lo, hi) = vertices.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
+                    (lo.min(*v), hi.max(*v))
+                });
+                let rotation = Mat3::from_quat(orientation);
+                let center = position + rotation * ((lo + hi) * 0.5);
+                let extent = rotation.abs() * ((hi - lo) * 0.5);
+                return Some(Aabb {
+                    min: center - extent,
+                    max: center + extent,
+                });
+            }
             Collider::Plane { .. } => return None,
         };
         Some(Aabb {
@@ -388,7 +408,13 @@ mod tests {
 
     #[test]
     fn aabbs_bound_their_shapes() {
-        let sphere = Aabb::of(Collider::Sphere { radius: 0.5 }, Vec3::ONE, Quat::IDENTITY).unwrap();
+        let sphere = Aabb::of(
+            Collider::Sphere { radius: 0.5 },
+            Vec3::ONE,
+            Quat::IDENTITY,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             sphere,
             Aabb {
@@ -404,6 +430,7 @@ mod tests {
             },
             Vec3::ZERO,
             turned,
+            &[],
         )
         .unwrap();
         assert!((cube.max.x - 0.5 * 2f32.sqrt()).abs() < 1e-5);
@@ -412,7 +439,8 @@ mod tests {
             Aabb::of(
                 Collider::Plane { normal: Vec3::Y },
                 Vec3::ZERO,
-                Quat::IDENTITY
+                Quat::IDENTITY,
+                &[],
             )
             .is_none()
         );

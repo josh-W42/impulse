@@ -2,8 +2,10 @@ use glam::Vec3;
 
 use crate::body::{BodyDesc, BodyError, RigidBody};
 use crate::broadphase::{Aabb, AabbTree};
+use crate::collider::HullId;
 use crate::contact::Contact;
 use crate::contact::contacts_for_pairs;
+use crate::hull::{ConvexHull, HullError};
 use crate::raycast::{RayHit, ray_shape};
 use crate::solver::{self, ContactCache, SolverSettings};
 use crate::union_find::UnionFind;
@@ -65,6 +67,7 @@ pub struct World {
     /// Last step's contact impulses, for warm starting.
     cache: ContactCache,
     tree: AabbTree,
+    hulls: Vec<ConvexHull>,
 }
 
 impl Default for World {
@@ -82,11 +85,28 @@ impl World {
             settings: SolverSettings::default(),
             cache: ContactCache::default(),
             tree: AabbTree::default(),
+            hulls: Vec::new(),
         }
     }
 
     pub fn gravity(&self) -> Vec3 {
         self.gravity
+    }
+
+    /// Registers a convex hull shape (re-centered on its center of mass; see
+    /// [`ConvexHull::center`]) for use as `Collider::Hull`.
+    pub fn add_hull(&mut self, points: &[Vec3]) -> Result<HullId, HullError> {
+        let hull = ConvexHull::new(points)?;
+        self.hulls.push(hull);
+        Ok(HullId((self.hulls.len() - 1) as u32))
+    }
+
+    pub fn hull(&self, id: HullId) -> Option<&ConvexHull> {
+        self.hulls.get(id.0 as usize)
+    }
+
+    pub(crate) fn hulls(&self) -> &[ConvexHull] {
+        &self.hulls
     }
 
     pub fn solver_settings(&self) -> SolverSettings {
@@ -104,7 +124,7 @@ impl World {
     }
 
     pub fn add_body(&mut self, desc: BodyDesc) -> Result<BodyHandle, BodyError> {
-        let body = RigidBody::new(desc)?;
+        let body = RigidBody::with_hulls(desc, &self.hulls)?;
         let handle = if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.body = Some(body);
@@ -125,7 +145,7 @@ impl World {
             }
         };
         self.slots[handle.index as usize].proxy =
-            body_aabb(&body).map(|aabb| self.tree.insert(aabb, handle));
+            body_aabb(&body, &self.hulls).map(|aabb| self.tree.insert(aabb, handle));
         Ok(handle)
     }
 
@@ -170,10 +190,11 @@ impl World {
         self.len() == 0
     }
 
-    /// Removes every body; all existing handles become stale.
+    /// Removes every body and hull shape; all existing handles and hull ids become stale.
     pub fn clear(&mut self) {
         self.cache.clear();
         self.tree = AabbTree::default();
+        self.hulls.clear();
         for (index, slot) in self.slots.iter_mut().enumerate() {
             slot.proxy = None;
             if slot.body.take().is_some() {
@@ -346,8 +367,14 @@ impl World {
             .into_iter()
             .filter_map(|body| {
                 let b = self.body(body)?;
-                let (t, normal) =
-                    ray_shape(origin, dir, b.collider()?, b.position(), b.orientation())?;
+                let (t, normal) = ray_shape(
+                    origin,
+                    dir,
+                    b.collider()?,
+                    b.position(),
+                    b.orientation(),
+                    &self.hulls,
+                )?;
                 (t <= max_distance).then_some(RayHit {
                     body,
                     t,
@@ -379,7 +406,7 @@ impl World {
     fn sync_broadphase(&mut self) {
         for slot in &self.slots {
             if let (Some(body), Some(proxy)) = (&slot.body, slot.proxy)
-                && let Some(aabb) = body_aabb(body)
+                && let Some(aabb) = body_aabb(body, &self.hulls)
             {
                 self.tree.update(proxy, aabb);
             }
@@ -437,8 +464,8 @@ impl World {
     }
 }
 
-fn body_aabb(body: &RigidBody) -> Option<Aabb> {
-    Aabb::of(body.collider()?, body.position(), body.orientation())
+fn body_aabb(body: &RigidBody, hulls: &[ConvexHull]) -> Option<Aabb> {
+    Aabb::of(body.collider()?, body.position(), body.orientation(), hulls)
 }
 
 #[cfg(test)]

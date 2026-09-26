@@ -3,6 +3,7 @@ use std::fmt;
 use glam::{Mat3, Quat, Vec3};
 
 use crate::collider::{Collider, Material};
+use crate::hull::ConvexHull;
 
 /// How a body participates in the simulation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,7 +119,13 @@ pub struct RigidBody {
 }
 
 impl RigidBody {
+    #[cfg(test)]
     pub(crate) fn new(desc: BodyDesc) -> Result<Self, BodyError> {
+        Self::with_hulls(desc, &[])
+    }
+
+    /// `hulls` resolves `Collider::Hull` ids (validation and inertia).
+    pub(crate) fn with_hulls(desc: BodyDesc, hulls: &[ConvexHull]) -> Result<Self, BodyError> {
         if !(desc.position.is_finite()
             && desc.velocity.is_finite()
             && desc.angular_velocity.is_finite()
@@ -139,9 +146,14 @@ impl RigidBody {
         }
         let collider = desc
             .collider
-            .map(|c| validate_collider(c, inverse_mass == 0.0))
+            .map(|c| validate_collider(c, inverse_mass == 0.0, hulls))
             .transpose()?;
-        let inverse_inertia_local = Mat3::from_diagonal(inverse_inertia(collider, inverse_mass));
+        let inverse_inertia_local = match collider {
+            Some(Collider::Hull { hull }) if inverse_mass != 0.0 => {
+                (hulls[hull.0 as usize].unit_inertia() * (1.0 / inverse_mass)).inverse()
+            }
+            _ => Mat3::from_diagonal(inverse_inertia(collider, inverse_mass)),
+        };
         let (velocity, angular_velocity) = if inverse_mass == 0.0 {
             (Vec3::ZERO, Vec3::ZERO)
         } else if inverse_inertia_local == Mat3::ZERO {
@@ -235,7 +247,11 @@ impl RigidBody {
     }
 }
 
-fn validate_collider(collider: Collider, is_static: bool) -> Result<Collider, BodyError> {
+fn validate_collider(
+    collider: Collider,
+    is_static: bool,
+    hulls: &[ConvexHull],
+) -> Result<Collider, BodyError> {
     match collider {
         Collider::Sphere { radius } if radius.is_finite() && radius > 0.0 => Ok(collider),
         Collider::Box { half_extents }
@@ -258,6 +274,7 @@ fn validate_collider(collider: Collider, is_static: bool) -> Result<Collider, Bo
                 normal: normal.normalize(),
             })
         }
+        Collider::Hull { hull } if (hull.0 as usize) < hulls.len() => Ok(collider),
         _ => Err(BodyError::InvalidCollider),
     }
 }

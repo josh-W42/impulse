@@ -209,7 +209,7 @@ fn clip_faces(reference: &Obb, axis: usize, face_normal: Vec3, incident: &Obb) -
 /// spanning the largest area on either side of that line. Clipping slightly twisted
 /// boxes yields clusters of near-duplicate points; redundant points let the solver
 /// shuffle impulse between them without converging (persistent stack jitter).
-fn reduce_to_four(points: Vec<(Vec3, f32)>, normal: Vec3) -> Vec<(Vec3, f32)> {
+pub(crate) fn reduce_to_four(points: Vec<(Vec3, f32)>, normal: Vec3) -> Vec<(Vec3, f32)> {
     if points.len() <= 4 {
         return points;
     }
@@ -232,7 +232,7 @@ fn reduce_to_four(points: Vec<(Vec3, f32)>, normal: Vec3) -> Vec<(Vec3, f32)> {
 }
 
 /// Sutherland–Hodgman: keeps the part of `polygon` where `normal·p <= offset`.
-fn clip_polygon(polygon: &[Vec3], normal: Vec3, offset: f32) -> Vec<Vec3> {
+pub(crate) fn clip_polygon(polygon: &[Vec3], normal: Vec3, offset: f32) -> Vec<Vec3> {
     let mut out = Vec::with_capacity(polygon.len() + 1);
     for (i, &current) in polygon.iter().enumerate() {
         let next = polygon[(i + 1) % polygon.len()];

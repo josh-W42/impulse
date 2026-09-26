@@ -316,7 +316,6 @@ pub fn all_below(world: &World, objects: &[SceneObject], y: f32) -> bool {
         .all(|pose| pose.position.y < y)
 }
 
-/// Mesh and scale for drawing a collider; `None` for planes (drawn as scenery).
 /// Meshes (with transforms in body space) that draw a collider; empty for planes
 /// (drawn as scenery). A capsule is a cylinder plus a sphere at each end.
 fn collider_visual(collider: Collider) -> Vec<(MeshKind, Mat4)> {
@@ -344,6 +343,8 @@ fn collider_visual(collider: Collider) -> Vec<(MeshKind, Mat4)> {
                 (MeshKind::Sphere, cap(-half_height)),
             ]
         }
+        // Hull meshes are registered with the renderer per hull (next task).
+        Collider::Hull { .. } => Vec::new(),
         Collider::Plane { .. } => Vec::new(),
     }
 }
@@ -357,6 +358,7 @@ fn collider_extent(collider: Collider) -> f32 {
             half_height,
             radius,
         } => (half_height + radius) * 2.0,
+        Collider::Hull { .. } => 1.0,
         Collider::Plane { .. } => 0.0,
     }
 }

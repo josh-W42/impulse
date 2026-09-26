@@ -7,6 +7,10 @@ use crate::body::RigidBody;
 use crate::box_box::box_box;
 use crate::capsule::{Capsule, capsule_box, capsule_capsule, capsule_plane, sphere_capsule};
 use crate::collider::Collider;
+use crate::hull::ConvexHull;
+use crate::polytope::{
+    Polytope, capsule_polytope, polytope_plane, polytope_polytope, sphere_polytope,
+};
 use crate::world::{BodyHandle, World};
 
 /// Overlap between two bodies. `normal` points from `b` toward `a`, so moving
@@ -140,7 +144,7 @@ pub(crate) fn contacts_for_pairs(
             continue;
         };
         if let (Some(ca), Some(cb)) = (a.collider(), b.collider()) {
-            pair_contacts((ha, a, ca), (hb, b, cb), &mut contacts);
+            pair_contacts((ha, a, ca), (hb, b, cb), world.hulls(), &mut contacts);
         }
     }
     contacts
@@ -159,7 +163,7 @@ pub(crate) fn find_contacts_brute_force(world: &World) -> Vec<Contact> {
             if a.1.inverse_mass() == 0.0 && b.1.inverse_mass() == 0.0 {
                 continue;
             }
-            pair_contacts(a, b, &mut contacts);
+            pair_contacts(a, b, world.hulls(), &mut contacts);
         }
     }
     contacts
@@ -169,6 +173,7 @@ pub(crate) fn find_contacts_brute_force(world: &World) -> Vec<Contact> {
 fn pair_contacts(
     (ha, a, ca): (BodyHandle, &RigidBody, Collider),
     (hb, b, cb): (BodyHandle, &RigidBody, Collider),
+    hulls: &[ConvexHull],
     out: &mut Vec<Contact>,
 ) {
     let (pa, pb) = (a.position(), b.position());
@@ -207,6 +212,20 @@ fn pair_contacts(
         (Collider::Box { half_extents: ha }, Collider::Box { half_extents: hb }) => {
             (box_box(pa, qa, ha, pb, qb, hb), false)
         }
+        (Collider::Hull { hull }, other) => match hulls.get(hull.0 as usize) {
+            Some(h) => (
+                hull_versus(&Polytope::hull(h, pa, qa), other, pb, qb, hulls),
+                false,
+            ),
+            None => (Vec::new(), false),
+        },
+        (other, Collider::Hull { hull }) => match hulls.get(hull.0 as usize) {
+            Some(h) => (
+                hull_versus(&Polytope::hull(h, pb, qb), other, pa, qa, hulls),
+                true,
+            ),
+            None => (Vec::new(), false),
+        },
         (
             Collider::Capsule {
                 half_height,
@@ -260,6 +279,44 @@ fn capsule_versus(
             capsule,
             Capsule::new(position, orientation, half_height, radius),
         ),
+        // Hull pairs are dispatched to `hull_versus` before capsules.
+        Collider::Hull { .. } => Vec::new(),
+    }
+}
+
+/// A hull (as A, posed) against any other collider (as B).
+fn hull_versus(
+    poly: &Polytope,
+    other: Collider,
+    position: Vec3,
+    orientation: Quat,
+    hulls: &[ConvexHull],
+) -> Vec<Geometry> {
+    // Several helpers compute normals toward the *other* shape; flip those to B→A.
+    let flip = |g: Geometry| (-g.0, g.1, g.2);
+    match other {
+        Collider::Plane { normal } => polytope_plane(poly, position, normal),
+        Collider::Sphere { radius } => sphere_polytope(position, radius, poly)
+            .map(flip)
+            .into_iter()
+            .collect(),
+        Collider::Box { half_extents } => {
+            polytope_polytope(poly, &Polytope::cuboid(position, orientation, half_extents))
+        }
+        Collider::Hull { hull } => match hulls.get(hull.0 as usize) {
+            Some(h) => polytope_polytope(poly, &Polytope::hull(h, position, orientation)),
+            None => Vec::new(),
+        },
+        Collider::Capsule {
+            half_height,
+            radius,
+        } => capsule_polytope(
+            Capsule::new(position, orientation, half_height, radius),
+            poly,
+        )
+        .into_iter()
+        .map(flip)
+        .collect(),
     }
 }
 

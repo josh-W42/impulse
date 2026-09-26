@@ -15,12 +15,20 @@ pub enum Collider {
         half_height: f32,
         radius: f32,
     },
+    /// A convex hull added with [`crate::World::add_hull`], centered on its center of mass.
+    Hull {
+        hull: HullId,
+    },
     /// Infinite plane through the body's position. Static bodies only; the
     /// normal points out of the solid side and is normalized on creation.
     Plane {
         normal: Vec3,
     },
 }
+
+/// Refers to a hull shape stored in a [`crate::World`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HullId(pub(crate) u32);
 
 /// Surface response. Combined per contact: restitution `max`, friction `√(a·b)`.
 #[derive(Debug, Clone, Copy, PartialEq)]

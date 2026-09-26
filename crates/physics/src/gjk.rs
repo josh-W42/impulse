@@ -7,21 +7,30 @@ use glam::{Mat3, Quat, Vec3};
 
 /// A convex shape posed in world space, described by its support mapping.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Convex {
-    // Used by the GJK tests; convex hulls (M6b) will pair with it too.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Sphere { center: Vec3, radius: f32 },
+pub(crate) enum Convex<'a> {
+    Sphere {
+        center: Vec3,
+        radius: f32,
+    },
     Box {
         center: Vec3,
         axes: Mat3,
         half: Vec3,
     },
     /// Segment from `a` to `b`, inflated by `radius`.
-    Capsule { a: Vec3, b: Vec3, radius: f32 },
+    Capsule {
+        a: Vec3,
+        b: Vec3,
+        radius: f32,
+    },
+    /// Convex hull of world-space points.
+    Points {
+        points: &'a [Vec3],
+    },
 }
 
-impl Convex {
-    pub(crate) fn cuboid(center: Vec3, orientation: Quat, half: Vec3) -> Self {
+impl Convex<'_> {
+    pub(crate) fn cuboid(center: Vec3, orientation: Quat, half: Vec3) -> Convex<'static> {
         Convex::Box {
             center,
             axes: Mat3::from_quat(orientation),
@@ -47,6 +56,11 @@ impl Convex {
                 let end = if (b - a).dot(direction) > 0.0 { b } else { a };
                 end + unit * radius
             }
+            Convex::Points { points } => points
+                .iter()
+                .copied()
+                .max_by(|p, q| p.dot(direction).total_cmp(&q.dot(direction)))
+                .unwrap_or(Vec3::ZERO),
         }
     }
 }
@@ -248,7 +262,7 @@ mod tests {
         }
     }
 
-    fn sphere(center: Vec3, radius: f32) -> Convex {
+    fn sphere(center: Vec3, radius: f32) -> Convex<'static> {
         Convex::Sphere { center, radius }
     }
 
