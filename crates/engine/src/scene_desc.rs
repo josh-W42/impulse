@@ -31,10 +31,11 @@ pub struct SceneDesc {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Arena {
     /// Floor plus four walls at ±`half` on x and z.
-    Pit {
-        half: f32,
-    },
+    Pit { half: f32 },
+    /// An infinite floor plane.
     Floor,
+    /// No surroundings: only the scene's own objects (e.g. a floor object).
+    Empty,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -493,6 +494,7 @@ fn add_arena(world: &mut World, arena: Arena) -> Result<(), SceneError> {
         Arena::Pit { half } if half.is_finite() && half > 0.0 => pit_planes(half).to_vec(),
         Arena::Pit { .. } => return Err(SceneError::InvalidArena),
         Arena::Floor => vec![(Vec3::ZERO, Vec3::Y)],
+        Arena::Empty => Vec::new(),
     };
     for (point, normal) in planes {
         world

@@ -132,13 +132,29 @@ const STACK_COLORS: [[f32; 4]; 3] = [
 ];
 
 /// A demo as a scene description. Deterministic.
-/// A blank scene: an open floor, nothing on it.
+/// Half-size of the floor object a new scene starts with (m).
+pub const NEW_FLOOR_HALF: f32 = FLOOR_SIZE / 2.0;
+
+/// A blank scene: no surroundings, just a finite floor object (static box,
+/// top at y = 0) that can be edited, resized, or deleted like anything else.
 pub fn empty_desc() -> SceneDesc {
+    let [r, g, b, _] = FLOOR_COLOR;
     SceneDesc {
         version: SCENE_VERSION,
         name: "untitled".to_string(),
-        arena: Arena::Floor,
-        objects: Vec::new(),
+        arena: Arena::Empty,
+        objects: vec![ObjectDesc {
+            name: "floor".to_string(),
+            shape: Some(ShapeDesc::Box {
+                half_extents: [NEW_FLOOR_HALF, 0.5, NEW_FLOOR_HALF],
+            }),
+            position: [0.0, -0.5, 0.0],
+            body: BodyType::Static,
+            restitution: STATIC_MATERIAL.restitution,
+            friction: STATIC_MATERIAL.friction,
+            color: [r, g, b],
+            ..ObjectDesc::default()
+        }],
         joints: Vec::new(),
     }
 }
@@ -557,6 +573,9 @@ fn collider_extent(collider: Collider) -> f32 {
 }
 
 fn push_scenery(list: &mut DrawList, arena: Arena) {
+    if arena == Arena::Empty {
+        return;
+    }
     list.push_instance(
         MeshKind::Plane,
         Mat4::from_scale(Vec3::new(FLOOR_SIZE, 1.0, FLOOR_SIZE)),
@@ -949,13 +968,30 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_scene_is_just_an_open_floor() {
-        let desc = empty_desc();
-        let (world, objects) =
+    fn the_empty_scene_has_a_finite_floor_things_can_fall_off() {
+        let mut desc = empty_desc();
+        let ball = |x: f32| ObjectDesc {
+            shape: Some(ShapeDesc::Sphere { radius: 0.5 }),
+            position: [x, 2.0, 0.0],
+            ..ObjectDesc::default()
+        };
+        desc.objects.push(ball(0.0));
+        desc.objects.push(ball(NEW_FLOOR_HALF + 3.0));
+        let (mut world, objects) =
             crate::scene_desc::build_world(&desc, &crate::models::ModelRegistry::default())
                 .unwrap();
-        assert!(objects.is_empty());
-        assert_eq!(world.len(), 1, "only the floor plane: no walls");
+        assert_eq!(
+            world.len(),
+            3,
+            "the floor object and two balls; no arena planes"
+        );
+        for _ in 0..120 {
+            world.step(1.0 / 60.0);
+        }
+        let y = |i: usize| world.body(objects[i].handle).unwrap().position().y;
+        assert!((y(1) - 0.5).abs() < 0.02, "on the floor: {}", y(1));
+        assert!(y(2) < -5.0, "past the edge it falls: {}", y(2));
+        let desc = empty_desc();
         assert_eq!(
             crate::scene_desc::from_ron(&crate::scene_desc::to_ron(&desc)).unwrap(),
             desc
