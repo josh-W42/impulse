@@ -52,6 +52,17 @@ enum Mode {
     Play,
 }
 
+/// A left press in edit mode that may become a click (select what was under
+/// it) or a drag (orbit the camera), decided on release.
+struct PendingClick {
+    at: Vec2,
+    /// The object under the cursor at the press, if any.
+    hit: Option<usize>,
+}
+
+/// Cursor travel (px) beyond which a press counts as a drag, not a click.
+const CLICK_SLOP: f32 = 5.0;
+
 /// A selected object being dragged in edit mode, on a horizontal plane (or a
 /// vertical one facing the camera).
 struct EditDrag {
@@ -76,6 +87,10 @@ enum Action {
     /// Desktop: import a `.glb` from the `models/` folder and add it.
     ImportFile(usize),
     LoadDemo(Demo),
+    /// Start a blank scene (open floor).
+    New,
+    /// Change the authored scene's surroundings (undoable).
+    SetArena(scene_desc::Arena),
     Inspector(InspectorAction),
     Save,
     /// Desktop: a scene from the `scenes/` folder.
@@ -136,6 +151,7 @@ pub struct Running {
     /// Editor revision the world was last built from.
     built_revision: u64,
     edit_drag: Option<EditDrag>,
+    pending_click: Option<PendingClick>,
     /// The demo the authored scene was loaded from, and the editor revision
     /// then (it stays highlighted until the scene is edited).
     demo: Option<(Demo, u64)>,
@@ -206,6 +222,7 @@ impl Running {
             editor: Editor::new(desc),
             built_revision: 0,
             edit_drag: None,
+            pending_click: None,
             demo: Some((initial, 0)),
             message: None,
             modifiers: ModifiersState::empty(),
@@ -284,6 +301,14 @@ impl Running {
                         self.drag = None; // release: the body keeps its velocity (throw)
                         if self.edit_drag.take().is_some() {
                             self.editor.commit();
+                        }
+                        if let Some(click) = self.pending_click.take()
+                            && self
+                                .input
+                                .cursor()
+                                .is_some_and(|c| c.distance(click.at) <= CLICK_SLOP)
+                        {
+                            self.editor.select(click.hit);
                         }
                     }
                 }
@@ -420,18 +445,20 @@ impl Running {
         });
     }
 
-    /// Left click in edit mode: select the object under the cursor and start
-    /// dragging it (Shift: vertically); empty space clears the selection.
+    /// Left press in edit mode. On the selected object it starts dragging it
+    /// (Shift: vertically). Anywhere else it waits: released in place it's a
+    /// click that selects what was under it (or clears the selection); moved,
+    /// it was a camera orbit. So a floor filling the view doesn't get dragged.
     fn try_select(&mut self) {
         if self.camera.mode != CameraMode::Orbit || self.egui_ctx.egui_wants_pointer_input() {
             return;
         }
-        let Some((origin, dir)) = self.cursor_ray() else {
+        let (Some((origin, dir)), Some(at)) = (self.cursor_ray(), self.input.cursor()) else {
             return;
         };
-        match editor_ui::object_at(&self.world, &self.objects, origin, dir) {
-            Some((index, point)) => {
-                self.editor.select(Some(index));
+        let hit = editor_ui::object_at(&self.world, &self.objects, origin, dir);
+        match hit {
+            Some((index, point)) if self.editor.selected() == Some(index) => {
                 let start = Vec3::from_array(self.editor.desc().objects[index].position);
                 let vertical = self.modifiers.shift_key();
                 self.editor.begin();
@@ -442,7 +469,12 @@ impl Running {
                     vertical,
                 });
             }
-            None => self.editor.select(None),
+            _ => {
+                self.pending_click = Some(PendingClick {
+                    at,
+                    hit: hit.map(|(index, _)| index),
+                });
+            }
         }
     }
 
@@ -570,6 +602,18 @@ impl Running {
                 self.demo = Some((demo, self.editor.revision()));
                 self.settings.file_name = demo.label().to_string();
                 self.rebuild_scene();
+            }
+            Action::New => {
+                self.editor.replace(scene::empty_desc());
+                self.demo = None;
+                self.settings.file_name = "untitled".to_string();
+                self.mode = Mode::Edit;
+                self.rebuild_scene();
+            }
+            // Part of the current gesture: a whole size drag is one undo step
+            // (committed when the pointer is released).
+            Action::SetArena(arena) => {
+                self.editor.modify(|d| d.arena = arena);
             }
             Action::Save => {
                 self.editor.commit();
@@ -879,6 +923,7 @@ impl Running {
             can_undo: self.editor.can_undo(),
             can_redo: self.editor.can_redo(),
             message: self.message.clone(),
+            arena: self.editor.desc().arena,
             models: self
                 .models
                 .list()
@@ -953,6 +998,8 @@ struct Stats {
     can_undo: bool,
     can_redo: bool,
     message: Option<String>,
+    /// The authored scene's surroundings.
+    arena: scene_desc::Arena,
     /// Every model's id, name, and whether it is bundled (Model… picker).
     models: Vec<(crate::models::ModelId, String, bool)>,
 }
@@ -1049,6 +1096,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             }
             ui.horizontal(|ui| {
                 ui.label("scene");
+                if ui.button("New").clicked() {
+                    actions.push(Action::New);
+                }
                 for demo in Demo::ALL {
                     if ui
                         .selectable_label(stats.demo == Some(demo), demo.label())
@@ -1058,6 +1108,41 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     }
                 }
             });
+            if stats.mode == Mode::Edit {
+                ui.horizontal(|ui| {
+                    use scene_desc::Arena;
+                    ui.label("arena");
+                    let pit = matches!(stats.arena, Arena::Pit { .. });
+                    let choices = [
+                        (Arena::Empty, stats.arena == Arena::Empty, "none"),
+                        (Arena::Floor, stats.arena == Arena::Floor, "infinite floor"),
+                        (
+                            Arena::Pit {
+                                half: scene::DEFAULT_PIT,
+                            },
+                            pit,
+                            "walled pit",
+                        ),
+                    ];
+                    for (arena, current, label) in choices {
+                        if ui.selectable_label(current, label).clicked() && !current {
+                            actions.push(Action::SetArena(arena));
+                        }
+                    }
+                    if let Arena::Pit { half } = stats.arena {
+                        let mut size = half;
+                        let drag = ui.add(
+                            egui::DragValue::new(&mut size)
+                                .speed(0.1)
+                                .range(1.0..=100.0)
+                                .prefix("half-width "),
+                        );
+                        if drag.changed() && size != half {
+                            actions.push(Action::SetArena(Arena::Pit { half: size }));
+                        }
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("file");
                 ui.add(egui::TextEdit::singleline(&mut s.file_name).desired_width(110.0));
@@ -1139,7 +1224,7 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     "Drag a body: grab / throw · drag empty space: orbit · right-drag: pan · wheel: zoom · F: fly"
                 },
                 (CameraMode::Orbit, Mode::Edit) => {
-                    "Click: select · drag it: move (Shift: up/down) · Del · Ctrl+D · Ctrl+Z / Ctrl+Y · drag empty space: orbit"
+                    "Click: select · drag the selection: move (Shift: up/down) · drag elsewhere: orbit · Del · Ctrl+D · Ctrl+Z / Ctrl+Y"
                 },
                 (CameraMode::Fly, _) => "WASD / Space / Shift: move · mouse: look · F or Esc: orbit",
             });

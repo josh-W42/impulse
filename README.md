@@ -26,9 +26,13 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
 Press **■ Edit** to author the scene; **▶ Play** simulates it and **■ Edit** returns
 to exactly what you authored.
 
-- Click to select; drag to move it across the floor (Shift: up/down); the inspector
+- Click to select; drag the selection to move it across the floor (Shift: up/down),
+  drag elsewhere to orbit; the inspector
   edits shape, pose, body, material, colour, and starting velocity
 - Add sphere/box/capsule, Ctrl+D duplicate, Del delete, Ctrl+Z / Ctrl+Y undo/redo
+- **New** starts a blank scene with a finite floor object (a static box you can
+  resize, move, or delete; things fall off its edges). In Edit mode, **arena** adds
+  built-in surroundings to any scene: none, an infinite floor, or a walled pit
 - **Capture pose** (in Play) writes the simulated poses back as the starting scene
 - Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
   opens them. The demos are available as starting points.
