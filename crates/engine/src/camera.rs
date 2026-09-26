@@ -1,7 +1,7 @@
 //! Orbit and fly cameras. Right-handed, Y up; yaw 0 / pitch 0 looks down −Z.
 
 use glam::camera::rh::{proj, view};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 
 const PITCH_LIMIT: f32 = 1.5; // ≈86°, short of straight up/down where look-at degenerates
 const MIN_DISTANCE: f32 = 1.0;
@@ -159,6 +159,15 @@ impl CameraRig {
     }
 }
 
+/// World-space ray `(origin on the near plane, unit direction)` through a point in
+/// normalized device coordinates (x right, y up, both in [-1, 1]).
+pub fn cursor_ray(view_proj: Mat4, ndc: Vec2) -> (Vec3, Vec3) {
+    let inverse = view_proj.inverse();
+    let near = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 0.0));
+    let far = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
+    (near, (far - near).normalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +184,19 @@ mod tests {
     /// Direction the view matrix looks along (world space).
     fn view_forward(view: Mat4) -> Vec3 {
         view.inverse().transform_vector3(Vec3::NEG_Z).normalize()
+    }
+
+    #[test]
+    fn screen_center_ray_leaves_the_eye_along_the_view() {
+        let rig = CameraRig::new(orbit());
+        let view_proj = CameraRig::projection(16.0 / 9.0) * rig.view();
+        let (origin, dir) = cursor_ray(view_proj, Vec2::ZERO);
+        assert!(dir.abs_diff_eq(view_forward(rig.view()), 1e-4), "{dir}");
+        assert!(origin.distance(rig.eye()) < 0.2, "starts at the near plane");
+        // A point up-right on screen sends the ray up and right of center.
+        let (_, corner) = cursor_ray(view_proj, Vec2::new(0.5, 0.5));
+        let right = view_forward(rig.view()).cross(Vec3::Y);
+        assert!(corner.dot(right) > 0.0 && corner.y > dir.y);
     }
 
     #[test]

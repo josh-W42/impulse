@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 use glam::{Vec2, Vec3};
-use impulse_physics::{SolverSettings, StepStats, World};
+use impulse_physics::{BodyHandle, SolverSettings, StepStats, World};
 use impulse_render::{CameraData, DrawList, FrameOutcome, Gpu, Renderer, UiFrame, backend_name};
 use web_time::Instant;
 use winit::event::{DeviceEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window};
 
-use crate::camera::{CameraMode, CameraRig, OrbitCamera};
+use crate::camera::{self, CameraMode, CameraRig, OrbitCamera};
 use crate::egui_input::EguiInput;
 use crate::input::InputState;
 use crate::platform;
@@ -22,6 +22,22 @@ const MAX_STEPS_PER_FRAME: u32 = 5;
 /// Bodies below this height count as gone; once all are, the scene re-drops.
 const RESET_HEIGHT: f32 = -30.0;
 const FLY_SPEED: f32 = 8.0;
+/// Drag spring stiffness (1/s²) and damping (1/s, slightly above critical 2·√k).
+const DRAG_STIFFNESS: f32 = 80.0;
+const DRAG_DAMPING: f32 = 18.0;
+/// Caps the drag acceleration (m/s²) so a fast flick can't explode the solver.
+const DRAG_MAX_ACCEL: f32 = 200.0;
+
+/// A body grabbed with the mouse, pulled toward the cursor by a spring.
+struct Drag {
+    body: BodyHandle,
+    /// Grab point in the body's local frame.
+    local_anchor: Vec3,
+    /// Distance from the camera along the cursor ray at grab time.
+    distance: f32,
+    /// Where the cursor ray currently wants the anchor.
+    target: Vec3,
+}
 
 /// Panel-controlled settings plus one-shot requests the panel raises.
 struct Settings {
@@ -63,6 +79,7 @@ pub struct Running {
     physics: StepStats,
     /// The scene currently in the world (the panel choice applies on reset).
     loaded: Demo,
+    drag: Option<Drag>,
 }
 
 impl Running {
@@ -108,6 +125,7 @@ impl Running {
             frame_ms: 0.0,
             physics: StepStats::default(),
             loaded: initial,
+            drag: None,
         }
     }
 
@@ -141,6 +159,13 @@ impl Running {
                 };
                 if let Some(b) = egui_button {
                     self.egui_input.on_mouse_button(b, pressed);
+                }
+                if *button == MouseButton::Left {
+                    if pressed {
+                        self.try_grab();
+                    } else {
+                        self.drag = None; // release: the body keeps its velocity (throw)
+                    }
                 }
                 self.input.on_mouse_button(*button, pressed);
             }
@@ -220,13 +245,78 @@ impl Running {
         window.set_cursor_visible(!fly);
     }
 
+    fn view_proj(&self) -> glam::Mat4 {
+        let (width, height) = self.gpu.size();
+        CameraRig::projection(width as f32 / height.max(1) as f32) * self.camera.view()
+    }
+
+    /// World ray under the mouse cursor.
+    fn cursor_ray(&self) -> Option<(Vec3, Vec3)> {
+        let cursor = self.input.cursor()?;
+        let (width, height) = self.gpu.size();
+        let ndc = Vec2::new(
+            2.0 * cursor.x / width.max(1) as f32 - 1.0,
+            1.0 - 2.0 * cursor.y / height.max(1) as f32,
+        );
+        Some(camera::cursor_ray(self.view_proj(), ndc))
+    }
+
+    /// Left click in orbit mode: grab the dynamic body under the cursor, if any.
+    fn try_grab(&mut self) {
+        if self.camera.mode != CameraMode::Orbit || self.egui_ctx.egui_wants_pointer_input() {
+            return;
+        }
+        let Some((origin, dir)) = self.cursor_ray() else {
+            return;
+        };
+        let Some(hit) = self.world.raycast(origin, dir, 500.0) else {
+            return;
+        };
+        let Some(body) = self
+            .world
+            .body(hit.body)
+            .filter(|b| b.inverse_mass() != 0.0)
+        else {
+            return;
+        };
+        self.drag = Some(Drag {
+            body: hit.body,
+            local_anchor: body.orientation().inverse() * (hit.point - body.position()),
+            distance: hit.t,
+            target: hit.point,
+        });
+    }
+
+    /// Spring-damper impulse pulling the grab point toward the cursor (gravity
+    /// cancelled so the body doesn't sag). Called before every fixed step.
+    fn apply_drag(&mut self, dt: f32) {
+        let Some(drag) = &self.drag else {
+            return;
+        };
+        let Some(body) = self.world.body(drag.body) else {
+            self.drag = None; // removed (e.g. reset)
+            return;
+        };
+        let r = body.orientation() * drag.local_anchor;
+        let anchor = body.position() + r;
+        let anchor_velocity = body.velocity() + body.angular_velocity().cross(r);
+        let accel = (DRAG_STIFFNESS * (drag.target - anchor)
+            - DRAG_DAMPING * anchor_velocity
+            - self.world.gravity())
+        .clamp_length_max(DRAG_MAX_ACCEL);
+        let impulse = accel * dt / body.inverse_mass();
+        let body = drag.body;
+        self.world.apply_impulse_at(body, impulse, anchor);
+    }
+
     fn update_camera(&mut self, dt: f32, egui_has_pointer: bool) {
+        let dragging = self.drag.is_some();
         let input = &self.input;
         match self.camera.mode {
             CameraMode::Orbit if !egui_has_pointer => {
                 let orbit = &mut self.camera.orbit;
                 let drag = input.cursor_delta();
-                if input.button_held(MouseButton::Left) {
+                if input.button_held(MouseButton::Left) && !dragging {
                     orbit.rotate(-drag.x * 0.005, drag.y * 0.005);
                 }
                 if input.button_held(MouseButton::Right) || input.button_held(MouseButton::Middle) {
@@ -294,6 +384,7 @@ impl Running {
         let mut clock = || start.elapsed().as_secs_f64() * 1000.0;
         let mut frame = StepStats::default();
         for _ in 0..steps {
+            self.apply_drag(self.timestep.step());
             scene::snapshot(&self.world, &mut self.objects);
             let s = self.world.step_profiled(self.timestep.step(), &mut clock);
             frame = StepStats {
@@ -333,6 +424,11 @@ impl Running {
         let egui_has_pointer =
             self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.egui_is_using_pointer();
         self.update_camera(dt, egui_has_pointer);
+        if let Some((origin, dir)) = self.cursor_ray()
+            && let Some(drag) = &mut self.drag
+        {
+            drag.target = origin + dir * drag.distance;
+        }
         self.step_physics(dt);
         scene::build_draw_list(
             &mut self.draw_list,
@@ -343,6 +439,13 @@ impl Running {
             self.settings.show_grid,
             self.settings.show_axes,
         );
+        if let Some(drag) = &self.drag
+            && let Some(body) = self.world.body(drag.body)
+        {
+            let anchor = body.position() + body.orientation() * drag.local_anchor;
+            self.draw_list
+                .push_line(anchor, drag.target, [1.0, 0.85, 0.2, 1.0]);
+        }
 
         let (width, height) = self.gpu.size();
         let raw = self
@@ -455,7 +558,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");
             ui.label(match stats.mode {
-                CameraMode::Orbit => "Drag: orbit · right-drag: pan · wheel: zoom · F: fly",
+                CameraMode::Orbit => {
+                    "Drag a body: grab / throw · drag empty space: orbit · right-drag: pan · wheel: zoom · F: fly"
+                },
                 CameraMode::Fly => "WASD / Space / Shift: move · mouse: look · F or Esc: orbit",
             });
         });

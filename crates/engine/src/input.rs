@@ -109,6 +109,11 @@ impl InputState {
         self.buttons_held.contains(&button)
     }
 
+    /// Cursor position in physical pixels, once the cursor has entered the window.
+    pub fn cursor(&self) -> Option<Vec2> {
+        self.cursor
+    }
+
     pub fn cursor_delta(&self) -> Vec2 {
         self.cursor_delta
     }
