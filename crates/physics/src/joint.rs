@@ -1,8 +1,10 @@
 //! Joints: velocity constraints between two bodies, solved alongside contacts by
 //! the sequential-impulse solver with the same machinery (accumulated impulses,
-//! warm starting, Baumgarte position bias).
+//! warm starting). Equality rows are *soft* (a stiff, critically damped spring;
+//! Box2D v3's soft step): the compliance keeps redundant rows, as in any closed
+//! loop of hinges, from drifting into ever-larger impulses that fight each other.
 
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 use std::fmt;
 
 use glam::{Mat2, Mat3, Quat, Vec2, Vec3};
@@ -10,9 +12,11 @@ use glam::{Mat2, Mat3, Quat, Vec2, Vec3};
 use crate::solver::{Side, tangent_basis};
 use crate::world::{BodyHandle, World};
 
-/// Fraction of a joint's position error corrected per step. No slop: joints
-/// should close exactly.
+/// Fraction of a limit's overshoot corrected per step.
 const BAUMGARTE: f32 = 0.2;
+/// Stiffness (Hz) and damping ratio of the soft equality rows.
+const JOINT_HERTZ: f32 = 30.0;
+const JOINT_DAMPING: f32 = 1.0;
 /// Limits nearer than this (rad) join the solve as speculative rows, so fast
 /// swings stop at the limit instead of overshooting and bouncing back.
 const LIMIT_MARGIN: f32 = 0.25;
@@ -330,9 +334,33 @@ struct LengthRow {
     bias: f32,
 }
 
+/// Soft-constraint coefficients for one step: the row solves
+/// `λ = −mass_scale·m·(Ċ + bias_rate·C) − impulse_scale·λ_total`.
+#[derive(Clone, Copy)]
+struct Soft {
+    bias_rate: f32,
+    mass_scale: f32,
+    impulse_scale: f32,
+}
+
+impl Soft {
+    fn new(hertz: f32, damping: f32, dt: f32) -> Self {
+        let omega = TAU * hertz;
+        let a1 = 2.0 * damping + dt * omega;
+        let a2 = dt * omega * a1;
+        let a3 = 1.0 / (1.0 + a2);
+        Self {
+            bias_rate: omega / a1,
+            mass_scale: a2 * a3,
+            impulse_scale: a3,
+        }
+    }
+}
+
 /// A joint's rows for one step, with geometry frozen at the start of the step.
 pub(crate) struct Rows {
     index: usize,
+    soft: Soft,
     a: Side,
     b: Side,
     impulse: Accumulated,
@@ -361,7 +389,8 @@ fn limit_row(a: &Side, b: &Side, dir: Vec3, room: f32, dt: f32) -> Option<LimitR
 
 /// Builds this step's rows for every joint touching an awake dynamic body.
 pub(crate) fn prepare(world: &World, joints: &[Option<Joint>], dt: f32, warm: bool) -> Vec<Rows> {
-    let correction = BAUMGARTE / dt;
+    let soft = Soft::new(JOINT_HERTZ, JOINT_DAMPING, dt);
+    let correction = soft.bias_rate;
     let mut out = Vec::new();
     for (index, joint) in joints.iter().enumerate() {
         let Some(j) = joint else { continue };
@@ -379,6 +408,7 @@ pub(crate) fn prepare(world: &World, joints: &[Option<Joint>], dt: f32, warm: bo
         };
         let mut rows = Rows {
             index,
+            soft,
             a,
             b,
             impulse: if warm {
@@ -550,20 +580,25 @@ impl Rows {
         if let Some(align) = &self.align {
             let spin = self.relative_spin(world);
             let speed = Vec2::new(spin.dot(align.dirs[0]), spin.dot(align.dirs[1]));
-            let lambda = align.inv_k * -(speed + align.bias);
+            let total = self.impulse.angular;
+            let total = Vec2::new(total.dot(align.dirs[0]), total.dot(align.dirs[1]));
+            let lambda = -self.soft.mass_scale * (align.inv_k * (speed + align.bias))
+                - self.soft.impulse_scale * total;
             let impulse = align.dirs[0] * lambda.x + align.dirs[1] * lambda.y;
             self.impulse.angular += impulse;
             self.twist(world, impulse);
         }
         if let Some(row) = &self.length {
             let speed = (self.a.velocity(world) - self.b.velocity(world)).dot(row.normal);
-            let lambda = -(speed + row.bias) * row.mass;
+            let lambda = -self.soft.mass_scale * row.mass * (speed + row.bias)
+                - self.soft.impulse_scale * self.impulse.distance;
             self.impulse.distance += lambda;
             self.push(world, row.normal * lambda);
         }
         if let Some(point) = &self.point {
             let velocity = self.a.velocity(world) - self.b.velocity(world);
-            let lambda = point.inv_k * -(velocity + point.bias);
+            let lambda = -self.soft.mass_scale * (point.inv_k * (velocity + point.bias))
+                - self.soft.impulse_scale * self.impulse.point;
             self.impulse.point += lambda;
             self.push(world, lambda);
         }

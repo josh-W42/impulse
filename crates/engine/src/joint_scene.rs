@@ -1,5 +1,5 @@
 //! The M7 "Joints" scene: a swinging capsule chain (ball-sockets), a plank rope
-//! bridge (hinges between planks, distance-joint ropes to the posts) with balls
+//! bridge (hinges between planks, distance-joint ropes to the posts) with crates
 //! dropped on it, and a ragdoll (cone-limited ball-sockets, limited hinges).
 
 use std::f32::consts::FRAC_PI_2;
@@ -13,16 +13,19 @@ use crate::scene::SceneObject;
 const POST_COLOR: [f32; 4] = [0.45, 0.35, 0.28, 1.0];
 const CHAIN_COLOR: [f32; 4] = [0.70, 0.72, 0.78, 1.0];
 const PLANK_COLOR: [f32; 4] = [0.78, 0.60, 0.38, 1.0];
-const BALL_COLOR: [f32; 4] = [0.85, 0.35, 0.30, 1.0];
+const CRATE_COLOR: [f32; 4] = [0.85, 0.35, 0.30, 1.0];
 const RAGDOLL_COLOR: [f32; 4] = [0.35, 0.60, 0.85, 1.0];
 const HEAD_COLOR: [f32; 4] = [0.95, 0.80, 0.55, 1.0];
 
 pub const CHAIN_LINKS: usize = 8;
 pub const PLANKS: usize = 10;
-pub const BALLS: usize = 3;
+pub const CRATES: usize = 3;
 /// Torso, head, 2 × (upper arm, forearm, thigh, shin).
 #[cfg(test)]
 pub const RAGDOLL_PARTS: usize = 10;
+
+/// Crossbar rope anchors sit this many times wider than the deck.
+const ROPE_SPLAY: f32 = 2.0;
 
 const MATERIAL: Material = Material {
     restitution: 0.1,
@@ -118,7 +121,9 @@ fn chain(b: &mut Builder, top: Vec3) {
 }
 
 /// Hinged planks spanning two posts, hung from them by rope (distance joints)
-/// at both corners so the deck can't roll; a little slack lets it sag.
+/// at both corners so the deck can't roll. The ropes splay outward to crossbars
+/// wider than the deck, bracing it against swinging sideways, and have enough
+/// slack for the deck to sag into a cradle.
 fn bridge(b: &mut Builder, center: Vec3) {
     let half = Vec3::new(0.34, 0.05, 0.6);
     let pitch = 2.0 * half.x + 0.04;
@@ -127,7 +132,7 @@ fn bridge(b: &mut Builder, center: Vec3) {
     for i in 0..PLANKS {
         let x = -span / 2.0 + pitch * (i as f32 + 0.5);
         let plank = b.dynamic(
-            0.6,
+            1.0,
             center + Vec3::X * x,
             Quat::IDENTITY,
             Collider::Box { half_extents: half },
@@ -140,27 +145,28 @@ fn bridge(b: &mut Builder, center: Vec3) {
         planks.push(plank);
     }
     for (side, end) in [(-1.0_f32, planks[0]), (1.0, planks[PLANKS - 1])] {
-        // A crossbar post as wide as the deck, a little above and beyond it.
-        let post_at = center + Vec3::new(side * (span / 2.0 + 0.6), 0.4, 0.0);
-        let post = b.post(post_at, Vec3::new(0.15, 0.15, half.z + 0.1));
+        let post_at = center + Vec3::new(side * (span / 2.0 + 0.6), 0.9, 0.0);
+        let post = b.post(post_at, Vec3::new(0.15, 0.15, ROPE_SPLAY * half.z + 0.1));
         for z in [-half.z, half.z] {
             let on_plank = center + Vec3::new(side * span / 2.0, 0.0, z);
             b.join(JointDesc::distance(
                 post,
                 end,
-                post_at + Vec3::Z * z,
+                post_at + Vec3::Z * (z * ROPE_SPLAY),
                 on_plank,
             ));
         }
     }
-    for i in 0..BALLS {
-        let at = center + Vec3::new(i as f32 - 1.0, 2.0 + 1.5 * i as f32, 0.0);
+    for i in 0..CRATES {
+        let at = center + Vec3::new(0.8 * (i as f32 - 1.0), 1.5 + i as f32, 0.0);
         b.dynamic(
-            1.5,
+            1.0,
             at,
             Quat::IDENTITY,
-            Collider::Sphere { radius: 0.25 },
-            BALL_COLOR,
+            Collider::Box {
+                half_extents: Vec3::splat(0.22),
+            },
+            CRATE_COLOR,
         );
     }
 }

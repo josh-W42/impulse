@@ -269,6 +269,55 @@ fn hanging_chain_barely_stretches() {
     assert!(stretch < 0.02, "chain stretched {:.1}%", stretch * 100.0);
 }
 
+/// Regression: a closed loop of parallel hinges (a plank bridge hinged to two
+/// posts) has redundant rows. With rigid rows, warm starting let their impulses
+/// drift and fight, pumping the bridge to ~9 m/s; soft rows let it settle.
+#[test]
+fn closed_hinge_loop_settles_with_warm_starting() {
+    let mut world = World::default();
+    no_sleep(&mut world);
+    let (planks, pitch, radius) = (10, 0.72, 12.0_f32);
+    let theta = 2.0 * (pitch / 2.0 / radius).asin();
+    let center = Vec3::new(0.0, 2.5 + radius, 0.0);
+    let on_arc = |phi: f32, r: f32| center + Vec3::new(phi.sin(), -phi.cos(), 0.0) * r;
+    let start = -(planks as f32) * theta / 2.0;
+    let pivot = |k: usize| on_arc(start + k as f32 * theta, radius);
+    let mut previous = anchor(&mut world, pivot(0));
+    let mut deck = Vec::new();
+    for i in 0..planks {
+        let phi = start + (i as f32 + 0.5) * theta;
+        let desc = BodyDesc {
+            orientation: Quat::from_rotation_z(phi),
+            ..BodyDesc::dynamic(0.6, on_arc(phi, radius * (theta / 2.0).cos()))
+        };
+        let plank = world
+            .add_body(desc.with_collider(Collider::Box {
+                half_extents: Vec3::new(0.34, 0.05, 0.6),
+            }))
+            .unwrap();
+        world
+            .add_joint(JointDesc::hinge(previous, plank, pivot(i), Vec3::Z))
+            .unwrap();
+        deck.push(plank);
+        previous = plank;
+    }
+    let end = anchor(&mut world, pivot(planks));
+    world
+        .add_joint(JointDesc::hinge(previous, end, pivot(planks), Vec3::Z))
+        .unwrap();
+    assert!(world.solver_settings().warm_starting);
+    let mut fastest: f32 = 0.0;
+    for step in 0..(15.0 / DT) as u32 {
+        world.step(DT);
+        if step as f32 * DT > 10.0 {
+            for &p in &deck {
+                fastest = fastest.max(world.body(p).unwrap().velocity().length());
+            }
+        }
+    }
+    assert!(fastest < 0.1, "bridge still moving at {fastest} m/s");
+}
+
 #[test]
 fn overlapping_joined_bodies_ignore_each_other_unless_asked() {
     let run = |collide: bool| {

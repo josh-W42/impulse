@@ -630,13 +630,13 @@ mod tests {
 
     #[test]
     fn joints_scene_holds_together_and_stays_in_the_pit() {
-        use crate::joint_scene::{BALLS, CHAIN_LINKS, PLANKS, RAGDOLL_PARTS};
+        use crate::joint_scene::{CHAIN_LINKS, CRATES, PLANKS, RAGDOLL_PARTS};
         let mut world = World::default();
         let objects = build(&mut world, Demo::Joints);
         let posts = 3;
         assert_eq!(
             objects.len(),
-            posts + CHAIN_LINKS + PLANKS + BALLS + RAGDOLL_PARTS
+            posts + CHAIN_LINKS + PLANKS + CRATES + RAGDOLL_PARTS
         );
         let gaps = |w: &World| -> Vec<f32> {
             w.joints()
