@@ -73,7 +73,7 @@ enum Action {
     Redo,
     Add(NewShape),
     AddModel(crate::models::ModelId),
-    /// Desktop: a `.glb` from the `models/` folder.
+    /// Desktop: import a `.glb` from the `models/` folder and add it.
     ImportFile(usize),
     LoadDemo(Demo),
     Inspector(InspectorAction),
@@ -615,7 +615,11 @@ impl Running {
                     return;
                 };
                 match platform::read_model(&stem) {
-                    Ok(bytes) => self.import_model(&format!("{stem}.glb"), &bytes),
+                    Ok(bytes) => {
+                        if let Some(id) = self.import_model(&format!("{stem}.glb"), &bytes) {
+                            self.apply(Action::AddModel(id));
+                        }
+                    }
                     Err(e) => self.message = Some(e),
                 }
             }
@@ -630,9 +634,9 @@ impl Running {
 
     /// Adds a model to the registry and uploads it; scenes using that name are
     /// rebuilt with the new mesh.
-    fn import_model(&mut self, file_name: &str, bytes: &[u8]) {
+    fn import_model(&mut self, file_name: &str, bytes: &[u8]) -> Option<crate::models::ModelId> {
         match self.models.import(file_name, bytes) {
-            Ok((_, name)) => {
+            Ok((id, name)) => {
                 self.upload_models();
                 let used = self.editor.desc().objects.iter().any(|o| {
                     matches!(&o.shape, Some(scene_desc::ShapeDesc::Model { name: n, .. }) if *n == name)
@@ -640,9 +644,13 @@ impl Running {
                 if used {
                     self.rebuild_scene();
                 }
-                self.message = Some(format!("imported '{name}' (add it from Model…)"));
+                self.message = Some(format!("imported '{name}'"));
+                Some(id)
             }
-            Err(e) => self.message = Some(format!("{file_name}: {e}")),
+            Err(e) => {
+                self.message = Some(format!("{file_name}: {e}"));
+                None
+            }
         }
     }
 
@@ -814,7 +822,9 @@ impl Running {
                     Ok(text) => self.load_scene_text(&picked.name, &text),
                     Err(_) => self.message = Some(format!("{} is not text", picked.name)),
                 },
-                platform::PickKind::Model => self.import_model(&picked.name, &picked.bytes),
+                platform::PickKind::Model => {
+                    self.import_model(&picked.name, &picked.bytes);
+                }
             },
             Some(Err(e)) => self.message = Some(e),
             None => {}
@@ -987,7 +997,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                             actions.push(Action::Add(shape));
                         }
                     }
-                    egui::ComboBox::from_id_salt("add model")
+                    // Loaded models, then (desktop) files in models/ not yet
+                    // imported: picking one imports and adds it.
+                    let list = egui::ComboBox::from_id_salt("add model")
                         .selected_text("Model…")
                         .show_ui(ui, |ui| {
                             for (id, name) in &stats.models {
@@ -995,24 +1007,32 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                                     actions.push(Action::AddModel(*id));
                                 }
                             }
-                        });
-                    if platform::HAS_SCENE_FOLDER {
-                        let list = egui::ComboBox::from_id_salt("import model")
-                            .selected_text("Import…")
-                            .show_ui(ui, |ui| {
-                                if s.model_files.is_empty() {
-                                    ui.label("put .glb files in models/");
-                                }
-                                for (i, name) in s.model_files.iter().enumerate() {
-                                    if ui.selectable_label(false, name).clicked() {
+                            if platform::HAS_SCENE_FOLDER {
+                                ui.separator();
+                                let loaded = |stem: &str| {
+                                    scene_desc::file_stem(stem)
+                                        .is_some_and(|n| stats.models.iter().any(|(_, m)| *m == n))
+                                };
+                                let mut any = false;
+                                for (i, file) in s.model_files.iter().enumerate() {
+                                    if loaded(file) {
+                                        continue;
+                                    }
+                                    any = true;
+                                    let label = format!("{file}.glb (models/)");
+                                    if ui.selectable_label(false, label).clicked() {
                                         actions.push(Action::ImportFile(i));
                                     }
                                 }
-                            });
-                        if list.response.clicked() {
-                            s.model_files = platform::model_files();
-                        }
-                    } else if ui.button("Import…").clicked() {
+                                if !any {
+                                    ui.label("more: put .glb files in models/");
+                                }
+                            }
+                        });
+                    if platform::HAS_SCENE_FOLDER && list.response.clicked() {
+                        s.model_files = platform::model_files();
+                    }
+                    if !platform::HAS_SCENE_FOLDER && ui.button("Import…").clicked() {
                         actions.push(Action::Open(platform::PickKind::Model));
                     }
                 });

@@ -33,8 +33,9 @@ to exactly what you authored.
 - Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
   opens them. The demos are available as starting points.
 - **Models** (glTF `.glb`): Add → Model… places a bundled CC0 prop
-  (`assets/models/`, see its `LICENSES.md`); import your own from `models/` on
-  desktop or with Import… in the browser. Each collides as a convex hull or a
+  (`assets/models/`, see its `LICENSES.md`). Your own: on desktop, `.glb` files in
+  `models/` (next to where you run it) are listed in Model… too, and picking one
+  imports and adds it; in the browser, use Import…. Each collides as a convex hull or a
   fitted box/sphere/capsule; the "model colliders" toggle shows them.
 
 ## Prerequisites
