@@ -1,5 +1,6 @@
-//! Sequential-impulse contact solver (Box2D-Lite lineage): accumulated impulse
-//! clamping, warm starting from persistent contacts, and Baumgarte position bias.
+//! Sequential-impulse contact and joint solver (Box2D-Lite lineage): accumulated
+//! impulse clamping, warm starting from persistent contacts, and Baumgarte
+//! position bias.
 
 use std::collections::HashMap;
 
@@ -7,6 +8,7 @@ use glam::{Mat3, Vec3};
 
 use crate::collider::Material;
 use crate::contact::Contact;
+use crate::joint::{self, Joint};
 use crate::world::{BodyHandle, World};
 
 /// Below this approach speed (m/s) contacts don't bounce, so resting bodies don't jitter.
@@ -61,18 +63,18 @@ impl ContactCache {
     }
 }
 
-/// One side of a contact, frozen for the duration of the solve.
+/// One side of a contact or joint, frozen for the duration of the solve.
 #[derive(Clone, Copy)]
-struct Side {
+pub(crate) struct Side {
     handle: BodyHandle,
-    inv_mass: f32,
-    inv_inertia: Mat3,
-    /// Contact point relative to the body's center.
-    r: Vec3,
+    pub(crate) inv_mass: f32,
+    pub(crate) inv_inertia: Mat3,
+    /// Contact point (or joint anchor) relative to the body's center.
+    pub(crate) r: Vec3,
 }
 
 impl Side {
-    fn new(world: &World, handle: BodyHandle, point: Vec3) -> Option<Self> {
+    pub(crate) fn new(world: &World, handle: BodyHandle, point: Vec3) -> Option<Self> {
         let body = world.body(handle)?;
         Some(Self {
             handle,
@@ -82,20 +84,33 @@ impl Side {
         })
     }
 
-    fn velocity(&self, world: &World) -> Vec3 {
+    pub(crate) fn velocity(&self, world: &World) -> Vec3 {
         world.body(self.handle).map_or(Vec3::ZERO, |b| {
             b.velocity + b.angular_velocity.cross(self.r)
         })
     }
 
-    fn apply(&self, world: &mut World, impulse: Vec3) {
+    pub(crate) fn apply(&self, world: &mut World, impulse: Vec3) {
         if let Some(body) = world.body_mut(self.handle) {
             body.velocity += impulse * self.inv_mass;
             body.angular_velocity += self.inv_inertia * self.r.cross(impulse);
         }
     }
 
-    fn inverse_mass_along(&self, direction: Vec3) -> f32 {
+    pub(crate) fn angular_velocity(&self, world: &World) -> Vec3 {
+        world
+            .body(self.handle)
+            .map_or(Vec3::ZERO, |b| b.angular_velocity)
+    }
+
+    /// Applies a pure angular impulse (torque × time).
+    pub(crate) fn apply_angular(&self, world: &mut World, impulse: Vec3) {
+        if let Some(body) = world.body_mut(self.handle) {
+            body.angular_velocity += self.inv_inertia * impulse;
+        }
+    }
+
+    pub(crate) fn inverse_mass_along(&self, direction: Vec3) -> f32 {
         let angular = (self.inv_inertia * self.r.cross(direction)).cross(self.r);
         self.inv_mass + direction.dot(angular)
     }
@@ -126,7 +141,7 @@ impl Point {
 }
 
 /// Two unit tangents perpendicular to `n` (Catto's construction; deterministic).
-fn tangent_basis(n: Vec3) -> [Vec3; 2] {
+pub(crate) fn tangent_basis(n: Vec3) -> [Vec3; 2] {
     let t1 = if n.x.abs() >= 0.577_35 {
         Vec3::new(n.y, -n.x, 0.0)
     } else {
@@ -141,8 +156,15 @@ fn local_point(world: &World, handle: BodyHandle, point: Vec3) -> Option<Vec3> {
     Some(body.orientation().inverse() * (point - body.position()))
 }
 
-/// Resolves all contacts' velocities for one step and refreshes `cache`.
-pub(crate) fn solve(world: &mut World, contacts: &[Contact], cache: &mut ContactCache, dt: f32) {
+/// Resolves all joint and contact velocities for one step and refreshes `cache`
+/// and the joints' stored impulses.
+pub(crate) fn solve(
+    world: &mut World,
+    contacts: &[Contact],
+    cache: &mut ContactCache,
+    joints: &mut [Option<Joint>],
+    dt: f32,
+) {
     let settings = world.solver_settings();
     let mut previous = std::mem::take(&mut cache.pairs);
     let mut points: Vec<Point> = Vec::with_capacity(contacts.len());
@@ -210,7 +232,12 @@ pub(crate) fn solve(world: &mut World, contacts: &[Contact], cache: &mut Contact
         });
     }
 
+    let mut rows = joint::prepare(world, joints, dt, settings.warm_starting);
+
     // Warm start: re-apply last step's impulses before iterating.
+    for r in &mut rows {
+        r.warm_start(world);
+    }
     for p in &points {
         let impulse = p.normal * p.normal_impulse
             + p.tangents[0] * p.tangent_impulse[0]
@@ -224,12 +251,20 @@ pub(crate) fn solve(world: &mut World, contacts: &[Contact], cache: &mut Contact
     // doesn't bias redundant contacts (4 coplanar points per face) toward one side.
     // A one-directional sweep leaves a same-signed residual spin every step that
     // accumulates into a lean in tall stacks.
+    // Joints first, contacts last: the last rows solved win each iteration, and
+    // penetration is the more visible error.
     for iteration in 0..settings.iterations.max(1) {
         if iteration % 2 == 0 {
+            rows.iter_mut().for_each(|r| r.solve(world));
             points.iter_mut().for_each(|p| solve_point(world, p));
         } else {
+            rows.iter_mut().rev().for_each(|r| r.solve(world));
             points.iter_mut().rev().for_each(|p| solve_point(world, p));
         }
+    }
+
+    for r in &rows {
+        r.store(joints);
     }
 
     for p in &points {
