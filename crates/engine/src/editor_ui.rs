@@ -403,10 +403,11 @@ pub fn outliner(
                     ui.horizontal(|ui| {
                         ui.add_space(row.depth as f32 * INDENT);
                         if row.has_children {
+                            // Plain +/−: egui's default font has no ▸/▾.
                             let arrow = if collapsed.contains(&row.index) {
-                                "▸"
+                                "+"
                             } else {
-                                "▾"
+                                "\u{2212}"
                             };
                             if ui.small_button(arrow).clicked() {
                                 toggled = Some(row.index);
