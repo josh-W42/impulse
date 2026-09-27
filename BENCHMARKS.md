@@ -20,6 +20,23 @@ dropped into a walled pit; every step of a 5 s simulation (300 steps at 60 Hz) t
   falling phase, when every body is awake — that's the number to budget against.
 - Contacts are bit-identical with and without the broadphase (equivalence test).
 
+## Solver comparison (M11, native)
+
+Measured 2026-09-26, same bench; it now runs under each solver. Soft step:
+4 substeps, 30 Hz contacts, relax each substep (see `docs/plans/2026-09-27-m11-soft-step.md`).
+
+| bodies | classic mean / p95 / max | soft step mean / p95 / max |
+|---|---|---|
+| 100 | 0.09 / 0.36 / 0.44 ms | 0.11 / 0.47 / 0.56 ms |
+| 500 | 0.61 / 1.92 / 2.21 ms | 0.78 / 2.55 / 2.74 ms |
+| 1000 | 1.27 / 3.46 / 3.78 ms | 2.43 / 4.64 / 5.32 ms |
+
+- Soft step costs ~1.3× classic at p95 (the falling phase) and ~1.9× in the
+  1,000-body mean: four substeps of one solve plus one relax (8 contact passes)
+  against classic's 10 iterations, but contact geometry is recomputed each pass.
+- Well inside a 16.7 ms frame; what it buys is stacking (10-high tower: 5.5 mm
+  drift vs 7.8 cm, see the M11 doc).
+
 ## Browser frame time (Rain scene, 1,000 bodies)
 
 `?scene=rain`, 1005 bodies incl. pit planes, 10 solver iterations, warm starting and

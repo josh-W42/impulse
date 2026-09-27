@@ -1,7 +1,7 @@
 //! Box contract tests against a floor.
 
 use glam::{Quat, Vec3};
-use impulse_physics::{BodyDesc, BodyHandle, Collider, Material, World};
+use impulse_physics::{BodyDesc, BodyHandle, Collider, Material, SolverMode, World};
 
 const DT: f32 = 1.0 / 60.0;
 
@@ -208,7 +208,14 @@ fn pile_of_boxes_never_deeply_interpenetrates() {
         highest > 0.6,
         "no pile formed (highest center {highest}): boxes passed through each other"
     );
-    assert!(deepest < 0.15, "bodies sank {deepest} m into each other");
+    // Fast impacts are detected once per step, so they arrive deep. Classic
+    // Baumgarte removes 20% of it at once; the soft step's spring pushes out
+    // more gradually (capped at 3 m/s), so its transient peak is a little deeper.
+    let bar = match world.solver_settings().mode {
+        SolverMode::Classic => 0.15,
+        SolverMode::SoftStep => 0.2,
+    };
+    assert!(deepest < bar, "bodies sank {deepest} m into each other");
     for (_, b) in world.bodies() {
         assert!(b.position().is_finite() && b.position().y > -0.1);
     }

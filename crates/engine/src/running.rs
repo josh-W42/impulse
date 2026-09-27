@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use glam::{Vec2, Vec3};
-use impulse_physics::{BodyHandle, SolverSettings, StepStats, World};
+use impulse_physics::{BodyHandle, SolverMode, SolverSettings, StepStats, World};
 use impulse_render::{CameraData, DrawList, FrameOutcome, Gpu, Renderer, UiFrame, backend_name};
 use web_time::Instant;
 use winit::event::{DeviceEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -120,6 +120,8 @@ struct Settings {
     warm_starting: bool,
     iterations: usize,
     sleeping: bool,
+    solver_mode: SolverMode,
+    substeps: usize,
 }
 
 pub enum FrameResult {
@@ -223,6 +225,8 @@ impl Running {
                 warm_starting: SolverSettings::default().warm_starting,
                 iterations: SolverSettings::default().iterations,
                 sleeping: SolverSettings::default().sleeping,
+                solver_mode: SolverSettings::default().mode,
+                substeps: SolverSettings::default().substeps,
             },
             start: now,
             last_frame: now,
@@ -818,6 +822,8 @@ impl Running {
             iterations: self.settings.iterations,
             warm_starting: self.settings.warm_starting,
             sleeping: self.settings.sleeping,
+            mode: self.settings.solver_mode,
+            substeps: self.settings.substeps,
         };
         if self.world.solver_settings() != solver {
             self.world.set_solver_settings(solver);
@@ -1268,7 +1274,19 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             ui.separator();
             ui.checkbox(&mut s.warm_starting, "warm starting");
             ui.checkbox(&mut s.sleeping, "sleeping");
-            ui.add(egui::Slider::new(&mut s.iterations, 1..=30).text("solver iterations"));
+            ui.horizontal(|ui| {
+                ui.label("solver");
+                ui.selectable_value(&mut s.solver_mode, SolverMode::Classic, "classic");
+                ui.selectable_value(&mut s.solver_mode, SolverMode::SoftStep, "soft step");
+            });
+            match s.solver_mode {
+                SolverMode::Classic => {
+                    ui.add(egui::Slider::new(&mut s.iterations, 1..=30).text("solver iterations"));
+                }
+                SolverMode::SoftStep => {
+                    ui.add(egui::Slider::new(&mut s.substeps, 1..=8).text("substeps"));
+                }
+            }
             ui.separator();
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");

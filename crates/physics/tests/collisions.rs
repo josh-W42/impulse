@@ -1,7 +1,7 @@
 //! Physical-contract tests for contacts, through the public API only.
 
 use glam::Vec3;
-use impulse_physics::{BodyDesc, BodyHandle, Collider, Material, World};
+use impulse_physics::{BodyDesc, BodyHandle, Collider, Material, SolverMode, World};
 
 const DT: f32 = 1.0 / 60.0;
 const G: f32 = 9.81;
@@ -350,8 +350,15 @@ fn glancing_collision_conserves_angular_momentum_and_induces_spin() {
     let before = angular_momentum(&world, &[a, b]);
     run(&mut world, 3.0, |_| {});
     let after = angular_momentum(&world, &[a, b]);
+    // Classic: the penetration stays inside its 5 mm slop, so only impulses act
+    // and r × p is conserved to rounding. The soft step has no slop: its contact
+    // spring moves the bodies slightly (position correction), perturbing r × p.
+    let tolerance = match world.solver_settings().mode {
+        SolverMode::Classic => 1e-4,
+        SolverMode::SoftStep => 1e-2,
+    };
     assert!(
-        after.abs_diff_eq(before, 1e-4 * before.length().max(1.0)),
+        after.abs_diff_eq(before, tolerance * before.length().max(1.0)),
         "{after} vs {before}"
     );
     assert!(

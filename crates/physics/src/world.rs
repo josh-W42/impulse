@@ -10,8 +10,12 @@ use crate::contact::contacts_for_pairs;
 use crate::hull::{ConvexHull, HullError};
 use crate::joint::{Joint, JointDesc, JointError, JointId};
 use crate::raycast::{RayHit, ray_shape};
-use crate::solver::{self, ContactCache, SolverSettings};
+use crate::solver::{self, ContactCache, SolverMode, SolverSettings};
+use crate::solver_soft;
 use crate::union_find::UnionFind;
+
+/// Upper bound on soft-step substeps per step.
+pub const MAX_SUBSTEPS: usize = 16;
 
 pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 
@@ -164,6 +168,7 @@ impl World {
     pub fn set_solver_settings(&mut self, settings: SolverSettings) {
         self.settings = SolverSettings {
             iterations: settings.iterations.max(1),
+            substeps: settings.substeps.clamp(1, MAX_SUBSTEPS),
             ..settings
         };
         if !settings.warm_starting {
@@ -278,10 +283,6 @@ impl World {
         let t2 = clock();
         let contact_count = contacts.len();
         self.wake_touched_islands(&contacts);
-        let gravity = self.gravity;
-        for body in self.bodies_mut() {
-            body.apply_gravity(gravity, dt);
-        }
         // Contacts among sleeping (or static) bodies need no solving.
         let active: Vec<Contact> = contacts
             .into_iter()
@@ -289,13 +290,22 @@ impl World {
             .collect();
         let mut cache = std::mem::take(&mut self.cache);
         let mut joints = std::mem::take(&mut self.joints);
-        solver::solve(self, &active, &mut cache, &mut joints, dt);
+        let t3 = match self.settings.mode {
+            SolverMode::Classic => {
+                self.integrate_velocities(dt);
+                solver::solve(self, &active, &mut cache, &mut joints, dt);
+                let t3 = clock();
+                self.integrate_positions(dt);
+                t3
+            }
+            // Integrates per substep itself; its time counts as solving.
+            SolverMode::SoftStep => {
+                solver_soft::step(self, &active, &mut cache, &mut joints, dt);
+                clock()
+            }
+        };
         self.joints = joints;
         self.cache = cache;
-        let t3 = clock();
-        for body in self.bodies_mut() {
-            body.advance(dt);
-        }
         if self.settings.sleeping {
             self.fall_asleep(&active, dt);
         }
@@ -522,6 +532,21 @@ impl World {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    /// Gravity for every awake dynamic body.
+    pub(crate) fn integrate_velocities(&mut self, dt: f32) {
+        let gravity = self.gravity;
+        for body in self.bodies_mut() {
+            body.apply_gravity(gravity, dt);
+        }
+    }
+
+    /// Moves every awake dynamic body with its current velocity.
+    pub(crate) fn integrate_positions(&mut self, dt: f32) {
+        for body in self.bodies_mut() {
+            body.advance(dt);
+        }
     }
 
     fn bodies_mut(&mut self) -> impl Iterator<Item = &mut RigidBody> {
