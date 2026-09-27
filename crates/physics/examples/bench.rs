@@ -1,12 +1,13 @@
 //! Native step-time benchmark: `cargo run --release -p impulse-physics --example bench`.
 //!
 //! Drops N mixed spheres/boxes into a walled pit and times every step of a 5 s
-//! simulation (300 steps at 60 Hz). Deterministic scene, so runs are comparable.
+//! simulation (300 steps at 60 Hz), under each solver. Deterministic scene, so
+//! runs are comparable.
 
 use std::time::Instant;
 
 use glam::{Quat, Vec3};
-use impulse_physics::{BodyDesc, Collider, Material, World};
+use impulse_physics::{BodyDesc, Collider, Material, SolverMode, SolverSettings, World};
 
 const DT: f32 = 1.0 / 60.0;
 const STEPS: usize = 300;
@@ -63,24 +64,34 @@ pub fn rain(world: &mut World, count: usize) {
 }
 
 fn main() {
-    println!("| bodies | mean step (ms) | p95 step (ms) | max step (ms) |");
-    println!("|---|---|---|---|");
-    for count in [100, 500, 1000] {
-        let mut world = World::default();
-        rain(&mut world, count);
-        let mut times: Vec<f64> = (0..STEPS)
-            .map(|_| {
-                let start = Instant::now();
-                world.step(DT);
-                start.elapsed().as_secs_f64() * 1000.0
-            })
-            .collect();
-        times.sort_by(f64::total_cmp);
-        let mean = times.iter().sum::<f64>() / times.len() as f64;
-        let p95 = times[(times.len() * 95) / 100];
-        println!(
-            "| {count} | {mean:.2} | {p95:.2} | {:.2} |",
-            times.last().unwrap()
-        );
+    println!("| solver | bodies | mean step (ms) | p95 step (ms) | max step (ms) |");
+    println!("|---|---|---|---|---|");
+    for mode in [SolverMode::Classic, SolverMode::SoftStep] {
+        for count in [100, 500, 1000] {
+            bench(mode, count);
+        }
     }
+}
+
+fn bench(mode: SolverMode, count: usize) {
+    let mut world = World::default();
+    world.set_solver_settings(SolverSettings {
+        mode,
+        ..world.solver_settings()
+    });
+    rain(&mut world, count);
+    let mut times: Vec<f64> = (0..STEPS)
+        .map(|_| {
+            let start = Instant::now();
+            world.step(DT);
+            start.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect();
+    times.sort_by(f64::total_cmp);
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let p95 = times[(times.len() * 95) / 100];
+    println!(
+        "| {mode:?} | {count} | {mean:.2} | {p95:.2} | {:.2} |",
+        times.last().unwrap()
+    );
 }

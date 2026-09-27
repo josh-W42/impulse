@@ -10,8 +10,12 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
 
 ## Physics (written from scratch; depends only on `glam`)
 
-- Sequential-impulse solver: accumulated clamping, warm starting, Baumgarte
-  correction, symmetric Gauss–Seidel, friction
+- Two solvers, switchable live in the panel:
+  - **soft step** (default, after Box2D v3): 4 substeps, soft (spring-damper)
+    contacts, a relax pass each substep, restitution in its own pass. A 10-high
+    box tower stands still (5.5 mm drift in 10 s)
+  - **classic** sequential impulses: accumulated clamping, warm starting,
+    Baumgarte correction, symmetric Gauss–Seidel, friction
 - Shapes: sphere, box, capsule, convex hull, plane; box–box SAT with clipped
   manifolds, GJK + EPA for general convex pairs, manifolds reduced to 4 points
 - Joints: ball-socket (3×3 block) with cone limits, hinge with angle limits,
