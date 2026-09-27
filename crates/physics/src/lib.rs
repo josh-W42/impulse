@@ -16,6 +16,7 @@ mod joint;
 mod polytope;
 mod raycast;
 mod solver;
+mod solver_soft;
 mod union_find;
 mod world;
 

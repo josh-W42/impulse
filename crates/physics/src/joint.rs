@@ -337,14 +337,14 @@ struct LengthRow {
 /// Soft-constraint coefficients for one step: the row solves
 /// `λ = −mass_scale·m·(Ċ + bias_rate·C) − impulse_scale·λ_total`.
 #[derive(Clone, Copy)]
-struct Soft {
-    bias_rate: f32,
-    mass_scale: f32,
-    impulse_scale: f32,
+pub(crate) struct Soft {
+    pub(crate) bias_rate: f32,
+    pub(crate) mass_scale: f32,
+    pub(crate) impulse_scale: f32,
 }
 
 impl Soft {
-    fn new(hertz: f32, damping: f32, dt: f32) -> Self {
+    pub(crate) fn new(hertz: f32, damping: f32, dt: f32) -> Self {
         let omega = TAU * hertz;
         let a1 = 2.0 * damping + dt * omega;
         let a2 = dt * omega * a1;
@@ -560,7 +560,17 @@ impl Rows {
 
     /// One Gauss–Seidel update: limits, then axis alignment, then the anchors
     /// (last solved wins, and a separated anchor is the most visible error).
-    pub(crate) fn solve(&mut self, world: &mut World) {
+    /// `use_bias` false is the soft step's relax pass (Box2D v3): equality rows
+    /// solve rigidly with no position correction, and limits keep only their
+    /// speculative part, so correction velocity isn't carried forward.
+    pub(crate) fn solve(&mut self, world: &mut World, use_bias: bool) {
+        let (mass_scale, impulse_scale) = if use_bias {
+            (self.soft.mass_scale, self.soft.impulse_scale)
+        } else {
+            (1.0, 0.0)
+        };
+        // Position-correction bias, or none when relaxing.
+        let on = if use_bias { 1.0 } else { 0.0 };
         for upper in [false, true] {
             let (row, total) = if upper {
                 (&self.upper, &mut self.impulse.upper)
@@ -570,7 +580,13 @@ impl Rows {
             if let Some(row) = row {
                 let speed =
                     (self.a.angular_velocity(world) - self.b.angular_velocity(world)).dot(row.dir);
-                let next = (*total + (row.bias - speed) * row.mass).max(0.0);
+                // Relaxing keeps a limit's speculative part (bias ≤ 0) only.
+                let bias = if use_bias {
+                    row.bias
+                } else {
+                    row.bias.min(0.0)
+                };
+                let next = (*total + (bias - speed) * row.mass).max(0.0);
                 let applied = next - *total;
                 *total = next;
                 self.a.apply_angular(world, row.dir * applied);
@@ -582,23 +598,23 @@ impl Rows {
             let speed = Vec2::new(spin.dot(align.dirs[0]), spin.dot(align.dirs[1]));
             let total = self.impulse.angular;
             let total = Vec2::new(total.dot(align.dirs[0]), total.dot(align.dirs[1]));
-            let lambda = -self.soft.mass_scale * (align.inv_k * (speed + align.bias))
-                - self.soft.impulse_scale * total;
+            let lambda =
+                -mass_scale * (align.inv_k * (speed + align.bias * on)) - impulse_scale * total;
             let impulse = align.dirs[0] * lambda.x + align.dirs[1] * lambda.y;
             self.impulse.angular += impulse;
             self.twist(world, impulse);
         }
         if let Some(row) = &self.length {
             let speed = (self.a.velocity(world) - self.b.velocity(world)).dot(row.normal);
-            let lambda = -self.soft.mass_scale * row.mass * (speed + row.bias)
-                - self.soft.impulse_scale * self.impulse.distance;
+            let lambda = -mass_scale * row.mass * (speed + row.bias * on)
+                - impulse_scale * self.impulse.distance;
             self.impulse.distance += lambda;
             self.push(world, row.normal * lambda);
         }
         if let Some(point) = &self.point {
             let velocity = self.a.velocity(world) - self.b.velocity(world);
-            let lambda = -self.soft.mass_scale * (point.inv_k * (velocity + point.bias))
-                - self.soft.impulse_scale * self.impulse.point;
+            let lambda = -mass_scale * (point.inv_k * (velocity + point.bias * on))
+                - impulse_scale * self.impulse.point;
             self.impulse.point += lambda;
             self.push(world, lambda);
         }

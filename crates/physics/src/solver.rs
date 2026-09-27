@@ -19,7 +19,7 @@ const SLOP: f32 = 0.005;
 const BAUMGARTE: f32 = 0.2;
 /// Max distance (m, in each body's local frame) for a contact point to count as
 /// the same point it was last step.
-const MATCH_DISTANCE: f32 = 0.02;
+pub(crate) const MATCH_DISTANCE: f32 = 0.02;
 
 /// Which step algorithm runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,11 @@ impl Default for SolverSettings {
             iterations: 10,
             warm_starting: true,
             sleeping: true,
-            mode: SolverMode::Classic,
+            mode: if cfg!(feature = "classic-default") {
+                SolverMode::Classic
+            } else {
+                SolverMode::SoftStep
+            },
             substeps: 4,
         }
     }
@@ -60,17 +64,17 @@ impl Default for SolverSettings {
 
 /// Last step's impulses for one contact point, keyed by where it sits on each body.
 #[derive(Debug, Clone, Copy)]
-struct CachedPoint {
-    local_a: Vec3,
-    local_b: Vec3,
-    normal_impulse: f32,
-    tangent_impulse: [f32; 2],
+pub(crate) struct CachedPoint {
+    pub(crate) local_a: Vec3,
+    pub(crate) local_b: Vec3,
+    pub(crate) normal_impulse: f32,
+    pub(crate) tangent_impulse: [f32; 2],
 }
 
 /// Contact points from the previous step, per body pair.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContactCache {
-    pairs: HashMap<(BodyHandle, BodyHandle), Vec<CachedPoint>>,
+    pub(crate) pairs: HashMap<(BodyHandle, BodyHandle), Vec<CachedPoint>>,
 }
 
 impl ContactCache {
@@ -167,7 +171,7 @@ pub(crate) fn tangent_basis(n: Vec3) -> [Vec3; 2] {
     [t1, n.cross(t1)]
 }
 
-fn local_point(world: &World, handle: BodyHandle, point: Vec3) -> Option<Vec3> {
+pub(crate) fn local_point(world: &World, handle: BodyHandle, point: Vec3) -> Option<Vec3> {
     let body = world.body(handle)?;
     Some(body.orientation().inverse() * (point - body.position()))
 }
@@ -271,10 +275,10 @@ pub(crate) fn solve(
     // penetration is the more visible error.
     for iteration in 0..settings.iterations.max(1) {
         if iteration % 2 == 0 {
-            rows.iter_mut().for_each(|r| r.solve(world));
+            rows.iter_mut().for_each(|r| r.solve(world, true));
             points.iter_mut().for_each(|p| solve_point(world, p));
         } else {
-            rows.iter_mut().rev().for_each(|r| r.solve(world));
+            rows.iter_mut().rev().for_each(|r| r.solve(world, true));
             points.iter_mut().rev().for_each(|p| solve_point(world, p));
         }
     }
