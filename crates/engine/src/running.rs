@@ -818,6 +818,7 @@ impl Running {
             iterations: self.settings.iterations,
             warm_starting: self.settings.warm_starting,
             sleeping: self.settings.sleeping,
+            ..self.world.solver_settings()
         };
         if self.world.solver_settings() != solver {
             self.world.set_solver_settings(solver);

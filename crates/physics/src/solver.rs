@@ -21,15 +21,29 @@ const BAUMGARTE: f32 = 0.2;
 /// the same point it was last step.
 const MATCH_DISTANCE: f32 = 0.02;
 
+/// Which step algorithm runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverMode {
+    /// One velocity solve per step (`iterations` sweeps), Baumgarte position
+    /// correction (M4).
+    Classic,
+    /// Box2D v3-style soft step: `substeps` substeps of soft contacts and
+    /// joints, then a relax pass and a restitution pass (M11).
+    SoftStep,
+}
+
 /// Solver knobs, exposed so the demo can show what each one buys.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolverSettings {
-    /// Velocity iterations per step (≥ 1).
+    /// Velocity iterations per step (≥ 1; classic mode).
     pub iterations: usize,
     /// Start each step from last step's impulses.
     pub warm_starting: bool,
     /// Let resting islands fall asleep.
     pub sleeping: bool,
+    pub mode: SolverMode,
+    /// Substeps per step (≥ 1; soft-step mode).
+    pub substeps: usize,
 }
 
 impl Default for SolverSettings {
@@ -38,6 +52,8 @@ impl Default for SolverSettings {
             iterations: 10,
             warm_starting: true,
             sleeping: true,
+            mode: SolverMode::Classic,
+            substeps: 4,
         }
     }
 }

@@ -13,6 +13,9 @@ use crate::raycast::{RayHit, ray_shape};
 use crate::solver::{self, ContactCache, SolverSettings};
 use crate::union_find::UnionFind;
 
+/// Upper bound on soft-step substeps per step.
+pub const MAX_SUBSTEPS: usize = 16;
+
 pub const DEFAULT_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 
 /// Below these speeds (m/s, rad/s) for `SLEEP_TIME` seconds, an island may sleep.
@@ -164,6 +167,7 @@ impl World {
     pub fn set_solver_settings(&mut self, settings: SolverSettings) {
         self.settings = SolverSettings {
             iterations: settings.iterations.max(1),
+            substeps: settings.substeps.clamp(1, MAX_SUBSTEPS),
             ..settings
         };
         if !settings.warm_starting {

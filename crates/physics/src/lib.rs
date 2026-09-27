@@ -26,5 +26,5 @@ pub use contact::{Contact, find_contacts};
 pub use hull::{ConvexHull, HullError, HullFace, MAX_HULL_POINTS};
 pub use joint::{Cone, JointDesc, JointError, JointId, JointKind};
 pub use raycast::RayHit;
-pub use solver::SolverSettings;
-pub use world::{BodyHandle, DEFAULT_GRAVITY, StepStats, World};
+pub use solver::{SolverMode, SolverSettings};
+pub use world::{BodyHandle, DEFAULT_GRAVITY, MAX_SUBSTEPS, StepStats, World};
