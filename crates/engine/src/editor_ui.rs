@@ -4,7 +4,9 @@
 use glam::Vec3;
 use impulse_physics::World;
 
-use crate::editor::Editor;
+use std::collections::HashSet;
+
+use crate::editor::{Editor, ReparentError, is_within};
 use crate::scene::{SceneObject, default_name};
 use crate::scene_desc::{BodyType, JointKindSpec, ModelCollider, ObjectDesc, SceneDesc, ShapeDesc};
 
@@ -13,6 +15,8 @@ use crate::scene_desc::{BodyType, JointKindSpec, ModelCollider, ObjectDesc, Scen
 pub enum InspectorAction {
     Duplicate,
     Delete,
+    /// Move the selection under this parent (`None`: top level).
+    Reparent(Option<usize>),
 }
 
 /// Shapes the editor can add.
@@ -139,7 +143,7 @@ impl ShapeKind {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Anchor => "none (anchor)",
+            Self::Anchor => "none (empty)",
             Self::Sphere => "sphere",
             Self::Box => "box",
             Self::Capsule => "capsule",
@@ -218,7 +222,7 @@ pub fn filtered_objects(desc: &SceneDesc, filter: &str) -> Vec<usize> {
 
 fn kind_tag(shape: &Option<ShapeDesc>) -> &'static str {
     match ShapeKind::of(shape) {
-        ShapeKind::Anchor => "anchor",
+        ShapeKind::Anchor => "empty",
         ShapeKind::Sphere => "sphere",
         ShapeKind::Box => "box",
         ShapeKind::Capsule => "capsule",
@@ -227,10 +231,102 @@ fn kind_tag(shape: &Option<ShapeDesc>) -> &'static str {
     }
 }
 
-/// Every object by name; clicking a row selects it. `follow` scrolls the list
-/// to the selection (when it was picked in the viewport). Only visible rows
-/// are laid out, so a 1,000-object scene stays cheap.
-pub fn outliner(ctx: &egui::Context, editor: &mut Editor, filter: &mut String, follow: bool) {
+/// One row of the objects tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeRow {
+    pub index: usize,
+    pub depth: usize,
+    pub has_children: bool,
+}
+
+/// The objects in tree order: each object followed by its children (list
+/// order), skipping the children of `collapsed` objects. Objects unreachable
+/// from the top level (only possible with a cycle) are listed at depth 0.
+pub fn tree_rows(desc: &SceneDesc, collapsed: &HashSet<usize>) -> Vec<TreeRow> {
+    let n = desc.objects.len();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots = Vec::new();
+    for (i, object) in desc.objects.iter().enumerate() {
+        match object.parent {
+            Some(p) if p < n && p != i => children[p].push(i),
+            _ => roots.push(i),
+        }
+    }
+    let mut rows = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&r| (r, 0)).collect();
+    loop {
+        while let Some((i, depth)) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            rows.push(TreeRow {
+                index: i,
+                depth,
+                has_children: !children[i].is_empty(),
+            });
+            if !collapsed.contains(&i) {
+                stack.extend(children[i].iter().rev().map(|&c| (c, depth + 1)));
+            }
+        }
+        // Anything left is in a cycle (or under a collapsed row): only
+        // cycles need listing.
+        match (0..n).find(|&i| !seen[i] && !under_collapsed(desc, i, collapsed)) {
+            Some(i) => stack.push((i, 0)),
+            None => break,
+        }
+    }
+    rows
+}
+
+fn under_collapsed(desc: &SceneDesc, i: usize, collapsed: &HashSet<usize>) -> bool {
+    let mut current = desc.objects[i].parent;
+    for _ in 0..desc.objects.len() {
+        match current {
+            Some(p) if p < desc.objects.len() => {
+                if collapsed.contains(&p) {
+                    return true;
+                }
+                current = desc.objects[p].parent;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// "bridge › plank 4": an object's ancestors and name.
+pub fn path(desc: &SceneDesc, index: usize) -> String {
+    let mut names = vec![desc.objects[index].name.as_str()];
+    let mut current = desc.objects[index].parent;
+    for _ in 0..desc.objects.len() {
+        let Some(p) = current.filter(|&p| p < desc.objects.len()) else {
+            break;
+        };
+        names.push(desc.objects[p].name.as_str());
+        current = desc.objects[p].parent;
+    }
+    names.reverse();
+    names.join(" \u{203a} ")
+}
+
+/// Payload of a row being dragged (the object index).
+#[derive(Debug, Clone, Copy)]
+struct RowDrag(usize);
+
+/// The objects tree: click a row to select; drag a row onto another to make
+/// it that object's child, or onto "(top level)" to unparent (the object
+/// stays where it is in the world). With a filter, matches are listed flat
+/// with their paths. `follow` scrolls to (and expands down to) the selection.
+/// Returns a message when a drop is refused.
+pub fn outliner(
+    ctx: &egui::Context,
+    editor: &mut Editor,
+    filter: &mut String,
+    collapsed: &mut HashSet<usize>,
+    follow: bool,
+) -> Option<String> {
+    let mut message = None;
     egui::Window::new("objects")
         .anchor(egui::Align2::LEFT_BOTTOM, [12.0, -12.0])
         .resizable(false)
@@ -240,7 +336,29 @@ pub fn outliner(ctx: &egui::Context, editor: &mut Editor, filter: &mut String, f
                     .hint_text("filter by name")
                     .desired_width(200.0),
             );
-            let rows = filtered_objects(editor.desc(), filter);
+            let filtering = !filter.trim().is_empty();
+            if follow && let Some(selected) = editor.selected() {
+                // Show the selection: expand its ancestors.
+                // Bounded, so a (corrupt) parent loop can't hang it.
+                let mut current = editor.desc().objects.get(selected).and_then(|o| o.parent);
+                for _ in 0..editor.desc().objects.len() {
+                    let Some(p) = current else { break };
+                    collapsed.remove(&p);
+                    current = editor.desc().objects.get(p).and_then(|o| o.parent);
+                }
+            }
+            let rows: Vec<TreeRow> = if filtering {
+                filtered_objects(editor.desc(), filter)
+                    .into_iter()
+                    .map(|index| TreeRow {
+                        index,
+                        depth: 0,
+                        has_children: false,
+                    })
+                    .collect()
+            } else {
+                tree_rows(editor.desc(), collapsed)
+            };
             let row_height =
                 ui.text_style_height(&egui::TextStyle::Button) + ui.spacing().item_spacing.y;
             let mut area = egui::ScrollArea::vertical()
@@ -248,30 +366,106 @@ pub fn outliner(ctx: &egui::Context, editor: &mut Editor, filter: &mut String, f
                 .auto_shrink([false, true]);
             if follow
                 && let Some(selected) = editor.selected()
-                && let Some(row) = rows.iter().position(|&i| i == selected)
+                && let Some(row) = rows.iter().position(|r| r.index == selected)
             {
-                // Put the selection a couple of rows below the top.
                 area = area.vertical_scroll_offset((row as f32 - 2.0).max(0.0) * row_height);
             }
             let mut clicked = None;
+            let mut toggled = None;
+            let mut dropped: Option<(usize, Option<usize>)> = None;
+            if !filtering {
+                let top = ui.weak("(top level) — drop here to unparent");
+                let top = ui.interact(top.rect, top.id.with("drop"), egui::Sense::hover());
+                if let Some(drag) = top.dnd_release_payload::<RowDrag>() {
+                    dropped = Some((drag.0, None));
+                } else if top.dnd_hover_payload::<RowDrag>().is_some() {
+                    ui.painter().rect_stroke(
+                        top.rect,
+                        2.0,
+                        ui.visuals().selection.stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
             area.show_rows(ui, row_height, rows.len(), |ui, range| {
-                for &index in &rows[range] {
-                    let object = &editor.desc().objects[index];
-                    let label = format!("{}   {}", object.name, kind_tag(&object.shape));
-                    let selected = editor.selected() == Some(index);
-                    if ui.selectable_label(selected, label).clicked() {
-                        clicked = Some(index);
-                    }
+                for row in &rows[range] {
+                    let object = &editor.desc().objects[row.index];
+                    let label = if filtering {
+                        format!(
+                            "{}   {}",
+                            path(editor.desc(), row.index),
+                            kind_tag(&object.shape)
+                        )
+                    } else {
+                        format!("{}   {}", object.name, kind_tag(&object.shape))
+                    };
+                    let selected = editor.selected() == Some(row.index);
+                    ui.horizontal(|ui| {
+                        ui.add_space(row.depth as f32 * INDENT);
+                        if row.has_children {
+                            let arrow = if collapsed.contains(&row.index) {
+                                "▸"
+                            } else {
+                                "▾"
+                            };
+                            if ui.small_button(arrow).clicked() {
+                                toggled = Some(row.index);
+                            }
+                        } else if !filtering {
+                            ui.add_space(ARROW_WIDTH);
+                        }
+                        let response = ui
+                            .selectable_label(selected, label)
+                            .interact(egui::Sense::drag());
+                        response.dnd_set_drag_payload(RowDrag(row.index));
+                        if response.clicked() {
+                            clicked = Some(row.index);
+                        }
+                        if let Some(drag) = response.dnd_release_payload::<RowDrag>() {
+                            dropped = Some((drag.0, Some(row.index)));
+                        } else if response.dnd_hover_payload::<RowDrag>().is_some() {
+                            ui.painter().rect_stroke(
+                                response.rect,
+                                2.0,
+                                ui.visuals().selection.stroke,
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                    });
                 }
             });
             if rows.is_empty() {
                 ui.label("no matching objects");
             }
+            if let Some(index) = toggled
+                && !collapsed.remove(&index)
+            {
+                collapsed.insert(index);
+            }
             if let Some(index) = clicked {
                 editor.select(Some(index));
             }
+            if let Some((child, parent)) = dropped
+                && Some(child) != parent
+            {
+                match editor.reparent(child, parent) {
+                    Ok(_) => editor.select(Some(child)),
+                    Err(ReparentError::IntoOwnSubtree) => {
+                        message = Some(format!(
+                            "can't put '{}' inside itself or its own children",
+                            editor.desc().objects[child].name
+                        ));
+                    }
+                    Err(ReparentError::NoSuchObject) => {}
+                }
+            }
         });
+    message
 }
+
+/// Indentation per tree level, and the width of an expand arrow (points).
+const INDENT: f32 = 14.0;
+const ARROW_WIDTH: f32 = 18.0;
 
 /// Rows visible in the objects list before it scrolls.
 const ROWS_SHOWN: f32 = 12.0;
@@ -304,6 +498,15 @@ pub fn inspector(
         .collect();
     let mut action = None;
     let mut remove_joint = None;
+    let editor_names: Vec<String> = editor
+        .desc()
+        .objects
+        .iter()
+        .map(|o| o.name.clone())
+        .collect();
+    let candidate_parent: Vec<bool> = (0..editor_names.len())
+        .map(|p| !is_within(editor.desc(), p, index))
+        .collect();
     egui::Window::new("inspector")
         .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
         .resizable(false)
@@ -389,10 +592,44 @@ pub fn inspector(
                     });
                 }
                 None => {
-                    ui.label("invisible, no collisions");
+                    ui.label("empty: invisible, no collisions (a folder or joint anchor)");
                 }
             }
-            vec3_row(ui, "position", &mut o.position, 0.05, -1000.0);
+            // Parent: anything but this object and its descendants.
+            let parent_name = |p: Option<usize>| match p {
+                Some(p) => editor_names.get(p).cloned().unwrap_or_default(),
+                None => "(top level)".to_string(),
+            };
+            egui::ComboBox::from_label("parent")
+                .selected_text(parent_name(o.parent))
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(o.parent.is_none(), "(top level)")
+                        .clicked()
+                        && o.parent.is_some()
+                    {
+                        action = Some(InspectorAction::Reparent(None));
+                    }
+                    for (p, name) in editor_names.iter().enumerate() {
+                        if candidate_parent[p]
+                            && ui.selectable_label(o.parent == Some(p), name).clicked()
+                            && o.parent != Some(p)
+                        {
+                            action = Some(InspectorAction::Reparent(Some(p)));
+                        }
+                    }
+                });
+            let relative = match o.parent {
+                Some(p) => format!(" (relative to '{}')", parent_name(Some(p))),
+                None => String::new(),
+            };
+            vec3_row(
+                ui,
+                &format!("position{relative}"),
+                &mut o.position,
+                0.05,
+                -1000.0,
+            );
             vec3_row(ui, "rotation°", &mut o.rotation_deg, 1.0, -1000.0);
             let mut fixed = matches!(o.body, BodyType::Static);
             if ui.checkbox(&mut fixed, "static").changed() {
@@ -469,6 +706,7 @@ pub fn inspector(
 mod tests {
     use super::*;
     use crate::scene_desc::{Arena, SCENE_VERSION, SceneDesc, build_world};
+    use std::collections::HashSet;
 
     #[test]
     fn picking_finds_the_object_under_the_ray_and_ignores_the_arena() {
@@ -554,7 +792,13 @@ mod tests {
         let mut filter = String::new();
         for follow in [true, false, false] {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                outliner(ui.ctx(), &mut editor, &mut filter, follow);
+                outliner(
+                    ui.ctx(),
+                    &mut editor,
+                    &mut filter,
+                    &mut HashSet::new(),
+                    follow,
+                );
             });
             output.textures_delta.clear();
         }
@@ -582,6 +826,58 @@ mod tests {
         assert!((object.position[1] - (1.0 + size.y / 2.0 + 0.05)).abs() < 1e-4);
         assert_eq!(object.name, "barrel 4");
         assert_eq!(object.color, [1.0; 3]);
+    }
+
+    fn tree_desc() -> SceneDesc {
+        let node = |name: &str, parent: Option<usize>| ObjectDesc {
+            name: name.into(),
+            parent,
+            ..ObjectDesc::default()
+        };
+        SceneDesc {
+            version: SCENE_VERSION,
+            name: "t".into(),
+            arena: Arena::Empty,
+            // Children listed before their parents too: tree order comes from
+            // the links, not the list.
+            objects: vec![
+                node("b", Some(2)),
+                node("x", None),
+                node("a", None),
+                node("c", Some(0)),
+                node("d", Some(2)),
+            ],
+            joints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tree_rows_nest_children_under_parents() {
+        let desc = tree_desc();
+        let rows = tree_rows(&desc, &HashSet::new());
+        let shape: Vec<_> = rows
+            .iter()
+            .map(|r| (desc.objects[r.index].name.as_str(), r.depth))
+            .collect();
+        assert_eq!(shape, [("x", 0), ("a", 0), ("b", 1), ("c", 2), ("d", 1)]);
+        assert!(rows[1].has_children && !rows[4].has_children);
+
+        let collapsed: HashSet<usize> = [2].into();
+        let names: Vec<_> = tree_rows(&desc, &collapsed)
+            .iter()
+            .map(|r| desc.objects[r.index].name.as_str())
+            .collect();
+        assert_eq!(names, ["x", "a"], "a collapsed hides b, c, d");
+        assert_eq!(path(&desc, 3), "a \u{203a} b \u{203a} c");
+    }
+
+    #[test]
+    fn tree_rows_survive_a_cycle() {
+        let mut desc = tree_desc();
+        desc.objects[1].parent = Some(4); // x under d
+        desc.objects[2].parent = Some(1); // a under x: a -> x -> d -> a
+        let rows = tree_rows(&desc, &HashSet::new());
+        assert_eq!(rows.len(), desc.objects.len(), "every object listed once");
     }
 
     #[test]

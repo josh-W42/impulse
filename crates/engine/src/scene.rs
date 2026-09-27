@@ -227,7 +227,7 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
 /// "box 3", "anchor 0": a readable name for unnamed objects.
 pub fn default_name(object: &ObjectDesc, index: usize) -> String {
     let kind = match &object.shape {
-        None => "anchor",
+        None => "empty",
         Some(ShapeDesc::Sphere { .. }) => "sphere",
         Some(ShapeDesc::Box { .. }) => "box",
         Some(ShapeDesc::Capsule { .. }) => "capsule",
@@ -681,6 +681,7 @@ fn push_scenery(list: &mut DrawList, arena: Arena) {
 /// How far a selected object's color moves toward white.
 const SELECTED_TINT: f32 = 0.35;
 const OUTLINE_COLOR: [f32; 4] = [1.0, 0.85, 0.2, 1.0];
+const DESCENDANT_OUTLINE: [f32; 4] = [0.75, 0.6, 0.25, 1.0];
 
 /// Half extents of a collider's bounding box in body space.
 fn local_half_extents(collider: Collider, world: &World) -> Vec3 {
@@ -806,6 +807,7 @@ pub fn build_draw_list(
     objects: &[SceneObject],
     hull_meshes: &HullMeshes,
     model_meshes: &ModelMeshes,
+    descendants: &[usize],
     options: DrawOptions,
 ) {
     let DrawOptions {
@@ -867,6 +869,14 @@ pub fn build_draw_list(
         }
         if selected {
             push_box_outline(list, body_transform, local_half_extents(collider, world));
+        } else if descendants.contains(&index) {
+            // What moves with the selection.
+            push_box_outline_colored(
+                list,
+                body_transform,
+                local_half_extents(collider, world),
+                DESCENDANT_OUTLINE,
+            );
         }
         if show_axes {
             let length = collider_extent(collider);
@@ -1180,6 +1190,7 @@ mod tests {
             &objects,
             &HullMeshes::new(),
             &ModelMeshes::new(),
+            &[],
             DrawOptions {
                 arena: Arena::Pit { half: PIT },
                 selected: None,
