@@ -138,7 +138,6 @@ const STACK_COLORS: [[f32; 4]; 3] = [
     [0.30, 0.55, 0.75, 1.0],
 ];
 
-/// A demo as a scene description. Deterministic.
 /// Half-size of the floor object a new scene starts with (m).
 pub const NEW_FLOOR_HALF: f32 = FLOOR_SIZE / 2.0;
 
@@ -169,7 +168,24 @@ pub fn empty_desc() -> SceneDesc {
 /// Default pit half-width when switching an open floor to a pit.
 pub const DEFAULT_PIT: f32 = PIT;
 
+/// A demo as a scene description. Deterministic.
 pub fn demo_desc(demo: Demo) -> SceneDesc {
+    let mut desc = demo_world_desc(demo);
+    crate::scene_desc::localize_joints(&mut desc);
+    desc.version = SCENE_VERSION;
+    if demo == Demo::Joints {
+        // Grouped after the joints are localized: nothing moves.
+        let (_, _, parents) = crate::joint_scene::joint_objects();
+        for (child, parent) in parents {
+            crate::scene_desc::set_parent_keep_world(&mut desc, child, Some(parent));
+        }
+    }
+    desc
+}
+
+/// A demo with world-space joints, i.e. the v1 format (the generators author
+/// joints in world space).
+pub fn demo_world_desc(demo: Demo) -> SceneDesc {
     let (objects, joints) = match demo {
         Demo::Pit => (pit_objects(), Vec::new()),
         Demo::Tower => (
@@ -190,12 +206,15 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
             (objects, Vec::new())
         }
         Demo::Rain => (rain_objects(), Vec::new()),
-        Demo::Joints => crate::joint_scene::joint_objects(),
+        Demo::Joints => {
+            let (objects, joints, _) = crate::joint_scene::joint_objects();
+            (objects, joints)
+        }
         Demo::Props => (props_objects(), Vec::new()),
         Demo::Materials => (materials_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
-        version: SCENE_VERSION,
+        version: 1,
         name: demo.label().to_string(),
         // The chart is for looking at: no walls in the way.
         arena: match demo {
@@ -218,7 +237,7 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
 /// "box 3", "anchor 0": a readable name for unnamed objects.
 pub fn default_name(object: &ObjectDesc, index: usize) -> String {
     let kind = match &object.shape {
-        None => "anchor",
+        None => "empty",
         Some(ShapeDesc::Sphere { .. }) => "sphere",
         Some(ShapeDesc::Box { .. }) => "box",
         Some(ShapeDesc::Capsule { .. }) => "capsule",
@@ -672,6 +691,7 @@ fn push_scenery(list: &mut DrawList, arena: Arena) {
 /// How far a selected object's color moves toward white.
 const SELECTED_TINT: f32 = 0.35;
 const OUTLINE_COLOR: [f32; 4] = [1.0, 0.85, 0.2, 1.0];
+const DESCENDANT_OUTLINE: [f32; 4] = [0.75, 0.6, 0.25, 1.0];
 
 /// Half extents of a collider's bounding box in body space.
 fn local_half_extents(collider: Collider, world: &World) -> Vec3 {
@@ -797,6 +817,7 @@ pub fn build_draw_list(
     objects: &[SceneObject],
     hull_meshes: &HullMeshes,
     model_meshes: &ModelMeshes,
+    descendants: &[usize],
     options: DrawOptions,
 ) {
     let DrawOptions {
@@ -858,6 +879,14 @@ pub fn build_draw_list(
         }
         if selected {
             push_box_outline(list, body_transform, local_half_extents(collider, world));
+        } else if descendants.contains(&index) {
+            // What moves with the selection.
+            push_box_outline_colored(
+                list,
+                body_transform,
+                local_half_extents(collider, world),
+                DESCENDANT_OUTLINE,
+            );
         }
         if show_axes {
             let length = collider_extent(collider);
@@ -973,9 +1002,10 @@ mod tests {
         let mut world = World::default();
         let objects = build(&mut world, Demo::Joints);
         let posts = 3;
+        let bridge_group = 1;
         assert_eq!(
             objects.len(),
-            posts + CHAIN_LINKS + PLANKS + CRATES + RAGDOLL_PARTS
+            posts + bridge_group + CHAIN_LINKS + PLANKS + CRATES + RAGDOLL_PARTS
         );
         let gaps = |w: &World| -> Vec<f32> {
             w.joints()
@@ -1091,6 +1121,74 @@ mod tests {
         );
     }
 
+    /// Every demo written as a v1 file (world-space joints) loads, migrates,
+    /// and builds the same world: bodies where authored, every joint's
+    /// anchors at its authored world points.
+    #[test]
+    fn v1_demos_migrate_to_the_same_world() {
+        use crate::scene_desc::{JointKindSpec, from_ron, to_ron};
+        for demo in Demo::ALL {
+            let v1 = demo_world_desc(demo);
+            let migrated = from_ron(&to_ron(&v1)).unwrap();
+            assert_eq!(migrated.version, SCENE_VERSION);
+            let (world, objects) =
+                crate::scene_desc::build_world(&migrated, &crate::models::ModelRegistry::bundled())
+                    .unwrap();
+            for (o, authored) in objects.iter().zip(&v1.objects) {
+                let p = world.body(o.handle).unwrap().position();
+                assert!(
+                    p.abs_diff_eq(Vec3::from_array(authored.position), 1e-4),
+                    "{demo:?}"
+                );
+            }
+            for (id, joint) in world.joints().zip(&v1.joints) {
+                let (pa, pb) = world.joint_anchors(id).unwrap();
+                let (want_a, want_b) = match joint.kind {
+                    JointKindSpec::BallSocket { pivot, .. }
+                    | JointKindSpec::Hinge { pivot, .. } => {
+                        (Vec3::from_array(pivot), Vec3::from_array(pivot))
+                    }
+                    JointKindSpec::Distance { anchor_a, anchor_b } => {
+                        (Vec3::from_array(anchor_a), Vec3::from_array(anchor_b))
+                    }
+                };
+                assert!(
+                    pa.abs_diff_eq(want_a, 1e-4) && pb.abs_diff_eq(want_b, 1e-4),
+                    "{demo:?}: {pa} {pb} vs {want_a} {want_b}"
+                );
+            }
+        }
+    }
+
+    /// Grouping the Joints demo (ragdoll skeleton, bridge under an empty)
+    /// changes nothing in the built world.
+    #[test]
+    fn the_grouped_joints_demo_builds_the_same_world_as_flat() {
+        use crate::scene_desc::{build_world, from_ron, to_ron};
+        let grouped = demo_desc(Demo::Joints);
+        assert!(
+            grouped
+                .objects
+                .iter()
+                .filter(|o| o.parent.is_some())
+                .count()
+                >= 15
+        );
+        let flat = from_ron(&to_ron(&demo_world_desc(Demo::Joints))).unwrap();
+        let registry = crate::models::ModelRegistry::default();
+        let (a, oa) = build_world(&grouped, &registry).unwrap();
+        let (b, ob) = build_world(&flat, &registry).unwrap();
+        for (x, y) in oa.iter().zip(&ob) {
+            let (x, y) = (a.body(x.handle).unwrap(), b.body(y.handle).unwrap());
+            assert!(x.position().abs_diff_eq(y.position(), 1e-4));
+            assert!(x.orientation().abs_diff_eq(y.orientation(), 1e-4));
+        }
+        for (i, j) in a.joints().zip(b.joints()) {
+            let (pa, pb) = (a.joint_anchors(i).unwrap(), b.joint_anchors(j).unwrap());
+            assert!(pa.0.abs_diff_eq(pb.0, 1e-4) && pa.1.abs_diff_eq(pb.1, 1e-4));
+        }
+    }
+
     #[test]
     fn stack_scenes_build_the_expected_bodies() {
         let mut world = World::default();
@@ -1132,6 +1230,7 @@ mod tests {
             &objects,
             &HullMeshes::new(),
             &ModelMeshes::new(),
+            &[],
             DrawOptions {
                 arena: Arena::Pit { half: PIT },
                 selected: None,

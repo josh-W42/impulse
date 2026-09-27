@@ -83,6 +83,7 @@ enum Action {
     Undo,
     Redo,
     Add(NewShape),
+    AddEmpty,
     AddModel(crate::models::ModelId),
     /// Desktop: import a `.glb` from the `models/` folder and add it.
     ImportFile(usize),
@@ -163,6 +164,8 @@ pub struct Running {
     modifiers: ModifiersState,
     /// Objects-list filter text.
     list_filter: String,
+    /// Tree rows whose children are hidden.
+    collapsed: std::collections::HashSet<usize>,
     /// Bundled and imported models, and their render meshes.
     models: ModelRegistry,
     model_meshes: ModelMeshes,
@@ -236,6 +239,7 @@ impl Running {
             message: None,
             modifiers: ModifiersState::empty(),
             list_filter: String::new(),
+            collapsed: Default::default(),
             models,
             model_meshes: ModelMeshes::new(),
             listed: None,
@@ -468,7 +472,8 @@ impl Running {
         let hit = editor_ui::object_at(&self.world, &self.objects, origin, dir);
         match hit {
             Some((index, point)) if self.editor.selected() == Some(index) => {
-                let start = Vec3::from_array(self.editor.desc().objects[index].position);
+                let start = scene_desc::world_poses(self.editor.desc())
+                    .map_or(point, |poses| poses[index].0);
                 let vertical = self.modifiers.shift_key();
                 self.editor.begin();
                 self.edit_drag = Some(EditDrag {
@@ -509,8 +514,17 @@ impl Running {
         if drag.vertical {
             delta = Vec3::new(0.0, delta.y, 0.0);
         }
-        let position = (drag.start + delta).to_array();
         let index = drag.object;
+        let target = drag.start + delta;
+        let desc = self.editor.desc();
+        let position = match desc.objects.get(index).and_then(|o| o.parent) {
+            Some(p) => match scene_desc::world_poses(desc) {
+                Ok(poses) => poses[p].1.inverse() * (target - poses[p].0),
+                Err(_) => return,
+            },
+            None => target,
+        }
+        .to_array();
         if self
             .editor
             .desc()
@@ -649,6 +663,19 @@ impl Running {
                 }
             }
             Action::Open(kind) => platform::pick_file(kind),
+            Action::AddEmpty => {
+                let target = self.camera.orbit.target;
+                self.editor.add_empty(Vec3::new(target.x, 1.0, target.z));
+            }
+            Action::Inspector(InspectorAction::Reparent(parent)) => {
+                if let Some(child) = self.editor.selected()
+                    && let Err(crate::editor::ReparentError::IntoOwnSubtree) =
+                        self.editor.reparent(child, parent)
+                {
+                    self.message =
+                        Some("can't put an object inside itself or its own children".into());
+                }
+            }
             Action::AddModel(id) => {
                 let target = self.camera.orbit.target;
                 let above = Vec3::new(target.x, 100.0, target.z);
@@ -888,12 +915,21 @@ impl Running {
             drag.target = origin + dir * drag.distance;
         }
         self.step_physics(dt);
+        // Outline what moves with the selection (edit mode).
+        let descendants: Vec<usize> = match (self.mode, self.editor.selected()) {
+            (Mode::Edit, Some(selected)) => crate::editor::subtree(self.editor.desc(), selected)
+                .into_iter()
+                .filter(|&i| i != selected)
+                .collect(),
+            _ => Vec::new(),
+        };
         scene::build_draw_list(
             &mut self.draw_list,
             &self.world,
             &self.objects,
             &self.hull_meshes,
             &self.model_meshes,
+            &descendants,
             scene::DrawOptions {
                 arena: self.editor.desc().arena,
                 selected: match self.mode {
@@ -942,16 +978,18 @@ impl Running {
         };
         let mut actions = Vec::new();
         let follow = self.editor.selected() != self.listed;
-        let (settings, editor, mode, filter) = (
+        let (settings, editor, mode, filter, collapsed) = (
             &mut self.settings,
             &mut self.editor,
             self.mode,
             &mut self.list_filter,
+            &mut self.collapsed,
         );
+        let mut list_message = None;
         let output = self.egui_ctx.run_ui(raw, |ui| {
             panel(ui, settings, &stats, &mut actions);
             if mode == Mode::Edit {
-                editor_ui::outliner(ui.ctx(), editor, filter, follow);
+                list_message = editor_ui::outliner(ui.ctx(), editor, filter, collapsed, follow);
                 let names: Vec<&str> = stats.models.iter().map(|(_, n, _)| n.as_str()).collect();
                 if let Some(action) = editor_ui::inspector(ui.ctx(), editor, &names) {
                     actions.push(Action::Inspector(action));
@@ -959,6 +997,9 @@ impl Running {
             }
         });
         self.listed = self.editor.selected();
+        if list_message.is_some() {
+            self.message = list_message;
+        }
         for action in actions {
             self.apply(action);
         }
@@ -1053,6 +1094,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                         if ui.button(shape.label()).clicked() {
                             actions.push(Action::Add(shape));
                         }
+                    }
+                    if ui.button("Empty").clicked() {
+                        actions.push(Action::AddEmpty);
                     }
                     // Loaded models, then (desktop) files in models/ not yet
                     // imported: picking one imports and adds it.

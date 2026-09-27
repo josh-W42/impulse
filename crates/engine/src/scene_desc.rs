@@ -15,7 +15,10 @@ use crate::pose::Pose;
 use crate::scene::{STATIC_MATERIAL, SceneObject, pit_planes};
 
 /// Bumped when the file format changes incompatibly.
-pub const SCENE_VERSION: u32 = 1;
+/// v2: poses are relative to the parent; joint points and axes are relative
+/// to their bodies. v1 files (world-space joints, no parents) are migrated on
+/// load.
+pub const SCENE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneDesc {
@@ -42,6 +45,10 @@ pub enum Arena {
 #[serde(default)]
 pub struct ObjectDesc {
     pub name: String,
+    /// Index of the parent object: `position` and `rotation_deg` are relative
+    /// to it (to the world when `None`). Edit-time only: at Play every body
+    /// is independent.
+    pub parent: Option<usize>,
     /// `None`: an invisible, collision-free body (e.g. a rope's hook point).
     pub shape: Option<ShapeDesc>,
     pub position: [f32; 3],
@@ -63,6 +70,7 @@ impl Default for ObjectDesc {
         let material = Material::default();
         Self {
             name: String::new(),
+            parent: None,
             shape: None,
             position: [0.0; 3],
             rotation_deg: [0.0; 3],
@@ -265,6 +273,10 @@ pub enum ObjectError {
     MissingModel(String),
     /// Model scale must be finite and positive.
     InvalidScale,
+    /// `parent` names an object index past the end of the list.
+    NoSuchParent(usize),
+    /// Following parents leads back to this object.
+    ParentCycle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -292,6 +304,8 @@ impl fmt::Display for SceneError {
                         write!(f, "model '{model}' isn't loaded; import it first")
                     }
                     ObjectError::InvalidScale => write!(f, "scale must be positive"),
+                    ObjectError::NoSuchParent(p) => write!(f, "there is no parent object {p}"),
+                    ObjectError::ParentCycle => write!(f, "it is its own ancestor"),
                 }
             }
             Self::Joint { index, error } => {
@@ -339,11 +353,133 @@ pub fn from_ron(text: &str) -> Result<SceneDesc, SceneError> {
             MAX_SCENE_BYTES / (1024 * 1024)
         )));
     }
-    let desc: SceneDesc = ron::from_str(text).map_err(|e| SceneError::Parse(e.to_string()))?;
-    if desc.version != SCENE_VERSION {
-        return Err(SceneError::UnsupportedVersion(desc.version));
+    let mut desc: SceneDesc = ron::from_str(text).map_err(|e| SceneError::Parse(e.to_string()))?;
+    match desc.version {
+        1 => {
+            // v1 joints are world-space at the authored poses.
+            localize_joints(&mut desc);
+            desc.version = SCENE_VERSION;
+        }
+        SCENE_VERSION => {}
+        other => return Err(SceneError::UnsupportedVersion(other)),
     }
     Ok(desc)
+}
+
+/// A rigid pose: world = `position + rotation * local`.
+pub type Pose3 = (Vec3, Quat);
+
+fn compose((position, rotation): Pose3, (local_p, local_q): Pose3) -> Pose3 {
+    (position + rotation * local_p, rotation * local_q)
+}
+
+fn to_local((position, rotation): Pose3, world_point: Vec3) -> Vec3 {
+    rotation.inverse() * (world_point - position)
+}
+
+fn to_world((position, rotation): Pose3, local_point: Vec3) -> Vec3 {
+    position + rotation * local_point
+}
+
+/// Every object's world pose: its local pose composed with its ancestors'.
+/// Fails on a missing parent or a cycle, naming the object.
+pub fn world_poses(desc: &SceneDesc) -> Result<Vec<Pose3>, SceneError> {
+    let n = desc.objects.len();
+    let fail = |index: usize, error| SceneError::Object {
+        index,
+        name: desc.objects[index].name.clone(),
+        error,
+    };
+    let mut world: Vec<Option<Pose3>> = vec![None; n];
+    for start in 0..n {
+        // Walk up to a resolved ancestor or the root, then resolve downward.
+        let mut chain = Vec::new();
+        let mut i = start;
+        while world[i].is_none() {
+            if chain.contains(&i) {
+                return Err(fail(start, ObjectError::ParentCycle));
+            }
+            chain.push(i);
+            match desc.objects[i].parent {
+                None => break,
+                Some(p) if p >= n => return Err(fail(i, ObjectError::NoSuchParent(p))),
+                Some(p) => i = p,
+            }
+        }
+        for &j in chain.iter().rev() {
+            let object = &desc.objects[j];
+            let local = (vec3(object.position), object.orientation());
+            world[j] = Some(match object.parent {
+                None => local,
+                Some(p) => compose(world[p].expect("resolved above"), local),
+            });
+        }
+    }
+    Ok(world
+        .into_iter()
+        .map(|w| w.expect("every object resolved"))
+        .collect())
+}
+
+/// Sets `child`'s parent, rewriting its local pose so it stays where it is in
+/// the world. The caller rules out cycles. False if the scene's parents are
+/// invalid or an index is out of range.
+pub fn set_parent_keep_world(desc: &mut SceneDesc, child: usize, parent: Option<usize>) -> bool {
+    let Ok(world) = world_poses(desc) else {
+        return false;
+    };
+    if child >= world.len() || parent.is_some_and(|p| p >= world.len()) {
+        return false;
+    }
+    let (position, rotation) = world[child];
+    let (position, rotation) = match parent {
+        Some(p) => {
+            let (pp, pq) = world[p];
+            (pq.inverse() * (position - pp), pq.inverse() * rotation)
+        }
+        None => (position, rotation),
+    };
+    let object = &mut desc.objects[child];
+    object.parent = parent;
+    object.position = position.to_array();
+    object.set_orientation(rotation);
+    true
+}
+
+/// Converts world-space joint points and axes (v1, and the demo generators)
+/// into their bodies' frames at the authored poses. Joints with bad indices,
+/// or a scene with bad parents, are left for `build_world` to report.
+pub fn localize_joints(desc: &mut SceneDesc) {
+    let Ok(world) = world_poses(desc) else {
+        return;
+    };
+    for joint in &mut desc.joints {
+        let (Some(&a), Some(&b)) = (world.get(joint.a), world.get(joint.b)) else {
+            continue;
+        };
+        let point = |p: &mut [f32; 3], pose: Pose3| *p = to_local(pose, vec3(*p)).to_array();
+        let axis = |v: &mut [f32; 3]| *v = (a.1.inverse() * vec3(*v)).to_array();
+        match &mut joint.kind {
+            JointKindSpec::BallSocket { pivot, cone } => {
+                point(pivot, a);
+                if let Some((cone_axis, _)) = cone {
+                    axis(cone_axis);
+                }
+            }
+            JointKindSpec::Hinge {
+                pivot,
+                axis: hinge_axis,
+                ..
+            } => {
+                point(pivot, a);
+                axis(hinge_axis);
+            }
+            JointKindSpec::Distance { anchor_a, anchor_b } => {
+                point(anchor_a, a);
+                point(anchor_b, b);
+            }
+        }
+    }
 }
 
 fn vec3(v: [f32; 3]) -> Vec3 {
@@ -380,6 +516,7 @@ fn populate(
     models: &ModelRegistry,
 ) -> Result<Vec<SceneObject>, SceneError> {
     add_arena(world, desc.arena)?;
+    let poses = world_poses(desc)?;
     let mut objects = Vec::with_capacity(desc.objects.len());
     for (index, object) in desc.objects.iter().enumerate() {
         let fail = |error| SceneError::Object {
@@ -422,8 +559,7 @@ fn populate(
                 Some(shape)
             }
         };
-        let position = vec3(object.position);
-        let orientation = object.orientation();
+        let (position, orientation) = poses[index];
         let base = match object.body {
             BodyType::Dynamic { mass } => BodyDesc::dynamic(mass, position),
             BodyType::Static => BodyDesc::fixed(position),
@@ -466,11 +602,15 @@ fn populate(
                 .ok_or(fail(JointSpecError::NoSuchObject(i)))
         };
         let (a, b) = (handle(joint.a)?, handle(joint.b)?);
+        // Stored relative to the bodies; physics takes world space.
+        let (pose_a, pose_b) = (poses[joint.a], poses[joint.b]);
         let spec = match &joint.kind {
             JointKindSpec::BallSocket { pivot, cone } => {
-                let desc = JointDesc::ball_socket(a, b, vec3(*pivot));
+                let desc = JointDesc::ball_socket(a, b, to_world(pose_a, vec3(*pivot)));
                 match cone {
-                    Some((axis, degrees)) => desc.with_cone(vec3(*axis), degrees.to_radians()),
+                    Some((axis, degrees)) => {
+                        desc.with_cone(pose_a.1 * vec3(*axis), degrees.to_radians())
+                    }
                     None => desc,
                 }
             }
@@ -479,15 +619,19 @@ fn populate(
                 axis,
                 limits_deg,
             } => {
-                let desc = JointDesc::hinge(a, b, vec3(*pivot), vec3(*axis));
+                let desc =
+                    JointDesc::hinge(a, b, to_world(pose_a, vec3(*pivot)), pose_a.1 * vec3(*axis));
                 match limits_deg {
                     Some((min, max)) => desc.with_limits(min.to_radians(), max.to_radians()),
                     None => desc,
                 }
             }
-            JointKindSpec::Distance { anchor_a, anchor_b } => {
-                JointDesc::distance(a, b, vec3(*anchor_a), vec3(*anchor_b))
-            }
+            JointKindSpec::Distance { anchor_a, anchor_b } => JointDesc::distance(
+                a,
+                b,
+                to_world(pose_a, vec3(*anchor_a)),
+                to_world(pose_b, vec3(*anchor_b)),
+            ),
         };
         world
             .add_joint(spec.with_collide_connected(joint.collide_connected))
@@ -725,7 +869,7 @@ mod tests {
     #[test]
     fn hand_written_model_objects_default_to_hull_colliders() {
         let text = r#"(
-            version: 1,
+            version: 2,
             name: "one barrel",
             arena: Floor,
             objects: [(shape: Some(Model(name: "barrel", scale: 1.0)), position: (0.0, 1.0, 0.0))],
@@ -747,12 +891,159 @@ mod tests {
         desc.objects[1].metallic = 1.0;
         assert_eq!(from_ron(&to_ron(&desc)).unwrap(), desc);
         // A file from before M9b: no roughness or metallic fields.
-        let old = r#"(version: 1, name: "old", arena: Floor,
+        let old = r#"(version: 2, name: "old", arena: Floor,
             objects: [(shape: Some(Sphere(radius: 0.5)), position: (0.0, 1.0, 0.0))])"#;
         let o = &from_ron(old).unwrap().objects[0];
         assert_eq!((o.roughness, o.metallic), (0.6, 0.0));
         let (_, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
         assert_eq!((objects[1].roughness, objects[1].metallic), (0.2, 1.0));
+    }
+
+    fn object_at(position: [f32; 3], parent: Option<usize>) -> ObjectDesc {
+        ObjectDesc {
+            name: "o".into(),
+            parent,
+            shape: Some(ShapeDesc::Sphere { radius: 0.1 }),
+            position,
+            body: BodyType::Static,
+            ..ObjectDesc::default()
+        }
+    }
+
+    fn scene(objects: Vec<ObjectDesc>, joints: Vec<JointSpec>) -> SceneDesc {
+        SceneDesc {
+            version: SCENE_VERSION,
+            name: "t".into(),
+            arena: Arena::Empty,
+            objects,
+            joints,
+        }
+    }
+
+    #[test]
+    fn world_poses_compose_through_parents() {
+        let mut root = object_at([1.0, 0.0, 0.0], None);
+        root.rotation_deg = [0.0, 90.0, 0.0];
+        let mut child = object_at([1.0, 0.0, 0.0], Some(0));
+        child.rotation_deg = [0.0, 90.0, 0.0];
+        let grandchild = object_at([0.0, 0.0, 1.0], Some(1));
+        let desc = scene(vec![root, child, grandchild], Vec::new());
+        let poses = world_poses(&desc).unwrap();
+        // A quarter turn about +Y takes +X to -Z and +Z to +X.
+        assert!(
+            poses[1].0.abs_diff_eq(Vec3::new(1.0, 0.0, -1.0), 1e-5),
+            "{}",
+            poses[1].0
+        );
+        // The child has turned half a turn in total: its local +Z is world -Z.
+        assert!(
+            poses[2].0.abs_diff_eq(Vec3::new(1.0, 0.0, -2.0), 1e-5),
+            "{}",
+            poses[2].0
+        );
+        let (world, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
+        let built = world.body(objects[2].handle).unwrap();
+        assert!(built.position().abs_diff_eq(poses[2].0, 1e-5));
+        assert!(built.orientation().abs_diff_eq(poses[2].1, 1e-5));
+    }
+
+    #[test]
+    fn bad_parents_are_specific_errors() {
+        let err = |objects: Vec<ObjectDesc>| {
+            build_world(&scene(objects, Vec::new()), &ModelRegistry::default()).unwrap_err()
+        };
+        let object_error = |e: SceneError| match e {
+            SceneError::Object { index, error, .. } => (index, error),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            object_error(err(vec![object_at([0.0; 3], Some(9))])),
+            (0, ObjectError::NoSuchParent(9))
+        );
+        assert_eq!(
+            object_error(err(vec![object_at([0.0; 3], Some(0))])),
+            (0, ObjectError::ParentCycle)
+        );
+        let (_, error) = object_error(err(vec![
+            object_at([0.0; 3], Some(1)),
+            object_at([0.0; 3], Some(0)),
+        ]));
+        assert_eq!(error, ObjectError::ParentCycle);
+    }
+
+    /// Stored relative to body `a`: a subtree moved together keeps its joint;
+    /// moving one side carries the pivot with `a` only.
+    #[test]
+    fn joints_move_with_their_bodies() {
+        let group = ObjectDesc {
+            name: "group".into(),
+            position: [0.0, 5.0, 0.0],
+            body: BodyType::Static,
+            ..ObjectDesc::default()
+        };
+        let mut a = object_at([-0.5, 0.0, 0.0], Some(0));
+        let mut b = object_at([0.5, 0.0, 0.0], Some(0));
+        a.body = BodyType::Dynamic { mass: 1.0 };
+        b.body = BodyType::Dynamic { mass: 1.0 };
+        let joint = JointSpec::ball_socket(1, 2, Vec3::new(0.5, 0.0, 0.0)); // in a's frame
+        let anchors = |desc: &SceneDesc| {
+            let (world, _) = build_world(desc, &ModelRegistry::default()).unwrap();
+            let id = world.joints().next().unwrap();
+            world.joint_anchors(id).unwrap()
+        };
+        let mut desc = scene(vec![group, a, b], vec![joint]);
+        let (pa, pb) = anchors(&desc);
+        assert!(pa.abs_diff_eq(Vec3::new(0.0, 5.0, 0.0), 1e-5) && pa.abs_diff_eq(pb, 1e-5));
+
+        desc.objects[0].position = [3.0, 5.0, 1.0];
+        desc.objects[0].rotation_deg = [0.0, 45.0, 0.0];
+        let (pa, pb) = anchors(&desc);
+        assert!(pa.abs_diff_eq(pb, 1e-5), "moved together: {pa} vs {pb}");
+        assert!(pa.abs_diff_eq(Vec3::new(3.0, 5.0, 1.0), 1e-5), "{pa}");
+
+        // Moving only `a` carries the pivot with it, by exactly as far as `a`
+        // moves (physics then anchors `b` at the new pivot).
+        let a_before = world_poses(&desc).unwrap()[1].0;
+        desc.objects[1].position[2] += 2.0;
+        let a_moved = world_poses(&desc).unwrap()[1].0 - a_before;
+        let (pa_after, _) = anchors(&desc);
+        assert!(
+            (pa_after - pa).abs_diff_eq(a_moved, 1e-5),
+            "pivot {pa} -> {pa_after}; a moved {a_moved}"
+        );
+        assert!((a_moved.length() - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn v1_files_migrate_to_body_relative_joints() {
+        let text = r#"(
+            version: 1,
+            name: "old",
+            arena: Floor,
+            objects: [
+                (shape: None, position: (0.0, 5.0, 0.0), body: Static),
+                (shape: Some(Sphere(radius: 0.2)), position: (0.0, 3.0, 0.0), rotation_deg: (0.0, 90.0, 0.0)),
+            ],
+            joints: [
+                (a: 1, b: 0, kind: Hinge(pivot: (0.0, 5.0, 0.0), axis: (1.0, 0.0, 0.0))),
+            ],
+        )"#;
+        let desc = from_ron(text).unwrap();
+        assert_eq!(desc.version, SCENE_VERSION);
+        let JointKindSpec::Hinge { pivot, axis, .. } = desc.joints[0].kind else {
+            panic!("hinge");
+        };
+        // In body 1's frame: 2 m above it, and the world X axis seen from a
+        // body turned a quarter about +Y is its local +Z.
+        assert!(Vec3::from_array(pivot).abs_diff_eq(Vec3::new(0.0, 2.0, 0.0), 1e-5));
+        assert!(
+            Vec3::from_array(axis).abs_diff_eq(Vec3::Z, 1e-5),
+            "{axis:?}"
+        );
+        let (world, _) = build_world(&desc, &ModelRegistry::default()).unwrap();
+        let (pa, pb) = world.joint_anchors(world.joints().next().unwrap()).unwrap();
+        assert!(pa.abs_diff_eq(Vec3::new(0.0, 5.0, 0.0), 1e-5) && pa.abs_diff_eq(pb, 1e-5));
+        assert!(from_ron(&text.replace("version: 1", "version: 3")).is_err());
     }
 
     #[test]
@@ -765,7 +1056,7 @@ mod tests {
     #[test]
     fn hand_written_files_can_skip_defaults() {
         let text = r#"(
-            version: 1,
+            version: 2,
             name: "tiny",
             arena: Floor,
             objects: [
