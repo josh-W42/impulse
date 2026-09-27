@@ -138,7 +138,6 @@ const STACK_COLORS: [[f32; 4]; 3] = [
     [0.30, 0.55, 0.75, 1.0],
 ];
 
-/// A demo as a scene description. Deterministic.
 /// Half-size of the floor object a new scene starts with (m).
 pub const NEW_FLOOR_HALF: f32 = FLOOR_SIZE / 2.0;
 
@@ -169,7 +168,17 @@ pub fn empty_desc() -> SceneDesc {
 /// Default pit half-width when switching an open floor to a pit.
 pub const DEFAULT_PIT: f32 = PIT;
 
+/// A demo as a scene description. Deterministic.
 pub fn demo_desc(demo: Demo) -> SceneDesc {
+    let mut desc = demo_world_desc(demo);
+    crate::scene_desc::localize_joints(&mut desc);
+    desc.version = SCENE_VERSION;
+    desc
+}
+
+/// A demo with world-space joints, i.e. the v1 format (the generators author
+/// joints in world space).
+pub fn demo_world_desc(demo: Demo) -> SceneDesc {
     let (objects, joints) = match demo {
         Demo::Pit => (pit_objects(), Vec::new()),
         Demo::Tower => (
@@ -195,7 +204,7 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
         Demo::Materials => (materials_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
-        version: SCENE_VERSION,
+        version: 1,
         name: demo.label().to_string(),
         // The chart is for looking at: no walls in the way.
         arena: match demo {
@@ -1089,6 +1098,45 @@ mod tests {
             crate::scene_desc::from_ron(&crate::scene_desc::to_ron(&desc)).unwrap(),
             desc
         );
+    }
+
+    /// Every demo written as a v1 file (world-space joints) loads, migrates,
+    /// and builds the same world: bodies where authored, every joint's
+    /// anchors at its authored world points.
+    #[test]
+    fn v1_demos_migrate_to_the_same_world() {
+        use crate::scene_desc::{JointKindSpec, from_ron, to_ron};
+        for demo in Demo::ALL {
+            let v1 = demo_world_desc(demo);
+            let migrated = from_ron(&to_ron(&v1)).unwrap();
+            assert_eq!(migrated, demo_desc(demo), "{demo:?}");
+            let (world, objects) =
+                crate::scene_desc::build_world(&migrated, &crate::models::ModelRegistry::bundled())
+                    .unwrap();
+            for (o, authored) in objects.iter().zip(&v1.objects) {
+                let p = world.body(o.handle).unwrap().position();
+                assert!(
+                    p.abs_diff_eq(Vec3::from_array(authored.position), 1e-4),
+                    "{demo:?}"
+                );
+            }
+            for (id, joint) in world.joints().zip(&v1.joints) {
+                let (pa, pb) = world.joint_anchors(id).unwrap();
+                let (want_a, want_b) = match joint.kind {
+                    JointKindSpec::BallSocket { pivot, .. }
+                    | JointKindSpec::Hinge { pivot, .. } => {
+                        (Vec3::from_array(pivot), Vec3::from_array(pivot))
+                    }
+                    JointKindSpec::Distance { anchor_a, anchor_b } => {
+                        (Vec3::from_array(anchor_a), Vec3::from_array(anchor_b))
+                    }
+                };
+                assert!(
+                    pa.abs_diff_eq(want_a, 1e-4) && pb.abs_diff_eq(want_b, 1e-4),
+                    "{demo:?}: {pa} {pb} vs {want_a} {want_b}"
+                );
+            }
+        }
     }
 
     #[test]
