@@ -33,6 +33,10 @@ to exactly what you authored.
   drag elsewhere to orbit; the inspector
   edits shape, pose, body, material, colour, and starting velocity
 - Add sphere/box/capsule, Ctrl+D duplicate, Del delete, Ctrl+Z / Ctrl+Y undo/redo
+- **Hierarchy:** the objects list is a tree. Drag a row onto another to parent it
+  (it stays put in the world), or onto "(top level)" to unparent; Add → Empty makes a
+  folder. Moving, duplicating, or deleting a parent brings its children (and the joints
+  among them) along. Parenting is for editing: at Play every body is independent.
 - **UI size** (A−/A+ in the panel) scales the interface, 75–200%; the browser starts at 125%
 - **New** starts a blank scene with a finite floor object (a static box you can
   resize, move, or delete; things fall off its edges). In Edit mode, **arena** adds
