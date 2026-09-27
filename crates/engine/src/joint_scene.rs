@@ -36,6 +36,8 @@ const MATERIAL: Material = Material {
 struct Builder {
     objects: Vec<ObjectDesc>,
     joints: Vec<JointSpec>,
+    /// (child, parent) links, applied after the joints are localized.
+    parents: Vec<(usize, usize)>,
 }
 
 impl Builder {
@@ -80,15 +82,32 @@ impl Builder {
     fn join(&mut self, joint: JointSpec) {
         self.joints.push(joint);
     }
+
+    fn parent(&mut self, child: usize, parent: usize) {
+        self.parents.push((child, parent));
+    }
+
+    /// A folder: no shape, static.
+    fn empty(&mut self, name: &str, at: Vec3) -> usize {
+        self.objects.push(ObjectDesc {
+            name: name.to_string(),
+            position: at.to_array(),
+            body: BodyType::Static,
+            ..ObjectDesc::default()
+        });
+        self.objects.len() - 1
+    }
 }
 
-/// The scene's objects and the joints between them.
-pub fn joint_objects() -> (Vec<ObjectDesc>, Vec<JointSpec>) {
+/// The scene's objects, the joints between them (world space), and the
+/// (child, parent) links grouping them: the ragdoll as a skeleton under its
+/// torso, the bridge planks under a "bridge" empty.
+pub fn joint_objects() -> (Vec<ObjectDesc>, Vec<JointSpec>, Vec<(usize, usize)>) {
     let mut b = Builder::default();
     chain(&mut b, Vec3::new(-4.0, 5.5, -3.0));
     bridge(&mut b, Vec3::new(0.0, 2.5, 2.5));
     ragdoll(&mut b, Vec3::new(2.5, 2.2, -2.5));
-    (b.objects, b.joints)
+    (b.objects, b.joints, b.parents)
 }
 
 /// Capsule links released horizontally, so the chain whips down and swings.
@@ -124,6 +143,7 @@ fn bridge(b: &mut Builder, center: Vec3) {
     let half = Vec3::new(0.34, 0.05, 0.6);
     let pitch = 2.0 * half.x + 0.04;
     let span = pitch * PLANKS as f32;
+    let group = b.empty("bridge", center);
     let mut planks = Vec::new();
     for i in 0..PLANKS {
         let x = -span / 2.0 + pitch * (i as f32 + 0.5);
@@ -138,6 +158,7 @@ fn bridge(b: &mut Builder, center: Vec3) {
             let pivot = center + Vec3::X * (x - pitch / 2.0);
             b.join(JointSpec::hinge(previous, plank, pivot, Vec3::Z));
         }
+        b.parent(plank, group);
         planks.push(plank);
     }
     for (side, end) in [(-1.0_f32, planks[0]), (1.0, planks[PLANKS - 1])] {
@@ -188,6 +209,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
         HEAD_COLOR,
     );
     b.join(JointSpec::ball_socket(torso, head, pelvis + Vec3::Y * 0.66).with_cone(Vec3::Y, 0.6));
+    b.parent(head, torso);
 
     let limb = |half_height: f32, radius: f32| Collider::Capsule {
         half_height,
@@ -205,6 +227,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             RAGDOLL_COLOR,
         );
         b.join(JointSpec::ball_socket(torso, upper, shoulder).with_cone(Vec3::X * side, 1.3));
+        b.parent(upper, torso);
         let elbow = shoulder + Vec3::X * side * 0.42;
         let fore = b.dynamic(
             0.5,
@@ -214,6 +237,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             HEAD_COLOR,
         );
         b.join(JointSpec::hinge(upper, fore, elbow, Vec3::NEG_Y * side).with_limits(0.0, 2.4));
+        b.parent(fore, upper);
 
         // Legs hang down; the knee bends the shin backward (toward −Z).
         let hip = pelvis + Vec3::new(side * 0.12, -0.02, 0.0);
@@ -225,6 +249,7 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             RAGDOLL_COLOR,
         );
         b.join(JointSpec::ball_socket(torso, thigh, hip).with_cone(Vec3::NEG_Y, 1.0));
+        b.parent(thigh, torso);
         let knee = hip - Vec3::Y * 0.48;
         let shin = b.dynamic(
             0.9,
@@ -234,5 +259,6 @@ fn ragdoll(b: &mut Builder, pelvis: Vec3) {
             RAGDOLL_COLOR,
         );
         b.join(JointSpec::hinge(thigh, shin, knee, Vec3::X).with_limits(0.0, 2.4));
+        b.parent(shin, thigh);
     }
 }

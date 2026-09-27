@@ -173,6 +173,13 @@ pub fn demo_desc(demo: Demo) -> SceneDesc {
     let mut desc = demo_world_desc(demo);
     crate::scene_desc::localize_joints(&mut desc);
     desc.version = SCENE_VERSION;
+    if demo == Demo::Joints {
+        // Grouped after the joints are localized: nothing moves.
+        let (_, _, parents) = crate::joint_scene::joint_objects();
+        for (child, parent) in parents {
+            crate::scene_desc::set_parent_keep_world(&mut desc, child, Some(parent));
+        }
+    }
     desc
 }
 
@@ -199,7 +206,10 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
             (objects, Vec::new())
         }
         Demo::Rain => (rain_objects(), Vec::new()),
-        Demo::Joints => crate::joint_scene::joint_objects(),
+        Demo::Joints => {
+            let (objects, joints, _) = crate::joint_scene::joint_objects();
+            (objects, joints)
+        }
         Demo::Props => (props_objects(), Vec::new()),
         Demo::Materials => (materials_objects(), Vec::new()),
     };
@@ -992,9 +1002,10 @@ mod tests {
         let mut world = World::default();
         let objects = build(&mut world, Demo::Joints);
         let posts = 3;
+        let bridge_group = 1;
         assert_eq!(
             objects.len(),
-            posts + CHAIN_LINKS + PLANKS + CRATES + RAGDOLL_PARTS
+            posts + bridge_group + CHAIN_LINKS + PLANKS + CRATES + RAGDOLL_PARTS
         );
         let gaps = |w: &World| -> Vec<f32> {
             w.joints()
@@ -1119,7 +1130,7 @@ mod tests {
         for demo in Demo::ALL {
             let v1 = demo_world_desc(demo);
             let migrated = from_ron(&to_ron(&v1)).unwrap();
-            assert_eq!(migrated, demo_desc(demo), "{demo:?}");
+            assert_eq!(migrated.version, SCENE_VERSION);
             let (world, objects) =
                 crate::scene_desc::build_world(&migrated, &crate::models::ModelRegistry::bundled())
                     .unwrap();
@@ -1146,6 +1157,35 @@ mod tests {
                     "{demo:?}: {pa} {pb} vs {want_a} {want_b}"
                 );
             }
+        }
+    }
+
+    /// Grouping the Joints demo (ragdoll skeleton, bridge under an empty)
+    /// changes nothing in the built world.
+    #[test]
+    fn the_grouped_joints_demo_builds_the_same_world_as_flat() {
+        use crate::scene_desc::{build_world, from_ron, to_ron};
+        let grouped = demo_desc(Demo::Joints);
+        assert!(
+            grouped
+                .objects
+                .iter()
+                .filter(|o| o.parent.is_some())
+                .count()
+                >= 15
+        );
+        let flat = from_ron(&to_ron(&demo_world_desc(Demo::Joints))).unwrap();
+        let registry = crate::models::ModelRegistry::default();
+        let (a, oa) = build_world(&grouped, &registry).unwrap();
+        let (b, ob) = build_world(&flat, &registry).unwrap();
+        for (x, y) in oa.iter().zip(&ob) {
+            let (x, y) = (a.body(x.handle).unwrap(), b.body(y.handle).unwrap());
+            assert!(x.position().abs_diff_eq(y.position(), 1e-4));
+            assert!(x.orientation().abs_diff_eq(y.orientation(), 1e-4));
+        }
+        for (i, j) in a.joints().zip(b.joints()) {
+            let (pa, pb) = (a.joint_anchors(i).unwrap(), b.joint_anchors(j).unwrap());
+            assert!(pa.0.abs_diff_eq(pb.0, 1e-4) && pa.1.abs_diff_eq(pb.1, 1e-4));
         }
     }
 

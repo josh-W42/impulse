@@ -6,7 +6,9 @@
 
 use glam::{Quat, Vec3};
 
-use crate::scene_desc::{BodyType, JointSpec, ObjectDesc, SceneDesc, world_poses};
+use crate::scene_desc::{
+    BodyType, JointSpec, ObjectDesc, SceneDesc, set_parent_keep_world, world_poses,
+};
 
 pub const UNDO_DEPTH: usize = 100;
 
@@ -205,20 +207,9 @@ impl Editor {
         if self.desc.objects[child].parent == parent {
             return Ok(false);
         }
-        let world = world_poses(&self.desc).map_err(|_| ReparentError::NoSuchObject)?;
-        let (position, rotation) = world[child];
-        let local = match parent {
-            Some(p) => {
-                let (pp, pq) = world[p];
-                (pq.inverse() * (position - pp), pq.inverse() * rotation)
-            }
-            None => (position, rotation),
-        };
+        world_poses(&self.desc).map_err(|_| ReparentError::NoSuchObject)?;
         Ok(self.edit(|d| {
-            let object = &mut d.objects[child];
-            object.parent = parent;
-            object.position = local.0.to_array();
-            object.set_orientation(local.1);
+            set_parent_keep_world(d, child, parent);
         }))
     }
 

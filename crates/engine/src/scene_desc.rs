@@ -421,6 +421,31 @@ pub fn world_poses(desc: &SceneDesc) -> Result<Vec<Pose3>, SceneError> {
         .collect())
 }
 
+/// Sets `child`'s parent, rewriting its local pose so it stays where it is in
+/// the world. The caller rules out cycles. False if the scene's parents are
+/// invalid or an index is out of range.
+pub fn set_parent_keep_world(desc: &mut SceneDesc, child: usize, parent: Option<usize>) -> bool {
+    let Ok(world) = world_poses(desc) else {
+        return false;
+    };
+    if child >= world.len() || parent.is_some_and(|p| p >= world.len()) {
+        return false;
+    }
+    let (position, rotation) = world[child];
+    let (position, rotation) = match parent {
+        Some(p) => {
+            let (pp, pq) = world[p];
+            (pq.inverse() * (position - pp), pq.inverse() * rotation)
+        }
+        None => (position, rotation),
+    };
+    let object = &mut desc.objects[child];
+    object.parent = parent;
+    object.position = position.to_array();
+    object.set_orientation(rotation);
+    true
+}
+
 /// Converts world-space joint points and axes (v1, and the demo generators)
 /// into their bodies' frames at the authored poses. Joints with bad indices,
 /// or a scene with bad parents, are left for `build_world` to report.
