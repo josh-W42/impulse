@@ -54,6 +54,37 @@ to exactly what you authored.
   imports and adds it; in the browser, use Import…. Each collides as a convex hull or a
   fitted box/sphere/capsule; the "model colliders" toggle shows them.
 
+## Writing a game on impulse
+
+`impulse-engine` runs any type that implements `Game`. The shell owns the
+window, GPU, renderer, egui and input, and calls three methods each frame:
+
+```rust
+use impulse_engine::{Context, Game};
+use impulse_engine::render::{CameraData, DrawList};
+
+impl Game for MyGame {
+    fn update(&mut self, cx: &mut Context<'_>) { /* input, simulation, uploads */ }
+    fn ui(&mut self, ui: &mut impulse_engine::egui::Ui) { /* panels */ }
+    fn draw(&mut self, cx: &mut Context<'_>, list: &mut DrawList) -> CameraData { /* … */ }
+}
+
+fn main() {
+    impulse_engine::run_game("my game", |cx| Box::new(MyGame::new(cx)));
+}
+```
+
+`Context` gives access to the `Gpu` and `Renderer` (for uploading meshes,
+textures and materials), the `InputState`, the egui context, and the frame
+time. The optional `window_event` hook is for gestures that must happen inside
+an event, such as browser pointer lock. The engine re-exports `egui`, `glam`,
+`winit` and the renderer (`impulse_engine::render`) so a game uses the same
+versions. Also available: `RtsCamera` (strategy-game camera with default
+controls), `perspective`, `cursor_ray`, `FixedTimestep`, and
+`Renderer::set_shadow_focus` for scenes larger than the default 25 m shadow
+radius. The smallest example: `cargo run -p impulse-engine --example spinning_cube`.
+The sandbox (`crates/engine/src/running.rs`) is itself a `Game`.
+
 ## Prerequisites
 
 - rustup (the pinned toolchain in `rust-toolchain.toml` installs automatically)
@@ -84,6 +115,6 @@ Open http://localhost:8080. Add `?backend=webgl` to force the WebGL2 fallback.
 
 - `crates/physics`: rigid-body physics; depends on `glam` only (enforced)
 - `crates/render`: wgpu renderer; no windowing
-- `crates/engine`: winit loop, platform glue
+- `crates/engine`: app shell (`Game` trait), winit loop, platform glue, and the sandbox editor
 - `crates/demo`: the demo binary
 - `web/`: HTML shell for the browser build
