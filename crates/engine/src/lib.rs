@@ -24,7 +24,7 @@ mod shell;
 mod timestep;
 
 pub use app::{run, run_game};
-pub use camera::{cursor_ray, perspective};
+pub use camera::{RtsCamera, cursor_ray, perspective};
 pub use game::{Context, Game};
 pub use input::InputState;
 pub use platform::DEFAULT_UI_SCALE;

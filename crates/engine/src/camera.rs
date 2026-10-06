@@ -2,6 +2,10 @@
 
 use glam::camera::rh::{proj, view};
 use glam::{Mat4, Vec2, Vec3};
+use winit::event::MouseButton;
+use winit::keyboard::KeyCode;
+
+use crate::input::InputState;
 
 const PITCH_LIMIT: f32 = 1.5; // ≈86°, short of straight up/down where look-at degenerates
 const MIN_DISTANCE: f32 = 1.0;
@@ -85,6 +89,122 @@ impl FlyCamera {
 
     pub fn view(&self) -> Mat4 {
         view::look_to_mat4(self.position, self.forward(), Vec3::Y)
+    }
+}
+
+/// Limits for [`RtsCamera`]: pitch (radians above horizontal) and distance (m).
+const RTS_PITCH: (f32, f32) = (0.35, 1.45);
+const RTS_DISTANCE: (f32, f32) = (6.0, 150.0);
+/// Keyboard pan speed, in view distances per second.
+const RTS_PAN_SPEED: f32 = 0.8;
+/// Keyboard rotate and tilt speeds (rad/s).
+const RTS_ROTATE_SPEED: f32 = 1.5;
+const RTS_TILT_SPEED: f32 = 0.8;
+/// Ground moved per pixel of middle-drag or touch drag, in view distances.
+const RTS_DRAG_PAN: f32 = 0.0015;
+
+/// Looks down at a point on the ground, like a strategy-game camera. Same
+/// spherical convention as [`OrbitCamera`] (yaw 0 looks down −Z).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtsCamera {
+    pub focus: Vec3,
+    pub yaw: f32,
+    /// Radians above horizontal, kept within [0.35, 1.45].
+    pub pitch: f32,
+    /// Kept within [6, 150].
+    pub distance: f32,
+    /// Keeps the focus's XZ within (min, max), if set.
+    pub bounds: Option<(Vec2, Vec2)>,
+}
+
+impl RtsCamera {
+    /// Looking at `focus` from 40 m away, about 50° above the horizon.
+    pub fn new(focus: Vec3) -> Self {
+        Self {
+            focus,
+            yaw: 0.0,
+            pitch: 0.9,
+            distance: 40.0,
+            bounds: None,
+        }
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        self.focus + Vec3::new(cp * sy, sp, cp * cy) * self.distance
+    }
+
+    pub fn view(&self) -> Mat4 {
+        view::look_at_mat4(self.eye(), self.focus, Vec3::Y)
+    }
+
+    /// Moves along the ground relative to the view, in metres.
+    pub fn pan(&mut self, forward: f32, right: f32) {
+        let (sy, cy) = self.yaw.sin_cos();
+        let forward_dir = Vec3::new(-sy, 0.0, -cy);
+        let right_dir = Vec3::new(cy, 0.0, -sy);
+        self.focus += forward_dir * forward + right_dir * right;
+        if let Some((min, max)) = self.bounds {
+            self.focus.x = self.focus.x.clamp(min.x, max.x);
+            self.focus.z = self.focus.z.clamp(min.y, max.y);
+        }
+    }
+
+    pub fn rotate(&mut self, dyaw: f32) {
+        self.yaw += dyaw;
+    }
+
+    /// Positive raises the eye toward looking straight down.
+    pub fn tilt(&mut self, dpitch: f32) {
+        self.pitch = (self.pitch + dpitch).clamp(RTS_PITCH.0, RTS_PITCH.1);
+    }
+
+    /// `factor` < 1 moves closer.
+    pub fn zoom(&mut self, factor: f32) {
+        if factor.is_finite() && factor > 0.0 {
+            self.distance = (self.distance * factor).clamp(RTS_DISTANCE.0, RTS_DISTANCE.1);
+        }
+    }
+
+    /// Default controls: WASD or arrows pan (faster when zoomed out), Q/E
+    /// rotate, R/F tilt; while the pointer is free of the UI, the wheel zooms,
+    /// middle-drag or a one-finger drag pans, and a pinch zooms.
+    pub fn update(&mut self, input: &InputState, dt: f32, pointer_free: bool) {
+        let axis = |pos: [KeyCode; 2], neg: [KeyCode; 2]| {
+            let held = |keys: [KeyCode; 2]| keys.iter().any(|&k| input.key_held(k));
+            held(pos) as i32 as f32 - held(neg) as i32 as f32
+        };
+        let step = RTS_PAN_SPEED * self.distance * dt;
+        self.pan(
+            axis(
+                [KeyCode::KeyW, KeyCode::ArrowUp],
+                [KeyCode::KeyS, KeyCode::ArrowDown],
+            ) * step,
+            axis(
+                [KeyCode::KeyD, KeyCode::ArrowRight],
+                [KeyCode::KeyA, KeyCode::ArrowLeft],
+            ) * step,
+        );
+        self.rotate(axis([KeyCode::KeyE; 2], [KeyCode::KeyQ; 2]) * RTS_ROTATE_SPEED * dt);
+        self.tilt(axis([KeyCode::KeyR; 2], [KeyCode::KeyF; 2]) * RTS_TILT_SPEED * dt);
+
+        if !pointer_free {
+            return;
+        }
+        if input.wheel() != 0.0 {
+            self.zoom(0.9f32.powf(input.wheel()));
+        }
+        // Dragging moves the ground with the pointer.
+        let mut drag = input.touch_rotate();
+        if input.button_held(MouseButton::Middle) {
+            drag += input.cursor_delta();
+        }
+        let k = RTS_DRAG_PAN * self.distance;
+        self.pan(drag.y * k, -drag.x * k);
+        if input.touch_pinch() != 1.0 {
+            self.zoom(1.0 / input.touch_pinch());
+        }
     }
 }
 
@@ -269,6 +389,97 @@ mod tests {
         let fwd = view_forward(f.view());
         f.translate(1.0, 0.0, 0.0);
         assert!(f.position.abs_diff_eq(fwd, 1e-4));
+    }
+
+    fn rts() -> RtsCamera {
+        RtsCamera {
+            yaw: 0.7,
+            ..RtsCamera::new(Vec3::new(64.0, 0.0, 64.0))
+        }
+    }
+
+    fn horizontal(v: Vec3) -> Vec2 {
+        Vec2::new(v.x, v.z)
+    }
+
+    #[test]
+    fn rts_pan_forward_moves_focus_away_from_the_eye() {
+        let mut cam = rts();
+        let (eye, before) = (cam.eye(), cam.focus);
+        cam.pan(5.0, 0.0);
+        let gap = |focus: Vec3| horizontal(focus).distance(horizontal(eye));
+        assert!((gap(cam.focus) - gap(before) - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rts_pan_right_moves_focus_to_screen_right() {
+        let mut cam = rts();
+        let view_proj = perspective(1.5) * cam.view();
+        cam.pan(0.0, 5.0);
+        let ndc = view_proj.project_point3(cam.focus);
+        assert!(ndc.x > 0.1 && ndc.y.abs() < 1e-3, "{ndc}");
+    }
+
+    #[test]
+    fn rts_focus_stays_on_the_ground_and_in_bounds() {
+        let mut cam = RtsCamera {
+            bounds: Some((Vec2::ZERO, Vec2::splat(128.0))),
+            ..rts()
+        };
+        cam.pan(1000.0, -1000.0);
+        assert_eq!(cam.focus.y, 0.0);
+        for v in [cam.focus.x, cam.focus.z] {
+            assert!((0.0..=128.0).contains(&v), "{}", cam.focus);
+        }
+    }
+
+    #[test]
+    fn rts_zoom_and_tilt_are_clamped() {
+        let mut cam = rts();
+        cam.zoom(1e6);
+        assert_eq!(cam.distance, RTS_DISTANCE.1);
+        cam.zoom(1e-6);
+        assert_eq!(cam.distance, RTS_DISTANCE.0);
+        cam.zoom(f32::NAN);
+        cam.zoom(-1.0);
+        assert_eq!(cam.distance, RTS_DISTANCE.0);
+        cam.tilt(100.0);
+        assert_eq!(cam.pitch, RTS_PITCH.1);
+        cam.tilt(-100.0);
+        assert_eq!(cam.pitch, RTS_PITCH.0);
+    }
+
+    #[test]
+    fn rts_center_ray_hits_the_focus() {
+        let cam = rts();
+        let (origin, dir) = cursor_ray(perspective(1.5) * cam.view(), Vec2::ZERO);
+        let to_focus = cam.focus - origin;
+        let miss = to_focus - dir * to_focus.dot(dir);
+        // f32 rounding through the inverse projection (near 0.1, far 500) costs
+        // a few millimetres at 40 m; a convention error would miss by metres.
+        assert!(miss.length() < 0.01, "{miss}");
+    }
+
+    #[test]
+    fn rts_keys_pan_relative_to_the_view() {
+        let mut cam = rts();
+        let view_proj = perspective(1.5) * cam.view();
+        let mut input = InputState::new();
+        input.on_key(KeyCode::KeyD, true);
+        cam.update(&input, 0.5, true);
+        assert!(view_proj.project_point3(cam.focus).x > 0.1);
+    }
+
+    #[test]
+    fn rts_wheel_zooms_only_while_the_pointer_is_free() {
+        let mut cam = rts();
+        let mut input = InputState::new();
+        input.on_wheel(2.0);
+        let before = cam.distance;
+        cam.update(&input, 0.016, false);
+        assert_eq!(cam.distance, before, "egui has the pointer");
+        cam.update(&input, 0.016, true);
+        assert!(cam.distance < before, "wheel up zooms in");
     }
 
     #[test]
