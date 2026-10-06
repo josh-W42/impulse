@@ -153,10 +153,12 @@ impl CameraRig {
             CameraMode::Fly => self.fly.view(),
         }
     }
+}
 
-    pub fn projection(aspect: f32) -> Mat4 {
-        proj::directx::perspective(FOV_Y, aspect.max(1e-3), 0.1, 500.0)
-    }
+/// The engine's perspective projection (60° vertical field of view) for a
+/// render target of the given width over height.
+pub fn perspective(aspect: f32) -> Mat4 {
+    proj::directx::perspective(FOV_Y, aspect.max(1e-3), 0.1, 500.0)
 }
 
 /// World-space ray `(origin on the near plane, unit direction)` through a point in
@@ -189,7 +191,7 @@ mod tests {
     #[test]
     fn screen_center_ray_leaves_the_eye_along_the_view() {
         let rig = CameraRig::new(orbit());
-        let view_proj = CameraRig::projection(16.0 / 9.0) * rig.view();
+        let view_proj = perspective(16.0 / 9.0) * rig.view();
         let (origin, dir) = cursor_ray(view_proj, Vec2::ZERO);
         assert!(dir.abs_diff_eq(view_forward(rig.view()), 1e-4), "{dir}");
         assert!(origin.distance(rig.eye()) < 0.2, "starts at the near plane");

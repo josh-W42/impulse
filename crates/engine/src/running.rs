@@ -1,20 +1,17 @@
-//! Everything that exists once the GPU is ready: simulation, cameras, input, UI, rendering.
-
-use std::sync::Arc;
+//! The impulse sandbox: the physics playground and scene editor, as a [`Game`].
 
 use glam::{Vec2, Vec3};
 use impulse_physics::{BodyHandle, SolverMode, SolverSettings, StepStats, World};
-use impulse_render::{CameraData, DrawList, FrameOutcome, Gpu, Renderer, UiFrame, backend_name};
+use impulse_render::{CameraData, DrawList, backend_name};
 use web_time::Instant;
-use winit::event::{DeviceEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Window};
 
-use crate::camera::{self, CameraMode, CameraRig, OrbitCamera};
+use crate::camera::{self, CameraMode, CameraRig, OrbitCamera, perspective};
 use crate::editor::Editor;
 use crate::editor_ui::{self, InspectorAction, NewShape};
-use crate::egui_input::EguiInput;
-use crate::input::InputState;
+use crate::game::{Context, Game};
 use crate::models::{self, ModelMeshes, ModelRegistry};
 use crate::platform;
 use crate::scene::{self, Demo, SceneObject};
@@ -124,27 +121,16 @@ struct Settings {
     substeps: usize,
 }
 
-pub enum FrameResult {
-    Continue,
-    Failed(String),
-}
-
-pub struct Running {
-    gpu: Gpu,
-    renderer: Renderer,
+pub struct Sandbox {
     world: World,
     objects: Vec<SceneObject>,
     timestep: FixedTimestep,
     alpha: f32,
     camera: CameraRig,
-    input: InputState,
-    egui_ctx: egui::Context,
-    egui_input: EguiInput,
-    draw_list: DrawList,
     settings: Settings,
     backend: &'static str,
+    /// Clock for the physics profiler.
     start: Instant,
-    last_frame: Instant,
     frame_ms: f32,
     /// Physics work this frame (timings summed over its fixed steps).
     physics: StepStats,
@@ -173,10 +159,12 @@ pub struct Running {
     model_meshes: ModelMeshes,
     /// The selection the objects list last showed (it follows viewport picks).
     listed: Option<usize>,
+    /// Panel requests from this frame's UI, carried out in `draw`.
+    actions: Vec<Action>,
 }
 
-impl Running {
-    pub fn new(gpu: Gpu, window: &Window) -> Self {
+impl Sandbox {
+    pub fn new(cx: &mut Context<'_>) -> Self {
         let mut world = World::default();
         let initial = platform::scene_override()
             .and_then(|name| Demo::from_name(&name))
@@ -185,11 +173,8 @@ impl Running {
         let models = ModelRegistry::bundled();
         let objects =
             scene_desc::rebuild(&mut world, &desc, &models).expect("demo scenes are valid");
-        let now = Instant::now();
-        Self {
-            renderer: Renderer::new(&gpu),
-            backend: backend_name(gpu.backend()),
-            gpu,
+        let mut sandbox = Self {
+            backend: backend_name(cx.gpu.backend()),
             world,
             objects,
             timestep: FixedTimestep::new(FIXED_STEP, MAX_STEPS_PER_FRAME),
@@ -200,16 +185,6 @@ impl Running {
                 pitch: 0.35,
                 distance: 28.0,
             }),
-            input: InputState::new(),
-            egui_ctx: {
-                let ctx = egui::Context::default();
-                // UI size is ours (see EguiInput::set_ui_scale); egui's own
-                // Ctrl +/- zoom would desync pointer positions from the layout.
-                ctx.options_mut(|o| o.zoom_with_keyboard = false);
-                ctx
-            },
-            egui_input: EguiInput::new(window.scale_factor() as f32),
-            draw_list: DrawList::default(),
             settings: Settings {
                 paused: false,
                 time_scale: 1.0,
@@ -228,8 +203,7 @@ impl Running {
                 solver_mode: SolverSettings::default().mode,
                 substeps: SolverSettings::default().substeps,
             },
-            start: now,
-            last_frame: now,
+            start: Instant::now(),
             frame_ms: 0.0,
             physics: StepStats::default(),
             drag: None,
@@ -247,159 +221,86 @@ impl Running {
             models,
             model_meshes: ModelMeshes::new(),
             listed: None,
-        }
-        .with_hull_meshes()
-    }
-
-    fn with_hull_meshes(mut self) -> Self {
-        self.upload_models();
-        self
+            actions: Vec::new(),
+        };
+        sandbox.upload_models(cx);
+        sandbox
     }
 
     /// (Re-)uploads every model's meshes and textures, pinned so scene
     /// rebuilds keep them, then the current scene's hull meshes.
-    fn upload_models(&mut self) {
-        self.renderer.reset_custom_meshes();
-        self.model_meshes = models::upload_models(&mut self.renderer, &self.gpu, &self.models);
-        self.renderer.pin_custom_meshes();
-        self.sync_hull_meshes();
+    fn upload_models(&mut self, cx: &mut Context<'_>) {
+        cx.renderer.reset_custom_meshes();
+        self.model_meshes = models::upload_models(cx.renderer, cx.gpu, &self.models);
+        cx.renderer.pin_custom_meshes();
+        self.sync_hull_meshes(cx);
     }
 
     /// Re-registers a render mesh for every hull shape in the (rebuilt) world.
-    fn sync_hull_meshes(&mut self) {
-        self.renderer.clear_custom_meshes();
+    fn sync_hull_meshes(&mut self, cx: &mut Context<'_>) {
+        cx.renderer.clear_custom_meshes();
         self.hull_meshes.clear();
         for id in scene::hulls_in_world(&self.world) {
             if let Some(hull) = self.world.hull(id) {
-                let mesh = self.renderer.add_mesh(&self.gpu, &scene::hull_mesh(hull));
+                let mesh = cx.renderer.add_mesh(cx.gpu, &scene::hull_mesh(hull));
                 self.hull_meshes.insert(id, mesh);
             }
         }
     }
 
-    pub fn backend(&self) -> &'static str {
-        self.backend
-    }
-
-    /// Routes one window event to egui, the input state, and the GPU.
-    pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) {
+    /// The sandbox's reactions to window events (the shell has already fed
+    /// egui and the input state).
+    fn on_window_event(&mut self, cx: &mut Context<'_>, event: &WindowEvent) {
         match event {
-            WindowEvent::Resized(size) => self.gpu.resize(size.width, size.height),
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.egui_input.set_pixels_per_point(*scale_factor as f32);
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.egui_input.on_cursor_moved((position.x, position.y));
-                self.input
-                    .on_cursor_moved(Vec2::new(position.x as f32, position.y as f32));
-            }
-            WindowEvent::CursorLeft { .. } => {
-                self.egui_input.on_cursor_left();
-                self.input.on_cursor_left();
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let pressed = state.is_pressed();
-                let egui_button = match button {
-                    MouseButton::Left => Some(egui::PointerButton::Primary),
-                    MouseButton::Right => Some(egui::PointerButton::Secondary),
-                    MouseButton::Middle => Some(egui::PointerButton::Middle),
-                    _ => None,
-                };
-                if let Some(b) = egui_button {
-                    self.egui_input.on_mouse_button(b, pressed);
-                }
-                if *button == MouseButton::Left {
-                    if pressed {
-                        match self.mode {
-                            Mode::Play => self.try_grab(),
-                            Mode::Edit => self.try_select(),
-                        }
-                    } else {
-                        self.drag = None; // release: the body keeps its velocity (throw)
-                        if self.edit_drag.take().is_some() {
-                            self.editor.commit();
-                        }
-                        if let Some(click) = self.pending_click.take()
-                            && self
-                                .input
-                                .cursor()
-                                .is_some_and(|c| c.distance(click.at) <= CLICK_SLOP)
-                        {
-                            self.editor.select(click.hit);
-                        }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if state.is_pressed() {
+                    match self.mode {
+                        Mode::Play => self.try_grab(cx),
+                        Mode::Edit => self.try_select(cx),
+                    }
+                } else {
+                    self.drag = None; // release: the body keeps its velocity (throw)
+                    if self.edit_drag.take().is_some() {
+                        self.editor.commit();
+                    }
+                    if let Some(click) = self.pending_click.take()
+                        && cx
+                            .input
+                            .cursor()
+                            .is_some_and(|c| c.distance(click.at) <= CLICK_SLOP)
+                    {
+                        self.editor.select(click.hit);
                     }
                 }
-                self.input.on_mouse_button(*button, pressed);
-            }
-            WindowEvent::MouseWheel { delta, .. } => match *delta {
-                MouseScrollDelta::LineDelta(x, y) => {
-                    self.egui_input.on_wheel_lines(x, y);
-                    self.input.on_wheel(y);
-                }
-                MouseScrollDelta::PixelDelta(p) => {
-                    self.egui_input.on_wheel_pixels(p.x, p.y);
-                    self.input.on_wheel(p.y as f32 / 50.0);
-                }
-            },
-            WindowEvent::Touch(touch) => {
-                let phase = match touch.phase {
-                    winit::event::TouchPhase::Started => egui::TouchPhase::Start,
-                    winit::event::TouchPhase::Moved => egui::TouchPhase::Move,
-                    winit::event::TouchPhase::Ended => egui::TouchPhase::End,
-                    winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
-                };
-                let (x, y) = (touch.location.x, touch.location.y);
-                self.egui_input.on_touch(touch.id, phase, (x, y));
-                self.input
-                    .on_touch(touch.id, touch.phase, Vec2::new(x as f32, y as f32));
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
                 let pressed = event.state.is_pressed();
-                self.egui_input
-                    .on_key(code, pressed, event.repeat, event.text.as_deref());
-                // Typing into a panel field: the keys are the field's, not the app's.
-                if pressed && self.egui_ctx.egui_wants_keyboard_input() {
-                    return;
-                }
                 // Toggle here, inside the key handler: browsers only grant pointer
                 // lock during a user gesture.
                 if pressed && !event.repeat {
                     let fly = self.camera.mode == CameraMode::Fly;
                     if code == KeyCode::KeyF || (fly && code == KeyCode::Escape) {
-                        self.toggle_camera(window);
+                        self.toggle_camera(cx.window);
                     }
                 }
                 if pressed && self.mode == Mode::Edit {
                     self.edit_shortcut(code, event.repeat);
                 }
-                self.input.on_key(code, pressed);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
-                self.egui_input.set_modifiers(self.modifiers);
             }
-            WindowEvent::Focused(focused) => {
-                self.egui_input.on_focus(*focused);
-                if !focused {
-                    self.input.release_all();
-                    if self.camera.mode == CameraMode::Fly {
-                        self.toggle_camera(window);
-                    }
-                }
+            WindowEvent::Focused(false) if self.camera.mode == CameraMode::Fly => {
+                self.toggle_camera(cx.window);
             }
             _ => {}
-        }
-    }
-
-    pub fn on_device_event(&mut self, event: &DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta } = event
-            && self.camera.mode == CameraMode::Fly
-        {
-            self.input
-                .on_raw_motion(Vec2::new(delta.0 as f32, delta.1 as f32));
         }
     }
 
@@ -420,28 +321,21 @@ impl Running {
         window.set_cursor_visible(!fly);
     }
 
-    fn view_proj(&self) -> glam::Mat4 {
-        let (width, height) = self.gpu.size();
-        CameraRig::projection(width as f32 / height.max(1) as f32) * self.camera.view()
+    fn view_proj(&self, cx: &Context<'_>) -> glam::Mat4 {
+        perspective(cx.aspect()) * self.camera.view()
     }
 
     /// World ray under the mouse cursor.
-    fn cursor_ray(&self) -> Option<(Vec3, Vec3)> {
-        let cursor = self.input.cursor()?;
-        let (width, height) = self.gpu.size();
-        let ndc = Vec2::new(
-            2.0 * cursor.x / width.max(1) as f32 - 1.0,
-            1.0 - 2.0 * cursor.y / height.max(1) as f32,
-        );
-        Some(camera::cursor_ray(self.view_proj(), ndc))
+    fn cursor_ray(&self, cx: &Context<'_>) -> Option<(Vec3, Vec3)> {
+        Some(camera::cursor_ray(self.view_proj(cx), cx.cursor_ndc()?))
     }
 
     /// Left click in orbit mode: grab the dynamic body under the cursor, if any.
-    fn try_grab(&mut self) {
-        if self.camera.mode != CameraMode::Orbit || self.egui_ctx.egui_wants_pointer_input() {
+    fn try_grab(&mut self, cx: &Context<'_>) {
+        if self.camera.mode != CameraMode::Orbit || cx.egui.egui_wants_pointer_input() {
             return;
         }
-        let Some((origin, dir)) = self.cursor_ray() else {
+        let Some((origin, dir)) = self.cursor_ray(cx) else {
             return;
         };
         let Some(hit) = self.world.raycast(origin, dir, 500.0) else {
@@ -466,11 +360,11 @@ impl Running {
     /// (Shift: vertically). Anywhere else it waits: released in place it's a
     /// click that selects what was under it (or clears the selection); moved,
     /// it was a camera orbit. So a floor filling the view doesn't get dragged.
-    fn try_select(&mut self) {
-        if self.camera.mode != CameraMode::Orbit || self.egui_ctx.egui_wants_pointer_input() {
+    fn try_select(&mut self, cx: &Context<'_>) {
+        if self.camera.mode != CameraMode::Orbit || cx.egui.egui_wants_pointer_input() {
             return;
         }
-        let (Some((origin, dir)), Some(at)) = (self.cursor_ray(), self.input.cursor()) else {
+        let (Some((origin, dir)), Some(at)) = (self.cursor_ray(cx), cx.input.cursor()) else {
             return;
         };
         let hit = editor_ui::object_at(&self.world, &self.objects, origin, dir);
@@ -497,11 +391,11 @@ impl Running {
     }
 
     /// Moves the dragged object to follow the cursor on its drag plane.
-    fn update_edit_drag(&mut self) {
+    fn update_edit_drag(&mut self, cx: &Context<'_>) {
         let Some(drag) = &self.edit_drag else {
             return;
         };
-        let Some((origin, dir)) = self.cursor_ray() else {
+        let Some((origin, dir)) = self.cursor_ray(cx) else {
             return;
         };
         let normal = if drag.vertical {
@@ -566,11 +460,11 @@ impl Running {
 
     /// Rebuilds the world from the authored scene (keeping the old world and
     /// reporting why if the scene is invalid).
-    fn rebuild_scene(&mut self) {
+    fn rebuild_scene(&mut self, cx: &mut Context<'_>) {
         match scene_desc::rebuild(&mut self.world, self.editor.desc(), &self.models) {
             Ok(objects) => {
                 self.objects = objects;
-                self.sync_hull_meshes();
+                self.sync_hull_meshes(cx);
                 self.timestep.reset();
                 self.alpha = 0.0;
                 self.drag = None;
@@ -581,18 +475,18 @@ impl Running {
         self.built_revision = self.editor.revision();
     }
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, cx: &mut Context<'_>, action: Action) {
         match action {
             Action::Play => {
                 self.editor.commit();
                 self.edit_drag = None;
                 self.mode = Mode::Play;
                 self.settings.paused = false;
-                self.rebuild_scene();
+                self.rebuild_scene(cx);
             }
             Action::Stop => {
                 self.mode = Mode::Edit;
-                self.rebuild_scene();
+                self.rebuild_scene(cx);
             }
             Action::Capture => {
                 let poses: Vec<_> = self
@@ -628,14 +522,14 @@ impl Running {
                 self.editor.replace(scene::demo_desc(demo));
                 self.demo = Some((demo, self.editor.revision()));
                 self.settings.file_name = demo.label().to_string();
-                self.rebuild_scene();
+                self.rebuild_scene(cx);
             }
             Action::New => {
                 self.editor.replace(scene::empty_desc());
                 self.demo = None;
                 self.settings.file_name = "untitled".to_string();
                 self.mode = Mode::Edit;
-                self.rebuild_scene();
+                self.rebuild_scene(cx);
             }
             // Part of the current gesture: a whole size drag is one undo step
             // (committed when the pointer is released).
@@ -662,7 +556,7 @@ impl Running {
                     return;
                 };
                 match platform::read_scene(&file) {
-                    Ok(text) => self.load_scene_text(&file, &text),
+                    Ok(text) => self.load_scene_text(cx, &file, &text),
                     Err(e) => self.message = Some(e),
                 }
             }
@@ -700,8 +594,8 @@ impl Running {
                 };
                 match platform::read_model(&file) {
                     Ok(bytes) => {
-                        if let Some(id) = self.import_model(&file, &bytes) {
-                            self.apply(Action::AddModel(id));
+                        if let Some(id) = self.import_model(cx, &file, &bytes) {
+                            self.apply(cx, Action::AddModel(id));
                         }
                     }
                     Err(e) => self.message = Some(e),
@@ -718,15 +612,20 @@ impl Running {
 
     /// Adds a model to the registry and uploads it; scenes using that name are
     /// rebuilt with the new mesh.
-    fn import_model(&mut self, file_name: &str, bytes: &[u8]) -> Option<crate::models::ModelId> {
+    fn import_model(
+        &mut self,
+        cx: &mut Context<'_>,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Option<crate::models::ModelId> {
         match self.models.import(file_name, bytes) {
             Ok((id, name)) => {
-                self.upload_models();
+                self.upload_models(cx);
                 let used = self.editor.desc().objects.iter().any(|o| {
                     matches!(&o.shape, Some(scene_desc::ShapeDesc::Model { name: n, .. }) if *n == name)
                 });
                 if used {
-                    self.rebuild_scene();
+                    self.rebuild_scene(cx);
                 }
                 self.message = Some(format!("imported '{name}'"));
                 Some(id)
@@ -740,7 +639,7 @@ impl Running {
 
     /// Replaces the authored scene with a scene file's contents, if it parses
     /// and builds; otherwise reports why and keeps the current scene.
-    fn load_scene_text(&mut self, source: &str, text: &str) {
+    fn load_scene_text(&mut self, cx: &mut Context<'_>, source: &str, text: &str) {
         let checked = scene_desc::from_ron(text)
             .and_then(|desc| scene_desc::build_world(&desc, &self.models).map(|_| desc));
         match checked {
@@ -748,7 +647,7 @@ impl Running {
                 self.settings.file_name = desc.name.clone();
                 self.editor.replace(desc);
                 self.demo = None;
-                self.rebuild_scene();
+                self.rebuild_scene(cx);
                 self.message = Some(format!("loaded {source}"));
             }
             Err(e) => self.message = Some(format!("{source}: {e}")),
@@ -777,9 +676,10 @@ impl Running {
         self.world.apply_impulse_at(body, impulse, anchor);
     }
 
-    fn update_camera(&mut self, dt: f32, egui_has_pointer: bool) {
+    fn update_camera(&mut self, cx: &Context<'_>, egui_has_pointer: bool) {
+        let dt = cx.dt;
         let dragging = self.drag.is_some() || self.edit_drag.is_some();
-        let input = &self.input;
+        let input = cx.input;
         match self.camera.mode {
             CameraMode::Orbit if !egui_has_pointer => {
                 let orbit = &mut self.camera.orbit;
@@ -817,7 +717,8 @@ impl Running {
         }
     }
 
-    fn step_physics(&mut self, dt: f32) {
+    fn step_physics(&mut self, cx: &mut Context<'_>) {
+        let dt = cx.dt;
         let solver = SolverSettings {
             iterations: self.settings.iterations,
             warm_starting: self.settings.warm_starting,
@@ -832,7 +733,7 @@ impl Running {
             self.settings.reset_requested = false;
             self.settings.step_requested = false;
             if self.editor.revision() != self.built_revision {
-                self.rebuild_scene();
+                self.rebuild_scene(cx);
             }
             return;
         }
@@ -840,7 +741,7 @@ impl Running {
             !self.objects.is_empty() && scene::all_below(&self.world, &self.objects, RESET_HEIGHT);
         if self.settings.reset_requested || fell {
             self.settings.reset_requested = false;
-            self.rebuild_scene();
+            self.rebuild_scene(cx);
         }
         let settings = &mut self.settings;
         let steps = if settings.paused {
@@ -876,91 +777,37 @@ impl Running {
             self.physics = frame;
         }
     }
+}
 
-    /// Runs one frame. Skipped frames leave input queued for the next one.
-    pub fn frame(&mut self, window: &Arc<Window>) -> FrameResult {
-        let frame = match self.gpu.acquire() {
-            Ok(frame) => frame,
-            Err(FrameOutcome::SurfaceLost) => {
-                return match self.gpu.instance().create_surface(window.clone()) {
-                    Ok(surface) => {
-                        self.gpu.replace_surface(surface);
-                        FrameResult::Continue
-                    }
-                    Err(e) => FrameResult::Failed(format!("Lost the rendering surface: {e}")),
-                };
-            }
-            Err(_) => return FrameResult::Continue,
-        };
-
-        let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.25);
-        self.last_frame = now;
-        self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
-
+impl Game for Sandbox {
+    fn update(&mut self, cx: &mut Context<'_>) {
+        self.frame_ms = self.frame_ms * 0.9 + cx.dt * 1000.0 * 0.1;
         let egui_has_pointer =
-            self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.egui_is_using_pointer();
-        self.update_camera(dt, egui_has_pointer);
-        self.update_edit_drag();
+            cx.egui.egui_wants_pointer_input() || cx.egui.egui_is_using_pointer();
+        self.update_camera(cx, egui_has_pointer);
+        self.update_edit_drag(cx);
         match platform::take_picked() {
             Some(Ok(picked)) => match picked.kind {
                 platform::PickKind::Scene => match String::from_utf8(picked.bytes) {
-                    Ok(text) => self.load_scene_text(&picked.name, &text),
+                    Ok(text) => self.load_scene_text(cx, &picked.name, &text),
                     Err(_) => self.message = Some(format!("{} is not text", picked.name)),
                 },
                 platform::PickKind::Model => {
-                    self.import_model(&picked.name, &picked.bytes);
+                    self.import_model(cx, &picked.name, &picked.bytes);
                 }
             },
             Some(Err(e)) => self.message = Some(e),
             None => {}
         }
-        if let Some((origin, dir)) = self.cursor_ray()
+        if let Some((origin, dir)) = self.cursor_ray(cx)
             && let Some(drag) = &mut self.drag
         {
             drag.target = origin + dir * drag.distance;
         }
-        self.step_physics(dt);
-        // Outline what moves with the selection (edit mode).
-        let descendants: Vec<usize> = match (self.mode, self.editor.selected()) {
-            (Mode::Edit, Some(selected)) => crate::editor::subtree(self.editor.desc(), selected)
-                .into_iter()
-                .filter(|&i| i != selected)
-                .collect(),
-            _ => Vec::new(),
-        };
-        scene::build_draw_list(
-            &mut self.draw_list,
-            &self.world,
-            &self.objects,
-            &self.hull_meshes,
-            &self.model_meshes,
-            &descendants,
-            scene::DrawOptions {
-                arena: self.editor.desc().arena,
-                selected: match self.mode {
-                    Mode::Edit => self.editor.selected(),
-                    Mode::Play => None,
-                },
-                show_colliders: self.settings.show_colliders,
-                alpha: self.alpha,
-                show_grid: self.settings.show_grid,
-                show_axes: self.settings.show_axes,
-            },
-        );
-        if let Some(drag) = &self.drag
-            && let Some(body) = self.world.body(drag.body)
-        {
-            let anchor = body.position() + body.orientation() * drag.local_anchor;
-            self.draw_list
-                .push_line(anchor, drag.target, [1.0, 0.85, 0.2, 1.0]);
-        }
+        self.step_physics(cx);
+    }
 
-        let (width, height) = self.gpu.size();
-        self.egui_input.set_ui_scale(self.settings.ui_scale);
-        let raw = self
-            .egui_input
-            .take([width, height], self.start.elapsed().as_secs_f64());
+    fn ui(&mut self, ui: &mut egui::Ui) {
         let stats = Stats {
             backend: self.backend,
             frame_ms: self.frame_ms,
@@ -982,65 +829,85 @@ impl Running {
                 .map(|(id, name, bundled)| (id, name.to_string(), bundled))
                 .collect(),
         };
-        let mut actions = Vec::new();
         let follow = self.editor.selected() != self.listed;
-        let (settings, editor, mode, filter, collapsed) = (
-            &mut self.settings,
-            &mut self.editor,
-            self.mode,
-            &mut self.list_filter,
-            &mut self.collapsed,
-        );
-        let mut list_message = None;
-        let output = self.egui_ctx.run_ui(raw, |ui| {
-            panel(ui, settings, &stats, &mut actions);
-            if mode == Mode::Edit {
-                list_message = editor_ui::outliner(ui.ctx(), editor, filter, collapsed, follow);
-                let names: Vec<&str> = stats.models.iter().map(|(_, n, _)| n.as_str()).collect();
-                if let Some(action) = editor_ui::inspector(ui.ctx(), editor, &names) {
-                    actions.push(Action::Inspector(action));
-                }
+        panel(ui, &mut self.settings, &stats, &mut self.actions);
+        if self.mode == Mode::Edit {
+            let list_message = editor_ui::outliner(
+                ui.ctx(),
+                &mut self.editor,
+                &mut self.list_filter,
+                &mut self.collapsed,
+                follow,
+            );
+            if list_message.is_some() {
+                self.message = list_message;
             }
-        });
-        self.listed = self.editor.selected();
-        if list_message.is_some() {
-            self.message = list_message;
+            let names: Vec<&str> = stats.models.iter().map(|(_, n, _)| n.as_str()).collect();
+            if let Some(action) = editor_ui::inspector(ui.ctx(), &mut self.editor, &names) {
+                self.actions.push(Action::Inspector(action));
+            }
         }
-        for action in actions {
-            self.apply(action);
+        self.listed = self.editor.selected();
+    }
+
+    fn draw(&mut self, cx: &mut Context<'_>, list: &mut DrawList) -> CameraData {
+        for action in std::mem::take(&mut self.actions) {
+            self.apply(cx, action);
         }
         // A gesture ends when nothing is being dragged or typed into.
         if self.edit_drag.is_none()
-            && !self.egui_ctx.egui_is_using_pointer()
-            && self.egui_ctx.memory(|m| m.focused().is_none())
+            && !cx.egui.egui_is_using_pointer()
+            && cx.egui.memory(|m| m.focused().is_none())
         {
             self.editor.commit();
         }
-        let ui = UiFrame {
-            primitives: self
-                .egui_ctx
-                .tessellate(output.shapes, output.pixels_per_point),
-            textures_delta: output.textures_delta,
-            pixels_per_point: output.pixels_per_point,
-        };
 
-        let aspect = width as f32 / height.max(1) as f32;
-        let camera = CameraData {
-            view_proj: CameraRig::projection(aspect) * self.camera.view(),
-            eye: self.camera.eye(),
+        // Outline what moves with the selection (edit mode).
+        let descendants: Vec<usize> = match (self.mode, self.editor.selected()) {
+            (Mode::Edit, Some(selected)) => crate::editor::subtree(self.editor.desc(), selected)
+                .into_iter()
+                .filter(|&i| i != selected)
+                .collect(),
+            _ => Vec::new(),
         };
-        self.renderer.render(
-            &self.gpu,
-            &frame.view,
-            &frame.ui_view,
-            &camera,
-            &self.draw_list,
-            ui,
+        scene::build_draw_list(
+            list,
+            &self.world,
+            &self.objects,
+            &self.hull_meshes,
+            &self.model_meshes,
+            &descendants,
+            scene::DrawOptions {
+                arena: self.editor.desc().arena,
+                selected: match self.mode {
+                    Mode::Edit => self.editor.selected(),
+                    Mode::Play => None,
+                },
+                show_colliders: self.settings.show_colliders,
+                alpha: self.alpha,
+                show_grid: self.settings.show_grid,
+                show_axes: self.settings.show_axes,
+            },
         );
-        window.pre_present_notify();
-        self.gpu.present(frame);
-        self.input.end_frame();
-        FrameResult::Continue
+        if let Some(drag) = &self.drag
+            && let Some(body) = self.world.body(drag.body)
+        {
+            let anchor = body.position() + body.orientation() * drag.local_anchor;
+            list.push_line(anchor, drag.target, [1.0, 0.85, 0.2, 1.0]);
+        }
+
+        CameraData {
+            view_proj: self.view_proj(cx),
+            eye: self.camera.eye(),
+        }
+    }
+
+    fn window_event(&mut self, cx: &mut Context<'_>, event: &WindowEvent) {
+        self.on_window_event(cx, event);
+    }
+
+    fn ui_scale(&self) -> f32 {
+        self.settings.ui_scale
     }
 }
 

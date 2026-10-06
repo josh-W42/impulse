@@ -8,8 +8,10 @@ use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::window::{Window, WindowId};
 
+use crate::game::{Context, Game};
 use crate::platform;
-use crate::running::{FrameResult, Running};
+use crate::running::Sandbox;
+use crate::shell::{FrameResult, MakeGame, Shell};
 
 /// Delivered to the event loop when async GPU init finishes (immediately on
 /// desktop; later on the web, where init can't block).
@@ -20,8 +22,8 @@ enum UserEvent {
 enum State {
     Uninitialized,
     Loading,
-    // Boxed: Running is large next to the unit variants (clippy::large_enum_variant).
-    Running(Box<Running>),
+    // Boxed: Shell is large next to the unit variants (clippy::large_enum_variant).
+    Running(Box<Shell>),
     Failed,
 }
 
@@ -30,10 +32,22 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     state: State,
+    /// Taken when the GPU is ready.
+    make: Option<MakeGame>,
 }
 
-/// Opens the window and runs the engine until it is closed.
+/// Opens the window and runs the impulse sandbox (the scene editor) until it
+/// is closed.
 pub fn run(title: &'static str) {
+    run_game(title, |cx| Box::new(Sandbox::new(cx)));
+}
+
+/// Opens the window and runs `make`'s game until the window is closed. `make`
+/// is called once the GPU is ready (later on the web, where init is async).
+pub fn run_game(
+    title: &'static str,
+    make: impl FnOnce(&mut Context<'_>) -> Box<dyn Game> + 'static,
+) {
     platform::init_logging();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -43,6 +57,7 @@ pub fn run(title: &'static str) {
         proxy: event_loop.create_proxy(),
         window: None,
         state: State::Uninitialized,
+        make: Some(Box::new(make)),
     };
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -101,10 +116,10 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::GpuReady(Ok(gpu)) => {
-                let Some(window) = &self.window else {
+                let (Some(window), Some(make)) = (&self.window, self.make.take()) else {
                     return;
                 };
-                let running = Running::new(gpu, window);
+                let running = Shell::new(gpu, window, make);
                 let name = running.backend();
                 platform::report_status(&format!("Running on {name}"));
                 window.set_title(&format!("{} ({name})", self.title));
