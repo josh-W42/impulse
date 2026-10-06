@@ -24,8 +24,12 @@ const SKY: wgpu::Color = wgpu::Color {
     b: 0.38,
     a: 1.0,
 };
-/// Half-width of the square the shadow map covers, centered on the origin.
-const SHADOW_EXTENT: f32 = 25.0;
+/// Where the shadow map's square is centered, and its half-width, until a
+/// game moves it ([`Renderer::set_shadow_focus`]).
+const DEFAULT_SHADOW_FOCUS: Vec3 = Vec3::ZERO;
+const DEFAULT_SHADOW_HALF_EXTENT: f32 = 25.0;
+/// Half-widths outside this range waste or starve the shadow map.
+const SHADOW_HALF_EXTENT_RANGE: (f32, f32) = (5.0, 100.0);
 
 const MESH_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 10 => Float32x2, 11 => Float32x4];
@@ -241,6 +245,8 @@ pub struct Renderer {
     sky_pipeline: wgpu::RenderPipeline,
     sky: Sky,
     sky_sh: [[f32; 4]; 9],
+    shadow_focus: Vec3,
+    shadow_half_extent: f32,
     /// Layout and shared sampler for per-material bind groups (group 1).
     material_bgl: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
@@ -597,6 +603,8 @@ impl Renderer {
             sky_pipeline,
             sky,
             sky_sh,
+            shadow_focus: DEFAULT_SHADOW_FOCUS,
+            shadow_half_extent: DEFAULT_SHADOW_HALF_EXTENT,
             globals,
             scene_bind_group,
             globals_bind_group,
@@ -643,7 +651,8 @@ impl Renderer {
         let rgba = |v: Vec3| v.extend(1.0).to_array();
         let globals = GlobalsRaw {
             view_proj: camera.view_proj.to_cols_array_2d(),
-            light_view_proj: light_view_proj(light_dir).to_cols_array_2d(),
+            light_view_proj: light_view_proj(light_dir, self.shadow_focus, self.shadow_half_extent)
+                .to_cols_array_2d(),
             inv_view_proj: camera.view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).to_array(),
             light_dir: light_dir.extend(EXPOSURE).to_array(),
@@ -807,6 +816,18 @@ impl Renderer {
         );
         self.materials.push(group);
         MaterialId((self.materials.len() - 1) as u32)
+    }
+
+    /// Centers the shadow map on `focus`. Everything within `half_extent`
+    /// metres of it (clamped to 5..100) casts and receives shadows; the
+    /// light's square can reach further in some directions, but only that
+    /// circle is guaranteed. The map's resolution is fixed, so a bigger
+    /// area means blurrier shadows. Change the extent in coarse steps: a
+    /// continuously changing extent makes shadow edges shimmer.
+    pub fn set_shadow_focus(&mut self, focus: Vec3, half_extent: f32) {
+        let (lo, hi) = SHADOW_HALF_EXTENT_RANGE;
+        self.shadow_focus = focus;
+        self.shadow_half_extent = half_extent.clamp(lo, hi);
     }
 
     /// The sky lighting the scene.
@@ -1003,16 +1024,74 @@ fn material_bind_group(
     })
 }
 
-/// Orthographic view of the scene from the directional light.
-fn light_view_proj(light_dir: Vec3) -> Mat4 {
-    let light_view = view::look_at_mat4(-light_dir * 40.0, Vec3::ZERO, Vec3::Y);
-    let light_proj = proj::directx::orthographic(
-        -SHADOW_EXTENT,
-        SHADOW_EXTENT,
-        -SHADOW_EXTENT,
-        SHADOW_EXTENT,
-        1.0,
-        80.0,
-    );
-    light_proj * light_view
+/// Orthographic view from the directional light of the square `half_extent`
+/// metres around `focus`.
+fn light_view_proj(light_dir: Vec3, focus: Vec3, half_extent: f32) -> Mat4 {
+    // Move the focus only in whole shadow texels (in light space), so panning
+    // doesn't make shadow edges shimmer.
+    let rotation = view::look_at_mat4(Vec3::ZERO, light_dir, Vec3::Y);
+    let texel = 2.0 * half_extent / SHADOW_SIZE as f32;
+    let local = rotation.transform_point3(focus);
+    let snap = |v: f32| (v / texel).round() * texel;
+    let center =
+        rotation
+            .inverse()
+            .transform_point3(Vec3::new(snap(local.x), snap(local.y), local.z));
+    let light_view = view::look_at_mat4(center - light_dir * 40.0, center, Vec3::Y);
+    let e = half_extent;
+    proj::directx::orthographic(-e, e, -e, e, 1.0, 80.0) * light_view
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sun() -> Vec3 {
+        -Sky::default().sun_direction
+    }
+
+    #[test]
+    fn default_shadow_matches_old_projection() {
+        let old = proj::directx::orthographic(-25.0, 25.0, -25.0, 25.0, 1.0, 80.0)
+            * view::look_at_mat4(-sun() * 40.0, Vec3::ZERO, Vec3::Y);
+        let new = light_view_proj(sun(), DEFAULT_SHADOW_FOCUS, DEFAULT_SHADOW_HALF_EXTENT);
+        assert!(new.abs_diff_eq(old, 1e-5), "{new:?} vs {old:?}");
+    }
+
+    #[test]
+    fn shadow_covers_the_ground_within_half_extent_of_the_focus() {
+        let focus = Vec3::new(60.0, 0.0, 60.0);
+        let m = light_view_proj(sun(), focus, 30.0);
+        for i in 0..16 {
+            let angle = i as f32 / 16.0 * std::f32::consts::TAU;
+            for r in [0.0, 15.0, 29.0] {
+                let ground = focus + r * Vec3::new(angle.cos(), 0.0, angle.sin());
+                let p = m.project_point3(ground);
+                assert!(
+                    p.x.abs() <= 1.0 && p.y.abs() <= 1.0 && (0.0..=1.0).contains(&p.z),
+                    "{ground} maps outside the shadow map: {p:?}"
+                );
+            }
+        }
+        // ...and the origin, 85 m away, is not covered.
+        let o = m.project_point3(Vec3::ZERO);
+        assert!(o.x.abs() > 1.0 || o.y.abs() > 1.0, "{o:?}");
+    }
+
+    #[test]
+    fn shadow_map_moves_in_whole_texels() {
+        let e = 30.0;
+        let texel = 2.0 * e / SHADOW_SIZE as f32;
+        for i in 0..20 {
+            let focus = Vec3::new(i as f32 * 1.37, 0.0, i as f32 * -0.91);
+            let m = light_view_proj(sun(), focus, e);
+            // The orthographic projection maps light-space x and y to x / e.
+            for offset in [m.w_axis.x * e / texel, m.w_axis.y * e / texel] {
+                assert!(
+                    (offset - offset.round()).abs() < 0.02,
+                    "focus {focus}: offset {offset} texels isn't whole"
+                );
+            }
+        }
+    }
 }
