@@ -862,6 +862,21 @@ impl Renderer {
         MeshId((self.meshes.len() - 1) as u32)
     }
 
+    /// Rebuilds a runtime-added mesh (from [`Renderer::add_mesh`] or
+    /// [`Renderer::add_mesh_with_material`]) from new data, keeping its id and
+    /// material: for geometry that changes now and then, like a terrain chunk.
+    /// Returns `false`, and changes nothing, for built-in or unknown ids.
+    pub fn replace_mesh(&mut self, gpu: &Gpu, id: MeshId, data: &MeshData) -> bool {
+        if !is_custom(id, self.meshes.len() as u32) {
+            return false;
+        }
+        let mesh = &mut self.meshes[id.0 as usize];
+        let material = mesh.material;
+        *mesh = GpuMesh::new(gpu.device(), data);
+        mesh.material = material;
+        true
+    }
+
     /// Frees runtime-added meshes and textures added since the last
     /// [`Renderer::pin_custom_meshes`] (built-ins and pinned ones stay); their
     /// ids become invalid.
@@ -912,6 +927,12 @@ impl Renderer {
             pass.draw_indexed(0..mesh.index_count, 0, 0..count);
         }
     }
+}
+
+/// Whether `id` names a runtime-added mesh (not a built-in [`MeshKind`]) among
+/// `mesh_count` meshes.
+fn is_custom(id: MeshId, mesh_count: u32) -> bool {
+    (MeshKind::ALL.len() as u32..mesh_count).contains(&id.0)
 }
 
 /// A texture handle from [`Renderer::add_texture`].
@@ -1048,6 +1069,20 @@ mod tests {
 
     fn sun() -> Vec3 {
         -Sky::default().sun_direction
+    }
+
+    #[test]
+    fn only_runtime_meshes_are_replaceable() {
+        let builtins = MeshKind::ALL.len() as u32;
+        for kind in MeshKind::ALL {
+            assert!(!is_custom(kind.into(), builtins + 3), "{kind:?}");
+        }
+        assert!(is_custom(MeshId(builtins), builtins + 3));
+        assert!(is_custom(MeshId(builtins + 2), builtins + 3));
+        assert!(
+            !is_custom(MeshId(builtins + 3), builtins + 3),
+            "not added yet"
+        );
     }
 
     #[test]

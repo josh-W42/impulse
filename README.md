@@ -82,7 +82,8 @@ an event, such as browser pointer lock. The engine re-exports `egui`, `glam`,
 versions. Also available: `RtsCamera` (strategy-game camera with default
 controls), `perspective`, `cursor_ray`, `FixedTimestep`, and
 `Renderer::set_shadow_focus` for scenes larger than the default 25 m shadow
-radius. The smallest example: `cargo run -p impulse-engine --example spinning_cube`.
+radius, and `Renderer::replace_mesh` for runtime meshes that change (e.g.
+terrain chunks). The smallest example: `cargo run -p impulse-engine --example spinning_cube`.
 The sandbox (`crates/engine/src/running.rs`) is itself a `Game`.
 
 ## Prerequisites
