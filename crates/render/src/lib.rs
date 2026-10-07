@@ -24,6 +24,6 @@ pub use draw_list::{
     DEFAULT_METALLIC, DEFAULT_ROUGHNESS, DebugLine, DrawList, Instance, InstanceRaw, group_by_mesh,
 };
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};
-pub use mesh::{MeshData, MeshId, MeshKind, Vertex, perpendicular_tangent};
+pub use mesh::{MeshData, MeshId, MeshKind, Vertex, cylinder, perpendicular_tangent, uv_sphere};
 pub use renderer::{CameraData, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame};
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};
