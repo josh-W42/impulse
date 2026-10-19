@@ -22,6 +22,48 @@ Success criteria:
 Not goals for the first playable: quests, items and an economy, PvE AI beyond
 training dummies, multiple zones.
 
+## Setting and art
+
+High fantasy in the spirit of WoW (two factions at war, swords and spells,
+bright readable colours) but our own world, names and lore: no borrowed races,
+places, factions or ability names. Faction names come with the game's name.
+
+Art direction: **stylized low-poly**. It reads well from a third-person camera,
+stays inside the browser's draw and memory budget, and matches the CC0 packs we
+can use now: KayKit (animated adventurer characters, dungeon and forest kits),
+Quaternius (characters, nature) and Kenney (the props already in
+`assets/models/`). Check each pack's licence before adding it, as
+`assets/models/LICENSES.md` does today.
+
+## Starting classes
+
+Two contrasting classes, enough to test melee against ranged, interrupts and
+crowd control. Numbers are placeholders for G0 tuning.
+
+**Warrior** (melee, plate). Resource: **rage**, 0–100, gained by dealing and
+taking damage, drains out of combat.
+
+| Ability | Cast | Range | Cooldown | Effect |
+|---|---|---|---|---|
+| Heavy Strike | instant | 5 m | GCD | Weapon damage; 15 rage |
+| Charge | instant | 8–25 m | 15 s | Rush to the target, 1 s stun, +20 rage; out of combat only |
+| Hamstring | instant | 5 m | GCD | 50% slow for 10 s; 10 rage |
+| Shield Bash | instant | 5 m | 12 s | Interrupts a cast, locks that spell school for 4 s; 10 rage |
+| Shield Wall | instant | self | 120 s | 40% less damage taken for 8 s |
+
+**Mage** (ranged, cloth). Resource: **mana**, regenerates slowly.
+
+| Ability | Cast | Range | Cooldown | Effect |
+|---|---|---|---|---|
+| Firebolt | 2.0 s | 35 m | GCD | Fire damage (projectile) |
+| Frost Lance | 1.5 s | 35 m | GCD | Frost damage, 40% slow for 6 s |
+| Frost Ring | instant | 10 m around self | 25 s | Roots enemies for 6 s; damage may break it |
+| Blink | instant | 15 m forward | 15 s | Teleport; a capsule sweep stops it at walls; breaks roots and stuns |
+| Counterspell | instant | 35 m | 24 s | Interrupts a cast, locks that spell school for 6 s |
+
+Charge and Blink are the two abilities that move a character through the world,
+so they exercise the M13 kinematic bodies and shape casts directly.
+
 ## What tab-target changes
 
 Combat is resolved from **who is targeted**, not from where a swing or projectile
@@ -130,6 +172,25 @@ Entities are plain structs in a `Vec` indexed by generational ids, like
   entities within ~100 m. Combat events about the player always arrive,
   whatever the distance.
 
+### Hosting
+
+- **Zone server: [Render](https://render.com)** as a Docker web service.
+  Render supports WebSockets on web services. The free tier sleeps after 15
+  minutes without HTTP requests or WebSocket messages and takes about a minute
+  to wake: fine for development demos, not for players. Move to a paid,
+  always-on instance once people play.
+- Deploys replace the instance and drop every connection (graceful shutdown
+  window 30 s, extendable to 300 s). The server saves characters on SIGTERM and
+  the client reconnects automatically (G3).
+- Shared CPUs make tick times jittery. The server reports tick time (mean, p95,
+  max) from G1 on; if p95 stops fitting the 33 ms tick, move to a dedicated-CPU
+  instance or another host.
+- Alternatives if Render stops fitting: Fly.io (cheap per-second machines in
+  many regions, so zones can sit near players) or a plain VPS (best price per
+  CPU, but we run the box ourselves).
+- **Client:** static files, like the engine demo on Firebase Hosting today, or
+  a Render static site next to the server.
+
 ### Persistence
 
 - SQLite first (one file next to the server), Postgres when there is more than
@@ -181,8 +242,7 @@ Every milestone ships a browser demo, as in the engine.
 
 ## Open questions
 
-1. Name and repository for the game.
-2. Setting and art direction (affects which asset packs fit).
-3. Starting classes (suggest two contrasting ones, e.g. melee warrior and
-   ranged caster).
-4. Hosting for the zone server (a small VPS is enough until G4).
+1. Name and repository for the game (and the two faction names).
+
+Decided 2026-10-19: high-fantasy setting with stylized low-poly art; Warrior
+and Mage as the starting classes; Render for the zone server.
