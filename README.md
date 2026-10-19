@@ -22,6 +22,9 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
   distance; soft (spring-regularized) rows so closed loops stay stable; joined
   bodies skip collision and share a sleep island
 - Scale: dynamic AABB-tree broadphase, island sleeping, raycasts, per-phase profiler
+- Gameplay: kinematic bodies (characters, platforms: they push, aren't pushed),
+  collision groups and masks, shape casts (GJK distance + conservative
+  advancement) and overlap queries, filtered raycasts
 - Rendering: physically based (glTF metallic-roughness with normal, occlusion,
   and emissive maps), a procedural sky as image-based light and background,
   Khronos PBR Neutral tonemapping, PCF shadows; WebGPU with a WebGL2 fallback
