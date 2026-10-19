@@ -1,13 +1,13 @@
-# Tab-target PvP MMO on impulse — Design
+# Ashen Crown — Design
 
 **Date:** 2026-10-19
 **Status:** Draft (for review)
 
 ## Purpose
 
-A third-person online RPG with **tab-target combat** (World of Warcraft style)
+**Ashen Crown** is a third-person online RPG with **tab-target combat** (World of Warcraft style)
 and **PvP**, running in the browser on impulse. Like solstice, the game lives in
-its own repository; this doc also lists the engine milestones it needs from
+its own repository (`ashen-crown`); this doc also lists the engine milestones it needs from
 impulse.
 
 Success criteria:
@@ -26,7 +26,17 @@ training dummies, multiple zones.
 
 High fantasy in the spirit of WoW (two factions at war, swords and spells,
 bright readable colours) but our own world, names and lore: no borrowed races,
-places, factions or ability names. Faction names come with the game's name.
+places, factions or ability names.
+
+Premise (working): the old king's crown burned in the cataclysm that ended his
+line. Two factions fight over what comes after:
+
+- **The Gilded Oath**, who swore to restore the crown and the old order: gold,
+  white and blue; knights, cathedrals, walled towns.
+- **The Ashsworn**, who rose from the burned lands and reject any crown: ash
+  grey, ember red and black; war camps, forges, scorched hills.
+
+Faction names are provisional until checked alongside the game name.
 
 Art direction: **stylized low-poly**. It reads well from a third-person camera,
 stays inside the browser's draw and memory budget, and matches the CC0 packs we
@@ -242,7 +252,9 @@ Every milestone ships a browser demo, as in the engine.
 
 ## Open questions
 
-1. Name and repository for the game (and the two faction names).
+None blocking G0. Before a public launch, check "Ashen Crown" and the faction
+names for trademarks and existing games.
 
-Decided 2026-10-19: high-fantasy setting with stylized low-poly art; Warrior
+Decided 2026-10-19: the name Ashen Crown (repository `ashen-crown`); a
+high-fantasy setting with stylized low-poly art; Warrior
 and Mage as the starting classes; Render for the zone server.
