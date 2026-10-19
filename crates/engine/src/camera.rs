@@ -1,7 +1,9 @@
-//! Orbit and fly cameras. Right-handed, Y up; yaw 0 / pitch 0 looks down −Z.
+//! Orbit, fly, strategy and third-person cameras. Right-handed, Y up; yaw 0 /
+//! pitch 0 looks down −Z.
 
 use glam::camera::rh::{proj, view};
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
+use impulse_physics::{Collider, QueryFilter, World};
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
 
@@ -208,6 +210,137 @@ impl RtsCamera {
     }
 }
 
+const THIRD_PERSON_PITCH: (f32, f32) = (-0.3, 1.3);
+const THIRD_PERSON_DISTANCE: (f32, f32) = (1.5, 25.0);
+/// Radians per pixel of right-drag or touch drag.
+const THIRD_PERSON_LOOK: f32 = 0.006;
+/// Radius of the sphere swept from the target to the eye: keeps the near plane
+/// (0.1 m) out of walls.
+const THIRD_PERSON_PROBE: f32 = 0.2;
+/// Closest the eye gets to the target when something is in the way.
+const THIRD_PERSON_MIN_PULL: f32 = 0.3;
+/// How fast (1/s) the eye eases back out once the way is clear.
+const THIRD_PERSON_EASE_OUT: f32 = 4.0;
+
+/// Follows a character from behind: orbits a target point (usually just above
+/// the character's head) and pulls in when a wall or the ground would come
+/// between the target and the eye. Same spherical convention as
+/// [`OrbitCamera`] (yaw 0 looks down −Z).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThirdPersonCamera {
+    pub target: Vec3,
+    pub yaw: f32,
+    /// Radians above horizontal, kept within [-0.3, 1.3].
+    pub pitch: f32,
+    /// Wanted distance from the target, kept within [1.5, 25].
+    pub distance: f32,
+    /// Distance in use after [`ThirdPersonCamera::avoid_obstacles`]: never more
+    /// than `distance`.
+    current: f32,
+}
+
+impl ThirdPersonCamera {
+    /// Behind `target` (looking down −Z), 7 m back and 20° above it.
+    pub fn new(target: Vec3) -> Self {
+        Self {
+            target,
+            yaw: 0.0,
+            pitch: 0.35,
+            distance: 7.0,
+            current: 7.0,
+        }
+    }
+
+    /// Unit vector from the target toward the eye.
+    fn offset_dir(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        Vec3::new(cp * sy, sp, cp * cy)
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        self.target + self.offset_dir() * self.current
+    }
+
+    pub fn view(&self) -> Mat4 {
+        view::look_at_mat4(self.eye(), self.target, Vec3::Y)
+    }
+
+    /// The direction the camera faces, flattened onto the ground: "forward" for
+    /// movement keys.
+    pub fn forward(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        Vec3::new(-sy, 0.0, -cy)
+    }
+
+    /// Screen right, on the ground.
+    pub fn right(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        Vec3::new(cy, 0.0, -sy)
+    }
+
+    /// Positive `dyaw` turns the view left; positive `dpitch` raises the eye.
+    pub fn rotate(&mut self, dyaw: f32, dpitch: f32) {
+        self.yaw += dyaw;
+        self.pitch = (self.pitch + dpitch).clamp(THIRD_PERSON_PITCH.0, THIRD_PERSON_PITCH.1);
+    }
+
+    /// `factor` < 1 moves closer.
+    pub fn zoom(&mut self, factor: f32) {
+        if factor.is_finite() && factor > 0.0 {
+            self.distance =
+                (self.distance * factor).clamp(THIRD_PERSON_DISTANCE.0, THIRD_PERSON_DISTANCE.1);
+            self.current = self.current.min(self.distance);
+        }
+    }
+
+    /// Default controls while the pointer is free of the UI: right-drag or a
+    /// one-finger drag looks around (the view follows the pointer), the wheel
+    /// or a pinch zooms.
+    pub fn update(&mut self, input: &InputState, pointer_free: bool) {
+        if !pointer_free {
+            return;
+        }
+        let mut drag = input.touch_rotate();
+        if input.button_held(MouseButton::Right) {
+            drag += input.cursor_delta();
+        }
+        self.rotate(-drag.x * THIRD_PERSON_LOOK, drag.y * THIRD_PERSON_LOOK);
+        if input.wheel() != 0.0 {
+            self.zoom(0.9f32.powf(input.wheel()));
+        }
+        if input.touch_pinch() != 1.0 {
+            self.zoom(1.0 / input.touch_pinch());
+        }
+    }
+
+    /// Pulls the eye in front of the first thing (that `filter` accepts)
+    /// between the target and the wanted eye position, at once; eases back out
+    /// over a fraction of a second when the way clears. Call each frame after
+    /// moving the target. Exclude the character's own body in `filter`.
+    pub fn avoid_obstacles(&mut self, world: &World, filter: QueryFilter, dt: f32) {
+        let probe = Collider::Sphere {
+            radius: THIRD_PERSON_PROBE,
+        };
+        let clear = world
+            .shape_cast(
+                probe,
+                self.target,
+                Quat::IDENTITY,
+                self.offset_dir(),
+                self.distance,
+                filter,
+            )
+            .map_or(self.distance, |hit| hit.distance.max(THIRD_PERSON_MIN_PULL));
+        if clear < self.current || !dt.is_finite() {
+            self.current = clear;
+        } else {
+            let ease = 1.0 - (-THIRD_PERSON_EASE_OUT * dt.max(0.0)).exp();
+            self.current += (clear - self.current) * ease;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraMode {
     Orbit,
@@ -389,6 +522,77 @@ mod tests {
         let fwd = view_forward(f.view());
         f.translate(1.0, 0.0, 0.0);
         assert!(f.position.abs_diff_eq(fwd, 1e-4));
+    }
+
+    #[test]
+    fn third_person_starts_behind_the_target() {
+        let cam = ThirdPersonCamera::new(Vec3::new(0.0, 1.6, 0.0));
+        let eye = cam.eye();
+        assert!(eye.z > 6.0 && eye.y > 1.6, "{eye}");
+        assert!(view_forward(cam.view()).dot(Vec3::NEG_Z) > 0.9);
+        assert!(cam.forward().abs_diff_eq(Vec3::NEG_Z, 1e-6));
+        assert!(cam.right().abs_diff_eq(Vec3::X, 1e-6));
+    }
+
+    #[test]
+    fn third_person_forward_matches_the_view() {
+        let mut cam = ThirdPersonCamera::new(Vec3::ZERO);
+        cam.rotate(1.1, 0.4);
+        let seen = view_forward(cam.view());
+        let flat = Vec3::new(seen.x, 0.0, seen.z).normalize();
+        assert!(
+            cam.forward().abs_diff_eq(flat, 1e-4),
+            "{} vs {flat}",
+            cam.forward()
+        );
+        assert!(cam.right().abs_diff_eq(cam.forward().cross(Vec3::Y), 1e-6));
+    }
+
+    #[test]
+    fn third_person_pitch_and_zoom_are_clamped() {
+        let mut cam = ThirdPersonCamera::new(Vec3::ZERO);
+        cam.rotate(0.0, 10.0);
+        assert_eq!(cam.pitch, THIRD_PERSON_PITCH.1);
+        cam.rotate(0.0, -20.0);
+        assert_eq!(cam.pitch, THIRD_PERSON_PITCH.0);
+        cam.zoom(0.0001);
+        assert_eq!(cam.distance, THIRD_PERSON_DISTANCE.0);
+        cam.zoom(1e6);
+        assert_eq!(cam.distance, THIRD_PERSON_DISTANCE.1);
+        assert!(cam.current <= cam.distance);
+    }
+
+    #[test]
+    fn third_person_pulls_in_at_walls_and_eases_back_out() {
+        use impulse_physics::BodyDesc;
+
+        let mut world = World::default();
+        // A wall 3 m behind the target (the eye wants to be 7 m back).
+        let wall = world
+            .add_body(
+                BodyDesc::fixed(Vec3::new(0.0, 2.0, 3.5)).with_collider(Collider::Box {
+                    half_extents: Vec3::new(5.0, 3.0, 0.5),
+                }),
+            )
+            .unwrap();
+        let mut cam = ThirdPersonCamera {
+            pitch: 0.0,
+            ..ThirdPersonCamera::new(Vec3::new(0.0, 1.6, 0.0))
+        };
+        cam.avoid_obstacles(&world, QueryFilter::ALL, 1.0 / 60.0);
+        // The probe sphere stops at the wall face (z = 3): eye 0.2 m in front.
+        assert!((cam.eye().z - 2.8).abs() < 0.01, "{}", cam.eye());
+        world.remove_body(wall);
+        cam.avoid_obstacles(&world, QueryFilter::ALL, 1.0 / 60.0);
+        let after_one = cam.eye().z;
+        assert!(
+            after_one > 2.8 && after_one < 4.0,
+            "eases out, not jumps: {after_one}"
+        );
+        for _ in 0..120 {
+            cam.avoid_obstacles(&world, QueryFilter::ALL, 1.0 / 60.0);
+        }
+        assert!((cam.eye().z - 7.0).abs() < 0.01, "{}", cam.eye());
     }
 
     fn rts() -> RtsCamera {

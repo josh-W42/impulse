@@ -8,6 +8,7 @@ mod body;
 mod box_box;
 mod broadphase;
 mod capsule;
+mod character;
 mod collider;
 mod contact;
 mod distance;
@@ -25,6 +26,7 @@ mod world;
 
 pub use body::{BodyDesc, BodyError, BodyKind, RigidBody};
 pub use broadphase::Aabb;
+pub use character::{CharacterController, CharacterDesc};
 pub use collider::{Collider, HullId, Material};
 pub use contact::{Contact, find_contacts};
 pub use filter::{CollisionFilter, QueryFilter};
