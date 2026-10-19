@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
-use crate::body::{BodyDesc, BodyError, RigidBody};
+use crate::body::{BodyDesc, BodyError, BodyKind, RigidBody};
 use crate::broadphase::{Aabb, AabbTree};
-use crate::collider::HullId;
+use crate::collider::{Collider, HullId};
 use crate::contact::Contact;
 use crate::contact::contacts_for_pairs;
+use crate::filter::{CollisionFilter, QueryFilter};
 use crate::hull::{ConvexHull, HullError};
 use crate::joint::{Joint, JointDesc, JointError, JointId};
 use crate::raycast::{RayHit, ray_shape};
@@ -384,6 +385,9 @@ impl World {
                 has_awake[islands.find(i)] = true;
             }
         }
+        for touched in self.touched_by_moving_kinematic(contacts) {
+            has_awake[islands.find(touched)] = true;
+        }
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(body) = &mut slot.body
                 && body.asleep
@@ -393,6 +397,19 @@ impl World {
                 body.sleep_timer = 0.0;
             }
         }
+    }
+
+    /// Slot indices of dynamic bodies in contact with a moving kinematic body:
+    /// their islands must wake (and stay awake) even with nothing else moving.
+    fn touched_by_moving_kinematic(&self, contacts: &[Contact]) -> Vec<usize> {
+        let moving = |h: BodyHandle| self.body(h).is_some_and(RigidBody::is_moving_kinematic);
+        let dynamic = |h: BodyHandle| self.body(h).is_some_and(|b| b.inverse_mass() != 0.0);
+        contacts
+            .iter()
+            .flat_map(|c| [(c.a, c.b), (c.b, c.a)])
+            .filter(|&(k, d)| moving(k) && dynamic(d))
+            .map(|(_, d)| d.index as usize)
+            .collect()
     }
 
     /// Advances sleep timers; an island whose bodies have all rested long enough
@@ -415,6 +432,9 @@ impl World {
                 ready[islands.find(i)] = false;
             }
         }
+        for touched in self.touched_by_moving_kinematic(contacts) {
+            ready[islands.find(touched)] = false;
+        }
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(body) = &mut slot.body
                 && body.is_active()
@@ -430,6 +450,17 @@ impl World {
     /// Nearest body hit by a ray within `max_distance` (the direction needn't be
     /// unit length; `RayHit::t` is a distance). Rays starting inside a shape skip it.
     pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        self.raycast_filtered(origin, direction, max_distance, QueryFilter::ALL)
+    }
+
+    /// [`World::raycast`] that only sees bodies `filter` accepts.
+    pub fn raycast_filtered(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max_distance: f32,
+        filter: QueryFilter,
+    ) -> Option<RayHit> {
         let dir = direction.try_normalize()?;
         if !origin.is_finite() || max_distance.is_nan() || max_distance < 0.0 {
             return None;
@@ -443,13 +474,11 @@ impl World {
         let mut candidates = Vec::new();
         self.tree
             .ray_candidates(origin, inv_dir, max_distance, |h| candidates.push(h));
-        candidates.extend(self.bodies().filter_map(|(h, b)| {
-            matches!(b.collider(), Some(crate::collider::Collider::Plane { .. })).then_some(h)
-        }));
+        candidates.extend(self.planes());
         candidates
             .into_iter()
             .filter_map(|body| {
-                let b = self.body(body)?;
+                let b = self.body(body).filter(|b| filter.accepts(body, b.filter))?;
                 let (t, normal) = ray_shape(
                     origin,
                     dir,
@@ -465,7 +494,18 @@ impl World {
                     normal,
                 })
             })
-            .min_by(|a, b| a.t.total_cmp(&b.t))
+            .min_by(|a, b| a.t.total_cmp(&b.t).then(a.body.cmp(&b.body)))
+    }
+
+    /// Bodies with a plane collider (unbounded, so not in the broadphase tree).
+    pub(crate) fn planes(&self) -> impl Iterator<Item = BodyHandle> + '_ {
+        self.bodies()
+            .filter(|(_, b)| matches!(b.collider(), Some(Collider::Plane { .. })))
+            .map(|(h, _)| h)
+    }
+
+    pub(crate) fn tree(&self) -> &AabbTree {
+        &self.tree
     }
 
     /// Applies an impulse at a world-space point (changing linear and angular
@@ -485,6 +525,143 @@ impl World {
         }
     }
 
+    /// Teleports a body (any kind) and wakes it and whatever touches it at its old
+    /// or new pose. False, changing nothing, for an unknown body or a non-finite
+    /// pose. Velocities are kept; moving a kinematic body smoothly is
+    /// [`World::set_kinematic_target`]'s job.
+    pub fn set_pose(&mut self, handle: BodyHandle, position: Vec3, orientation: Quat) -> bool {
+        if !position.is_finite() || !orientation.is_finite() || orientation.length_squared() < 1e-12
+        {
+            return false;
+        }
+        let Some(body) = self.body_mut(handle) else {
+            return false;
+        };
+        body.set_pose(position, orientation.normalize());
+        body.asleep = false;
+        body.sleep_timer = 0.0;
+        let body = *body;
+        let slot = handle.index as usize;
+        match (self.slots[slot].proxy, body_aabb(&body, &self.hulls)) {
+            (Some(proxy), Some(aabb)) => {
+                let old = self.tree.fat_aabb(proxy);
+                self.tree.update(proxy, aabb);
+                self.wake_region(old);
+                self.wake_region(aabb);
+            }
+            // A moved plane can touch anything.
+            _ if body.collider().is_some() => {
+                for body in self.bodies_mut() {
+                    body.asleep = false;
+                    body.sleep_timer = 0.0;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Sets a dynamic or kinematic body's velocity and wakes it. False for static
+    /// or unknown bodies and non-finite velocities.
+    pub fn set_velocity(&mut self, handle: BodyHandle, velocity: Vec3) -> bool {
+        self.set_velocities(handle, Some(velocity), None)
+    }
+
+    /// Sets a dynamic or kinematic body's angular velocity (rad/s, world space)
+    /// and wakes it. Dynamic bodies that can't rotate (no collider) ignore it.
+    /// False for static or unknown bodies and non-finite values.
+    pub fn set_angular_velocity(&mut self, handle: BodyHandle, angular_velocity: Vec3) -> bool {
+        self.set_velocities(handle, None, Some(angular_velocity))
+    }
+
+    /// Sets a kinematic body's velocities so that the next `step(dt)` moves it
+    /// exactly to `position` and (to first order) turns it to `orientation`, by
+    /// the shorter way round. This is how characters and platforms move: the
+    /// body sweeps through the step, pushing dynamic bodies in its path, rather
+    /// than teleporting. False for non-kinematic or unknown bodies, a
+    /// non-positive `dt`, or a non-finite target.
+    pub fn set_kinematic_target(
+        &mut self,
+        handle: BodyHandle,
+        position: Vec3,
+        orientation: Quat,
+        dt: f32,
+    ) -> bool {
+        if !(dt.is_finite() && dt > 0.0)
+            || !position.is_finite()
+            || !orientation.is_finite()
+            || orientation.length_squared() < 1e-12
+        {
+            return false;
+        }
+        let Some(body) = self.body(handle).filter(|b| b.is_kinematic()) else {
+            return false;
+        };
+        let velocity = (position - body.position()) / dt;
+        let mut turn = orientation.normalize() * body.orientation().conjugate();
+        if turn.w < 0.0 {
+            turn = -turn; // the same rotation, the short way round
+        }
+        let (axis, angle) = turn.to_axis_angle();
+        let angular_velocity = if angle.is_finite() && angle > 1e-7 {
+            axis * (angle / dt)
+        } else {
+            Vec3::ZERO
+        };
+        self.set_velocities(handle, Some(velocity), Some(angular_velocity))
+    }
+
+    fn set_velocities(
+        &mut self,
+        handle: BodyHandle,
+        velocity: Option<Vec3>,
+        angular_velocity: Option<Vec3>,
+    ) -> bool {
+        if velocity.is_some_and(|v| !v.is_finite())
+            || angular_velocity.is_some_and(|w| !w.is_finite())
+        {
+            return false;
+        }
+        let Some(body) = self
+            .body_mut(handle)
+            .filter(|b| b.kind() != BodyKind::Static)
+        else {
+            return false;
+        };
+        if let Some(v) = velocity {
+            body.velocity = v;
+        }
+        if let Some(w) = angular_velocity
+            && (body.is_kinematic() || body.inverse_inertia_world() != glam::Mat3::ZERO)
+        {
+            body.angular_velocity = w;
+        }
+        body.asleep = false;
+        body.sleep_timer = 0.0;
+        true
+    }
+
+    /// Changes which bodies this one collides with (see [`CollisionFilter`]) and
+    /// wakes it. False for an unknown body.
+    pub fn set_filter(&mut self, handle: BodyHandle, filter: CollisionFilter) -> bool {
+        let Some(body) = self.body_mut(handle) else {
+            return false;
+        };
+        body.filter = filter;
+        body.asleep = false;
+        body.sleep_timer = 0.0;
+        true
+    }
+
+    /// Wakes every body whose broadphase box overlaps `aabb`.
+    fn wake_region(&mut self, aabb: Aabb) {
+        let mut touched = Vec::new();
+        self.tree.query(aabb, |h| touched.push(h));
+        for handle in touched {
+            self.wake(handle);
+        }
+    }
+
     /// Refits broadphase leaves after bodies moved (cheap when they stay in their margin).
     fn sync_broadphase(&mut self) {
         for slot in &self.slots {
@@ -497,7 +674,8 @@ impl World {
     }
 
     /// Pairs that might touch, sorted: tree overlaps between bounded shapes plus every
-    /// (plane, bounded dynamic body) pair. Static–static pairs are skipped.
+    /// (plane, bounded dynamic body) pair. Pairs without a dynamic body, and pairs
+    /// whose collision filters exclude each other, are skipped.
     pub(crate) fn candidate_pairs(&self) -> Vec<(BodyHandle, BodyHandle)> {
         let mut pairs = Vec::new();
         let mut planes = Vec::new();
@@ -505,7 +683,7 @@ impl World {
             let Some(collider) = body.collider() else {
                 continue;
             };
-            if matches!(collider, crate::collider::Collider::Plane { .. }) {
+            if matches!(collider, Collider::Plane { .. }) {
                 planes.push(handle);
                 continue;
             }
@@ -514,18 +692,25 @@ impl World {
                 .expect("bounded bodies have proxies");
             let dynamic = body.inverse_mass() != 0.0;
             self.tree.query(self.tree.fat_aabb(proxy), |other| {
-                // Each pair once (from its lower handle); skip static–static.
-                if other > handle {
-                    let other_dynamic = self.body(other).is_some_and(|b| b.inverse_mass() != 0.0);
-                    if dynamic || other_dynamic {
-                        pairs.push((handle, other));
-                    }
+                // Each pair once (from its lower handle); skip pairs with no
+                // dynamic body (static and kinematic never collide with each
+                // other) and pairs their filters keep apart.
+                if other > handle
+                    && let Some(other_body) = self.body(other)
+                    && (dynamic || other_body.inverse_mass() != 0.0)
+                    && body.filter.collides_with(other_body.filter)
+                {
+                    pairs.push((handle, other));
                 }
             });
         }
         for plane in planes {
+            let plane_filter = self.body(plane).expect("listed above").filter;
             for (handle, body) in self.bodies() {
-                if body.inverse_mass() != 0.0 && self.slots[handle.index as usize].proxy.is_some() {
+                if body.inverse_mass() != 0.0
+                    && self.slots[handle.index as usize].proxy.is_some()
+                    && body.filter.collides_with(plane_filter)
+                {
                     pairs.push((plane.min(handle), plane.max(handle)));
                 }
             }

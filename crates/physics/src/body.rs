@@ -3,6 +3,7 @@ use std::fmt;
 use glam::{Mat3, Quat, Vec3};
 
 use crate::collider::{Collider, Material};
+use crate::filter::CollisionFilter;
 use crate::hull::ConvexHull;
 
 /// How a body participates in the simulation.
@@ -12,6 +13,11 @@ pub enum BodyKind {
     Dynamic { mass: f32 },
     /// Never moves (floors, walls).
     Static,
+    /// Moved only by its own velocity, which the caller sets (characters,
+    /// moving platforms, doors). Infinite mass: pushes dynamic bodies, is never
+    /// pushed back, ignores gravity, and doesn't collide with static or other
+    /// kinematic bodies.
+    Kinematic,
 }
 
 /// Everything needed to create a body.
@@ -26,6 +32,7 @@ pub struct BodyDesc {
     /// `None`: the body moves but never collides.
     pub collider: Option<Collider>,
     pub material: Material,
+    pub filter: CollisionFilter,
 }
 
 impl BodyDesc {
@@ -38,12 +45,20 @@ impl BodyDesc {
             angular_velocity: Vec3::ZERO,
             collider: None,
             material: Material::default(),
+            filter: CollisionFilter::DEFAULT,
         }
     }
 
     pub fn fixed(position: Vec3) -> Self {
         Self {
             kind: BodyKind::Static,
+            ..Self::dynamic(1.0, position)
+        }
+    }
+
+    pub fn kinematic(position: Vec3) -> Self {
+        Self {
+            kind: BodyKind::Kinematic,
             ..Self::dynamic(1.0, position)
         }
     }
@@ -57,6 +72,10 @@ impl BodyDesc {
 
     pub fn with_material(self, material: Material) -> Self {
         Self { material, ..self }
+    }
+
+    pub fn with_filter(self, filter: CollisionFilter) -> Self {
+        Self { filter, ..self }
     }
 
     pub fn with_velocity(self, velocity: Vec3) -> Self {
@@ -116,6 +135,7 @@ pub struct RigidBody {
     pub(crate) sleep_timer: f32,
     collider: Option<Collider>,
     material: Material,
+    pub(crate) filter: CollisionFilter,
 }
 
 impl RigidBody {
@@ -139,14 +159,14 @@ impl RigidBody {
         let inverse_mass = match desc.kind {
             BodyKind::Dynamic { mass } if mass.is_finite() && mass > 0.0 => 1.0 / mass,
             BodyKind::Dynamic { .. } => return Err(BodyError::InvalidMass),
-            BodyKind::Static => 0.0,
+            BodyKind::Static | BodyKind::Kinematic => 0.0,
         };
         if !desc.material.is_valid() {
             return Err(BodyError::InvalidMaterial);
         }
         let collider = desc
             .collider
-            .map(|c| validate_collider(c, inverse_mass == 0.0, hulls))
+            .map(|c| validate_collider(c, desc.kind == BodyKind::Static, hulls))
             .transpose()?;
         let inverse_inertia_local = match collider {
             Some(Collider::Hull { hull }) if inverse_mass != 0.0 => {
@@ -154,12 +174,13 @@ impl RigidBody {
             }
             _ => Mat3::from_diagonal(inverse_inertia(collider, inverse_mass)),
         };
-        let (velocity, angular_velocity) = if inverse_mass == 0.0 {
-            (Vec3::ZERO, Vec3::ZERO)
-        } else if inverse_inertia_local == Mat3::ZERO {
-            (desc.velocity, Vec3::ZERO)
-        } else {
-            (desc.velocity, desc.angular_velocity)
+        let (velocity, angular_velocity) = match desc.kind {
+            BodyKind::Static => (Vec3::ZERO, Vec3::ZERO),
+            BodyKind::Kinematic => (desc.velocity, desc.angular_velocity),
+            BodyKind::Dynamic { .. } if inverse_inertia_local == Mat3::ZERO => {
+                (desc.velocity, Vec3::ZERO)
+            }
+            BodyKind::Dynamic { .. } => (desc.velocity, desc.angular_velocity),
         };
         Ok(Self {
             kind: desc.kind,
@@ -173,6 +194,7 @@ impl RigidBody {
             sleep_timer: 0.0,
             collider,
             material: desc.material,
+            filter: desc.filter,
         })
     }
 
@@ -188,6 +210,14 @@ impl RigidBody {
         self.kind
     }
 
+    pub fn is_kinematic(&self) -> bool {
+        self.kind == BodyKind::Kinematic
+    }
+
+    pub fn filter(&self) -> CollisionFilter {
+        self.filter
+    }
+
     pub fn position(&self) -> Vec3 {
         self.position
     }
@@ -200,7 +230,7 @@ impl RigidBody {
         self.velocity
     }
 
-    /// Zero for static bodies.
+    /// Zero for static and kinematic bodies.
     pub fn inverse_mass(&self) -> f32 {
         self.inverse_mass
     }
@@ -212,6 +242,17 @@ impl RigidBody {
     /// Dynamic and awake: gets integrated and solved this step.
     pub(crate) fn is_active(&self) -> bool {
         self.inverse_mass != 0.0 && !self.asleep
+    }
+
+    /// Kinematic with a non-zero velocity: wakes what it touches.
+    pub(crate) fn is_moving_kinematic(&self) -> bool {
+        self.is_kinematic() && (self.velocity != Vec3::ZERO || self.angular_velocity != Vec3::ZERO)
+    }
+
+    /// Teleports (validated by the caller).
+    pub(crate) fn set_pose(&mut self, position: Vec3, orientation: Quat) {
+        self.position = position;
+        self.orientation = orientation;
     }
 
     pub fn angular_velocity(&self) -> Vec3 {
@@ -231,9 +272,16 @@ impl RigidBody {
         }
     }
 
-    /// Second half: move with the (contact-corrected) new velocity.
+    /// Second half: move with the (contact-corrected) new velocity. Kinematic
+    /// bodies move with the velocity they were given.
     pub(crate) fn advance(&mut self, dt: f32) {
-        if self.is_active() {
+        if self.is_kinematic() {
+            // Constant spin through the step, so rotate by exactly ω·dt: the
+            // first-order update below would miss kinematic targets.
+            self.position += self.velocity * dt;
+            self.orientation =
+                (Quat::from_scaled_axis(self.angular_velocity * dt) * self.orientation).normalize();
+        } else if self.is_active() {
             self.position += self.velocity * dt;
             // dq/dt = ½·(ω, 0)·q; renormalize to stop drift. (No gyroscopic term.)
             let w = self.angular_velocity;
