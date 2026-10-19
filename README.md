@@ -24,7 +24,8 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
 - Scale: dynamic AABB-tree broadphase, island sleeping, raycasts, per-phase profiler
 - Gameplay: kinematic bodies (characters, platforms: they push, aren't pushed),
   collision groups and masks, shape casts (GJK distance + conservative
-  advancement) and overlap queries, filtered raycasts
+  advancement) and overlap queries, filtered raycasts; a character controller
+  (walks, slides along walls, climbs slopes and stairs, falls, jumps)
 - Rendering: physically based (glTF metallic-roughness with normal, occlusion,
   and emissive maps), a procedural sky as image-based light and background,
   Khronos PBR Neutral tonemapping, PCF shadows; WebGPU with a WebGL2 fallback
@@ -81,9 +82,10 @@ fn main() {
 textures and materials), the `InputState`, the egui context, and the frame
 time. The optional `window_event` hook is for gestures that must happen inside
 an event, such as browser pointer lock. The engine re-exports `egui`, `glam`,
-`winit` and the renderer (`impulse_engine::render`) so a game uses the same
-versions. Also available: `RtsCamera` (strategy-game camera with default
-controls), `perspective`, `cursor_ray`, `FixedTimestep`, and
+`winit`, the renderer (`impulse_engine::render`) and the physics
+(`impulse_engine::physics`) so a game uses the same versions. Also available:
+`RtsCamera` (strategy-game camera with default controls), `ThirdPersonCamera`
+(follows a character; pulls in at walls), `perspective`, `cursor_ray`, `FixedTimestep`, and
 `Renderer::set_shadow_focus` for scenes larger than the default 25 m shadow
 radius, and `Renderer::replace_mesh` for runtime meshes that change (e.g.
 terrain chunks). The smallest example: `cargo run -p impulse-engine --example spinning_cube`.
