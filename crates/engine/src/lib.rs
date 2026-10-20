@@ -22,6 +22,7 @@ mod scene;
 mod scene_desc;
 mod shell;
 mod timestep;
+pub mod upload;
 
 pub use app::{run, run_game};
 pub use camera::{RtsCamera, ThirdPersonCamera, cursor_ray, perspective};
@@ -30,4 +31,7 @@ pub use input::InputState;
 pub use platform::DEFAULT_UI_SCALE;
 pub use timestep::{FixedTimestep, StepPlan};
 // One version of each shared crate for every game.
-pub use {egui, glam, impulse_physics as physics, impulse_render as render, winit};
+pub use {
+    egui, glam, impulse_anim as anim, impulse_assets as assets, impulse_physics as physics,
+    impulse_render as render, winit,
+};

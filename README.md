@@ -89,6 +89,16 @@ an event, such as browser pointer lock. The engine re-exports `egui`, `glam`,
 `Renderer::set_shadow_focus` for scenes larger than the default 25 m shadow
 radius, and `Renderer::replace_mesh` for runtime meshes that change (e.g.
 terrain chunks). The smallest example: `cargo run -p impulse-engine --example spinning_cube`.
+
+Skinned, animated models: `impulse_engine::assets::load_skinned_glb` reads a
+`.glb` with one skin (and any clips in it; `load_clips` reads clips from a
+separate file, matched to joints by name). `impulse_engine::anim` binds clips
+to the skeleton, plays and crossfades them (`Animator`), and turns the pose
+into skinning matrices. `impulse_engine::upload::upload_skinned_model` uploads
+the meshes; each frame, `DrawList::push_joints` takes the matrices and
+`DrawList::push_skinned` draws each mesh with them. Skinning runs in the
+vertex shader on WebGPU and WebGL2. Example:
+`cargo run -p impulse-engine --example skinned_character`.
 The sandbox (`crates/engine/src/running.rs`) is itself a `Game`.
 
 ## Prerequisites

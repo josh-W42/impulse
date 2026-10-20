@@ -58,6 +58,8 @@ mod tests {
             &[
                 ("vs_main", Vertex),
                 ("vs_shadow", Vertex),
+                ("vs_skinned", Vertex),
+                ("vs_shadow_skinned", Vertex),
                 ("fs_main", Fragment),
                 ("vs_sky", Vertex),
                 ("fs_sky", Fragment),

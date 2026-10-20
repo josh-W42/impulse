@@ -14,13 +14,20 @@ use gltf::buffer::Source as BufferSource;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::Mode;
 
+mod clips;
 mod colliders;
 mod mips;
+mod skin;
 
+pub use clips::{Channel, Clip, Interpolation, Keyframes, load_clips};
 pub use colliders::{
     bounding_box, bounding_capsule, bounding_sphere, extreme_points, fibonacci_directions,
 };
 pub use mips::{ColorSpace, MipLevel, mip_chain};
+pub use skin::{
+    Joint, JointTransform, Skeleton, SkinnedMesh, SkinnedModelData, SkinnedVertex,
+    load_skinned_glb, load_skinned_glb_with,
+};
 
 /// Size and complexity caps for loading untrusted files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +36,8 @@ pub struct Limits {
     pub max_vertices: usize,
     /// Largest texture width or height (texels).
     pub max_texture_size: u32,
+    /// Most joints in a skin.
+    pub max_joints: usize,
 }
 
 impl Default for Limits {
@@ -37,6 +46,7 @@ impl Default for Limits {
             max_bytes: 32 * 1024 * 1024,
             max_vertices: 500_000,
             max_texture_size: 4096,
+            max_joints: 128,
         }
     }
 }
@@ -149,6 +159,15 @@ pub enum ModelError {
     BadGeometry(String),
     /// Nothing drawable: no triangle primitives in the scene.
     NoTriangles,
+    /// A skinned model was expected, but the file has no skin.
+    NoSkin,
+    /// More than one skin (only single-skeleton models are supported).
+    TooManySkins,
+    TooManyJoints {
+        max: usize,
+    },
+    /// An animation's keyframes are malformed.
+    Animation(String),
 }
 
 impl fmt::Display for ModelError {
@@ -169,6 +188,10 @@ impl fmt::Display for ModelError {
             Self::Texture(e) => write!(f, "texture: {e}"),
             Self::BadGeometry(e) => write!(f, "geometry: {e}"),
             Self::NoTriangles => write!(f, "the model has no triangles to draw"),
+            Self::NoSkin => write!(f, "the model has no skin (skeleton)"),
+            Self::TooManySkins => write!(f, "the model has more than one skin"),
+            Self::TooManyJoints { max } => write!(f, "more than {max} joints in the skin"),
+            Self::Animation(e) => write!(f, "animation: {e}"),
         }
     }
 }
@@ -181,74 +204,13 @@ pub fn load_glb(bytes: &[u8]) -> Result<ModelData, ModelError> {
 }
 
 pub fn load_glb_with(bytes: &[u8], limits: &Limits) -> Result<ModelData, ModelError> {
-    if bytes.len() > limits.max_bytes {
-        return Err(ModelError::TooLarge {
-            bytes: bytes.len(),
-            max: limits.max_bytes,
-        });
-    }
-    let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| ModelError::Parse(e.to_string()))?;
+    let gltf = open(bytes, limits)?;
     let blob = gltf.blob.as_deref();
-    if gltf
-        .buffers()
-        .any(|b| matches!(b.source(), BufferSource::Uri(_)))
-        || gltf
-            .images()
-            .any(|i| matches!(i.source(), ImageSource::Uri { .. }))
-    {
-        return Err(ModelError::ExternalData);
-    }
     let bin = |buffer: gltf::Buffer| match buffer.source() {
         BufferSource::Bin => blob,
         BufferSource::Uri(_) => None,
     };
-
-    // Textures: decode each (image, colour space) pair once.
-    let mut textures: Vec<TextureData> = Vec::new();
-    let mut decoded: Vec<(usize, ColorSpace)> = Vec::new();
-    let mut texture = |image: gltf::Image, space: ColorSpace| -> Result<usize, ModelError> {
-        let key = (image.index(), space);
-        if let Some(i) = decoded.iter().position(|k| *k == key) {
-            return Ok(i);
-        }
-        let (rgba, width, height) = decode_image(&image, blob, limits)?;
-        textures.push(TextureData {
-            mips: mip_chain(rgba, width, height, space),
-            space,
-        });
-        decoded.push(key);
-        Ok(textures.len() - 1)
-    };
-    let mut materials = Vec::new();
-    for material in gltf.materials() {
-        let pbr = material.pbr_metallic_roughness();
-        let mut data = MaterialData {
-            base_color: pbr.base_color_factor(),
-            metallic: pbr.metallic_factor(),
-            roughness: pbr.roughness_factor(),
-            emissive: material.emissive_factor(),
-            ..MaterialData::default()
-        };
-        if let Some(info) = pbr.base_color_texture() {
-            data.base_color_texture = Some(texture(info.texture().source(), ColorSpace::Srgb)?);
-        }
-        if let Some(info) = pbr.metallic_roughness_texture() {
-            data.metallic_roughness_texture =
-                Some(texture(info.texture().source(), ColorSpace::Linear)?);
-        }
-        if let Some(info) = material.normal_texture() {
-            data.normal_texture = Some(texture(info.texture().source(), ColorSpace::Normal)?);
-            data.normal_scale = info.scale();
-        }
-        if let Some(info) = material.occlusion_texture() {
-            data.occlusion_texture = Some(texture(info.texture().source(), ColorSpace::Linear)?);
-            data.occlusion_strength = info.strength();
-        }
-        if let Some(info) = material.emissive_texture() {
-            data.emissive_texture = Some(texture(info.texture().source(), ColorSpace::Srgb)?);
-        }
-        materials.push(data);
-    }
+    let (materials, textures) = read_materials(&gltf, blob, limits)?;
 
     // Geometry: walk the scene graph, baking each node's world transform.
     let roots: Vec<gltf::Node> = match gltf.default_scene().or_else(|| gltf.scenes().next()) {
@@ -297,6 +259,82 @@ pub fn load_glb_with(bytes: &[u8], limits: &Limits) -> Result<ModelData, ModelEr
         min,
         max,
     })
+}
+
+/// Parses a self-contained `.glb` within the size limit.
+fn open(bytes: &[u8], limits: &Limits) -> Result<gltf::Gltf, ModelError> {
+    if bytes.len() > limits.max_bytes {
+        return Err(ModelError::TooLarge {
+            bytes: bytes.len(),
+            max: limits.max_bytes,
+        });
+    }
+    let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| ModelError::Parse(e.to_string()))?;
+    if gltf
+        .buffers()
+        .any(|b| matches!(b.source(), BufferSource::Uri(_)))
+        || gltf
+            .images()
+            .any(|i| matches!(i.source(), ImageSource::Uri { .. }))
+    {
+        return Err(ModelError::ExternalData);
+    }
+    Ok(gltf)
+}
+
+/// Every material, and the textures they use (each image and colour space
+/// decoded once).
+fn read_materials(
+    gltf: &gltf::Gltf,
+    blob: Option<&[u8]>,
+    limits: &Limits,
+) -> Result<(Vec<MaterialData>, Vec<TextureData>), ModelError> {
+    let mut textures: Vec<TextureData> = Vec::new();
+    let mut decoded: Vec<(usize, ColorSpace)> = Vec::new();
+    let mut texture = |image: gltf::Image, space: ColorSpace| -> Result<usize, ModelError> {
+        let key = (image.index(), space);
+        if let Some(i) = decoded.iter().position(|k| *k == key) {
+            return Ok(i);
+        }
+        let (rgba, width, height) = decode_image(&image, blob, limits)?;
+        textures.push(TextureData {
+            mips: mip_chain(rgba, width, height, space),
+            space,
+        });
+        decoded.push(key);
+        Ok(textures.len() - 1)
+    };
+    let mut materials = Vec::new();
+    for material in gltf.materials() {
+        let pbr = material.pbr_metallic_roughness();
+        let mut data = MaterialData {
+            base_color: pbr.base_color_factor(),
+            metallic: pbr.metallic_factor(),
+            roughness: pbr.roughness_factor(),
+            emissive: material.emissive_factor(),
+            ..MaterialData::default()
+        };
+        if let Some(info) = pbr.base_color_texture() {
+            data.base_color_texture = Some(texture(info.texture().source(), ColorSpace::Srgb)?);
+        }
+        if let Some(info) = pbr.metallic_roughness_texture() {
+            data.metallic_roughness_texture =
+                Some(texture(info.texture().source(), ColorSpace::Linear)?);
+        }
+        if let Some(info) = material.normal_texture() {
+            data.normal_texture = Some(texture(info.texture().source(), ColorSpace::Normal)?);
+            data.normal_scale = info.scale();
+        }
+        if let Some(info) = material.occlusion_texture() {
+            data.occlusion_texture = Some(texture(info.texture().source(), ColorSpace::Linear)?);
+            data.occlusion_strength = info.strength();
+        }
+        if let Some(info) = material.emissive_texture() {
+            data.emissive_texture = Some(texture(info.texture().source(), ColorSpace::Srgb)?);
+        }
+        materials.push(data);
+    }
+    Ok((materials, textures))
 }
 
 fn read_primitive<'a, 's, F>(

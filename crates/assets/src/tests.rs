@@ -1,5 +1,8 @@
 use super::*;
 
+mod clips;
+mod skin;
+
 const FLOAT: u32 = 5126;
 const U16: u32 = 5123;
 
@@ -29,8 +32,12 @@ impl Glb {
         let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
         let view = self.view(&bytes);
         let count = data.len() / width;
-        // POSITION accessors must carry min/max.
-        let bounds = if ty == "VEC3" {
+        // POSITION and animation input accessors must carry min/max.
+        let bounds = if ty == "SCALAR" {
+            let lo = data.iter().copied().fold(f32::MAX, f32::min);
+            let hi = data.iter().copied().fold(f32::MIN, f32::max);
+            format!(r#","min":[{lo:?}],"max":[{hi:?}]"#)
+        } else if ty == "VEC3" {
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
             for p in data.chunks(3) {
                 for k in 0..3 {
@@ -44,6 +51,17 @@ impl Glb {
         };
         self.accessors.push(format!(
             r#"{{"bufferView":{view},"componentType":{FLOAT},"count":{count},"type":"{ty}"{bounds}}}"#
+        ));
+        self.accessors.len() - 1
+    }
+
+    /// Unsigned shorts, e.g. `JOINTS_0` (VEC4).
+    fn u16s(&mut self, data: &[u16], ty: &str, width: usize) -> usize {
+        let bytes: Vec<u8> = data.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let view = self.view(&bytes);
+        self.accessors.push(format!(
+            r#"{{"bufferView":{view},"componentType":{U16},"count":{},"type":"{ty}"}}"#,
+            data.len() / width
         ));
         self.accessors.len() - 1
     }

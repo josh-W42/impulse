@@ -25,6 +25,29 @@ pub fn perpendicular_tangent(normal: [f32; 3]) -> [f32; 4] {
     [t.x, t.y, t.z, 1.0]
 }
 
+/// A vertex of a skinned mesh: a [`Vertex`] plus up to four joints (indices
+/// into the instance's joint matrices) and their weights (summing to 1).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct SkinnedVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub tangent: [f32; 4],
+    pub joints: [u16; 4],
+    pub weights: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkinnedMeshData {
+    pub vertices: Vec<SkinnedVertex>,
+    pub indices: Vec<u32>,
+}
+
+/// Identifies a skinned mesh added with `Renderer::add_skinned_mesh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SkinnedMeshId(pub u32);
+
 /// Identifies a mesh the renderer can draw: a built-in [`MeshKind`] or one
 /// added at runtime with `Renderer::add_mesh`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
