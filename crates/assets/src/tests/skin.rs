@@ -232,3 +232,36 @@ fn skinned_models_carry_their_clips() {
     assert_eq!(model.clips[0].name, "Bob");
     assert_eq!(model.clips[0].channels[0].target, "root");
 }
+
+#[test]
+fn the_bundled_skinned_model_loads() {
+    let model = load_skinned_glb(include_bytes!(
+        "../../../../assets/models/mannequin-general.glb"
+    ))
+    .unwrap();
+    let skeleton = &model.skeleton;
+    assert_eq!(skeleton.joints.len(), 23);
+    assert!(skeleton.find("handslot.r").is_some());
+    assert!(
+        skeleton
+            .joints
+            .iter()
+            .enumerate()
+            .all(|(i, j)| j.parent.is_none_or(|p| p < i)),
+        "parents first"
+    );
+    assert_eq!(model.clips.len(), 15);
+    assert!(model.clips.iter().any(|c| c.name == "Idle_A"));
+    for clip in &model.clips {
+        for channel in &clip.channels {
+            assert!(
+                skeleton.find(&channel.target).is_some(),
+                "{}: {} names no joint",
+                clip.name,
+                channel.target
+            );
+        }
+    }
+    let size = model.max - model.min;
+    assert!(size.y > 0.5 && size.y < 5.0, "about human height: {size}");
+}

@@ -2,17 +2,15 @@
 //! synchronously and identically everywhere) plus any imported this session.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use glam::{Mat4, Vec3};
-use impulse_assets::{ColorSpace, ModelData, ModelError, TextureData, extreme_points, load_glb};
+use impulse_assets::{ModelData, ModelError, extreme_points, load_glb};
 use impulse_physics::{Collider, World};
-use impulse_render::{
-    Gpu, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureId, Vertex,
-};
+use impulse_render::{Gpu, MeshId, Renderer};
 
 use crate::scene_desc::{ModelCollider, ObjectError};
+use crate::upload::{TextureCache, upload_model};
 
 /// Directions sampled for a model's hull collider (the physics hull cap).
 pub const HULL_DIRECTIONS: usize = impulse_physics::MAX_HULL_POINTS;
@@ -188,82 +186,14 @@ pub type ModelMeshes = HashMap<ModelId, Vec<MeshId>>;
 /// textures (same pixels, same colour space; e.g. a kit's shared palette) are
 /// uploaded once.
 pub fn upload_models(renderer: &mut Renderer, gpu: &Gpu, registry: &ModelRegistry) -> ModelMeshes {
-    let mut textures: HashMap<u64, TextureId> = HashMap::new();
-    let mut out = ModelMeshes::new();
-    for (id, _, _) in registry.list() {
-        let data = &registry.get(id).expect("listed").data;
-        let mut texture = |index: Option<usize>| {
-            let texture = data.textures.get(index?)?;
-            Some(upload_texture(renderer, gpu, texture, &mut textures))
-        };
-        let materials: Vec<MaterialDesc> = data
-            .materials
-            .iter()
-            .map(|m| MaterialDesc {
-                base_color: m.base_color,
-                metallic: m.metallic,
-                roughness: m.roughness,
-                normal_scale: m.normal_scale,
-                occlusion_strength: m.occlusion_strength,
-                emissive: m.emissive,
-                base_color_texture: texture(m.base_color_texture),
-                metallic_roughness_texture: texture(m.metallic_roughness_texture),
-                normal_texture: texture(m.normal_texture),
-                occlusion_texture: texture(m.occlusion_texture),
-                emissive_texture: texture(m.emissive_texture),
-            })
-            .collect();
-        let material_ids: Vec<MaterialId> = materials
-            .iter()
-            .map(|m| renderer.add_material(gpu, m))
-            .collect();
-        // Primitives without a material get glTF's default material.
-        let mut default = None;
-        let meshes = data
-            .meshes
-            .iter()
-            .map(|mesh| {
-                let material = match mesh.material.and_then(|m| material_ids.get(m)) {
-                    Some(&id) => id,
-                    None => *default.get_or_insert_with(|| {
-                        renderer.add_material(gpu, &MaterialDesc::default())
-                    }),
-                };
-                let mesh_data = MeshData {
-                    vertices: mesh
-                        .vertices
-                        .iter()
-                        .map(|v| Vertex {
-                            position: v.position,
-                            normal: v.normal,
-                            uv: v.uv,
-                            tangent: v.tangent,
-                        })
-                        .collect(),
-                    indices: mesh.indices.clone(),
-                };
-                renderer.add_mesh_with_material(gpu, &mesh_data, material)
-            })
-            .collect();
-        out.insert(id, meshes);
-    }
-    out
-}
-
-fn upload_texture(
-    renderer: &mut Renderer,
-    gpu: &Gpu,
-    texture: &TextureData,
-    uploaded: &mut HashMap<u64, TextureId>,
-) -> TextureId {
-    let base = &texture.mips[0];
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (base.width, base.height, &base.rgba, texture.space).hash(&mut hasher);
-    *uploaded.entry(hasher.finish()).or_insert_with(|| {
-        let levels: Vec<&[u8]> = texture.mips.iter().map(|m| m.rgba.as_slice()).collect();
-        let srgb = texture.space == ColorSpace::Srgb;
-        renderer.add_texture(gpu, base.width, base.height, &levels, srgb)
-    })
+    let mut cache = TextureCache::default();
+    registry
+        .list()
+        .map(|(id, _, _)| {
+            let data = &registry.get(id).expect("listed").data;
+            (id, upload_model(renderer, gpu, data, &mut cache))
+        })
+        .collect()
 }
 
 /// Where a model's mesh sits on its body: `transform` maps model space to
