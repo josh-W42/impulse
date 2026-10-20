@@ -63,27 +63,89 @@ fn model_matrix(i: InstanceIn) -> mat4x4<f32> {
     return mat4x4<f32>(i.model_0, i.model_1, i.model_2, i.model_3);
 }
 
-@vertex
-fn vs_main(v: VertexIn, i: InstanceIn) -> VertexOut {
+// The lit pass's vertex output for a vertex already in the model's space.
+fn shade_vertex(position: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>, tangent: vec4<f32>, i: InstanceIn) -> VertexOut {
     let model = model_matrix(i);
-    let world = model * vec4<f32>(v.position, 1.0);
+    let world = model * vec4<f32>(position, 1.0);
     let normal_matrix = mat3x3<f32>(i.normal_0.xyz, i.normal_1.xyz, i.normal_2.xyz);
     var out: VertexOut;
     out.clip = globals.view_proj * world;
     out.world_pos = world.xyz;
-    out.normal = normal_matrix * v.normal;
+    out.normal = normal_matrix * normal;
     out.color = i.color;
     out.light_clip = globals.light_view_proj * world;
-    out.uv = v.uv;
+    out.uv = uv;
     // Tangents follow the surface, so they take the model matrix itself.
-    out.tangent = vec4<f32>((model * vec4<f32>(v.tangent.xyz, 0.0)).xyz, v.tangent.w);
+    out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.pbr = i.pbr.xy;
     return out;
 }
 
 @vertex
+fn vs_main(v: VertexIn, i: InstanceIn) -> VertexOut {
+    return shade_vertex(v.position, v.normal, v.uv, v.tangent, i);
+}
+
+@vertex
 fn vs_shadow(v: VertexIn, i: InstanceIn) -> @builtin(position) vec4<f32> {
     return globals.light_view_proj * model_matrix(i) * vec4<f32>(v.position, 1.0);
+}
+
+// Skinning. Joint matrices live in a float texture (WebGL2 has no storage
+// buffers in the vertex stage): four texels, the columns, per matrix, rows
+// JOINT_TEXTURE_WIDTH texels wide. Must match `draw_list::JOINT_TEXTURE_WIDTH`.
+@group(2) @binding(0) var joint_matrices: texture_2d<f32>;
+const JOINT_TEXTURE_WIDTH: u32 = 1024u;
+
+struct SkinnedVertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(10) uv: vec2<f32>,
+    @location(11) tangent: vec4<f32>,
+    @location(13) joints: vec4<u32>,
+    @location(14) weights: vec4<f32>,
+};
+
+fn joint_matrix(index: u32) -> mat4x4<f32> {
+    let texel = index * 4u;
+    let x = i32(texel % JOINT_TEXTURE_WIDTH);
+    let y = i32(texel / JOINT_TEXTURE_WIDTH);
+    return mat4x4<f32>(
+        textureLoad(joint_matrices, vec2<i32>(x, y), 0),
+        textureLoad(joint_matrices, vec2<i32>(x + 1, y), 0),
+        textureLoad(joint_matrices, vec2<i32>(x + 2, y), 0),
+        textureLoad(joint_matrices, vec2<i32>(x + 3, y), 0),
+    );
+}
+
+// The weighted blend of a vertex's joint matrices; `first` is where the
+// instance's matrices start.
+fn skin_matrix(v: SkinnedVertexIn, first: u32) -> mat4x4<f32> {
+    return joint_matrix(first + v.joints.x) * v.weights.x
+        + joint_matrix(first + v.joints.y) * v.weights.y
+        + joint_matrix(first + v.joints.z) * v.weights.z
+        + joint_matrix(first + v.joints.w) * v.weights.w;
+}
+
+@vertex
+fn vs_skinned(v: SkinnedVertexIn, i: InstanceIn, @location(15) first_joint: u32) -> VertexOut {
+    let skin = skin_matrix(v, first_joint);
+    // Joints only rotate, translate and scale uniformly, so their 3x3 part
+    // carries normals as well as positions.
+    let skin3 = mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz);
+    return shade_vertex(
+        (skin * vec4<f32>(v.position, 1.0)).xyz,
+        skin3 * v.normal,
+        v.uv,
+        vec4<f32>(skin3 * v.tangent.xyz, v.tangent.w),
+        i,
+    );
+}
+
+@vertex
+fn vs_shadow_skinned(v: SkinnedVertexIn, i: InstanceIn, @location(15) first_joint: u32) -> @builtin(position) vec4<f32> {
+    let skin = skin_matrix(v, first_joint);
+    return globals.light_view_proj * model_matrix(i) * skin * vec4<f32>(v.position, 1.0);
 }
 
 fn shadow_factor(light_clip: vec4<f32>) -> f32 {

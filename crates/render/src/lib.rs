@@ -21,9 +21,14 @@ mod shaders;
 mod sky;
 
 pub use draw_list::{
-    DEFAULT_METALLIC, DEFAULT_ROUGHNESS, DebugLine, DrawList, Instance, InstanceRaw, group_by_mesh,
+    DEFAULT_METALLIC, DEFAULT_ROUGHNESS, DebugLine, DrawList, Instance, InstanceRaw,
+    JOINT_TEXTURE_WIDTH, JointRange, SkinnedInstance, SkinnedInstanceRaw, group_by_mesh,
+    group_skinned, joint_texels, joint_texture_rows,
 };
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};
-pub use mesh::{MeshData, MeshId, MeshKind, Vertex, cylinder, perpendicular_tangent, uv_sphere};
+pub use mesh::{
+    MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex, cylinder,
+    perpendicular_tangent, uv_sphere,
+};
 pub use renderer::{CameraData, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame};
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};

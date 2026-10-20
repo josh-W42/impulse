@@ -8,9 +8,14 @@ use glam::camera::rh::{proj, view};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use crate::draw_list::{DrawList, InstanceRaw, group_by_mesh};
+use crate::draw_list::{
+    DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_by_mesh, group_skinned,
+    joint_texels, joint_texture_rows,
+};
 use crate::gpu::Gpu;
-use crate::mesh::{MeshData, MeshId, MeshKind, Vertex};
+use crate::mesh::{
+    MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex,
+};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
 use crate::sky::Sky;
 
@@ -37,6 +42,20 @@ const INSTANCE_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
     2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
     6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4, 12 => Float32x4
 ];
+/// Skinned meshes add joints and weights; with the skinned instance's joint
+/// offset that makes 16 vertex attributes, WebGL2's limit.
+const SKINNED_MESH_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    0 => Float32x3, 1 => Float32x3, 10 => Float32x2, 11 => Float32x4,
+    13 => Uint16x4, 14 => Float32x4
+];
+const SKINNED_INSTANCE_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
+    2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
+    6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4, 12 => Float32x4,
+    15 => Uint32
+];
+/// WebGL2's guaranteed texture height bounds the joint texture: 2048 rows
+/// of 256 matrices.
+const MAX_JOINT_ROWS: u32 = 2048;
 /// Linear HDR → display: a fixed exposure before the tonemapper.
 const EXPOSURE: f32 = 1.0;
 const LINE_ATTRS: [wgpu::VertexAttribute; 2] =
@@ -150,19 +169,64 @@ struct GpuMesh {
 
 impl GpuMesh {
     fn new(device: &wgpu::Device, data: &MeshData) -> Self {
+        Self::from_parts(device, bytemuck::cast_slice(&data.vertices), &data.indices)
+    }
+
+    fn from_parts(device: &wgpu::Device, vertices: &[u8], indices: &[u32]) -> Self {
         Self {
             vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh vertices"),
-                contents: bytemuck::cast_slice(&data.vertices),
+                contents: vertices,
                 usage: wgpu::BufferUsages::VERTEX,
             }),
             indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh indices"),
-                contents: bytemuck::cast_slice(&data.indices),
+                contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             }),
-            index_count: data.indices.len() as u32,
+            index_count: indices.len() as u32,
             material: 0,
+        }
+    }
+}
+
+/// The joint matrices of every skinned instance this frame, as a float
+/// texture the skinned vertex shaders read.
+struct JointTexture {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    rows: u32,
+}
+
+impl JointTexture {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, rows: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("joint matrices"),
+            size: wgpu::Extent3d {
+                width: JOINT_TEXTURE_WIDTH,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("joint matrices"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        Self {
+            texture,
+            bind_group,
+            rows,
         }
     }
 }
@@ -264,6 +328,16 @@ pub struct Renderer {
     /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
     meshes: Vec<GpuMesh>,
     instances: Vec<GrowableBuffer>,
+    skinned_lit_pipeline: wgpu::RenderPipeline,
+    skinned_shadow_pipeline: wgpu::RenderPipeline,
+    joints_bgl: wgpu::BindGroupLayout,
+    /// Bound at group 1 in the skinned shadow pass, which has no material.
+    empty_bind_group: wgpu::BindGroup,
+    joint_texture: JointTexture,
+    skinned_meshes: Vec<GpuMesh>,
+    skinned_instances: Vec<GrowableBuffer>,
+    /// Set once a frame has had more joint matrices than fit (logged once).
+    joints_overflowed: bool,
     lines: GrowableBuffer,
     depth: DepthTarget,
     egui: egui_wgpu::Renderer,
@@ -517,6 +591,109 @@ impl Renderer {
             cache: None,
         });
 
+        let joints_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("joint matrices"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }],
+        });
+        let empty_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("empty"),
+            entries: &[],
+        });
+        let empty_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("empty"),
+            layout: &empty_bgl,
+            entries: &[],
+        });
+        let skinned_mesh_layout = wgpu::VertexBufferLayout {
+            array_stride: size_of::<SkinnedVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &SKINNED_MESH_ATTRS,
+        };
+        let skinned_instance_layout = wgpu::VertexBufferLayout {
+            array_stride: size_of::<SkinnedInstanceRaw>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &SKINNED_INSTANCE_ATTRS,
+        };
+        let skinned_lit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lit skinned"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("lit skinned"),
+                    bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl), Some(&joints_bgl)],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vs_skinned"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    Some(skinned_mesh_layout.clone()),
+                    Some(skinned_instance_layout.clone()),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(gpu.view_format().into())],
+            }),
+            primitive: solid,
+            depth_stencil: depth(
+                true,
+                wgpu::CompareFunction::Less,
+                wgpu::DepthBiasState::default(),
+            ),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let skinned_shadow_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow skinned"),
+                layout: Some(
+                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("shadow skinned"),
+                        bind_group_layouts: &[
+                            Some(&globals_bgl),
+                            Some(&empty_bgl),
+                            Some(&joints_bgl),
+                        ],
+                        immediate_size: 0,
+                    }),
+                ),
+                vertex: wgpu::VertexState {
+                    module: &scene_shader,
+                    entry_point: Some("vs_shadow_skinned"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(skinned_mesh_layout), Some(skinned_instance_layout)],
+                },
+                fragment: None,
+                primitive: solid,
+                depth_stencil: depth(
+                    true,
+                    wgpu::CompareFunction::LessEqual,
+                    wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 2.0,
+                        clamp: 0.0,
+                    },
+                ),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let joint_texture = JointTexture::new(device, &joints_bgl, 1);
+
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky"),
             layout: Some(&globals_layout),
@@ -621,6 +798,14 @@ impl Renderer {
             shadow_view,
             meshes,
             instances,
+            skinned_lit_pipeline,
+            skinned_shadow_pipeline,
+            joints_bgl,
+            empty_bind_group,
+            joint_texture,
+            skinned_meshes: Vec::new(),
+            skinned_instances: Vec::new(),
+            joints_overflowed: false,
             lines: GrowableBuffer::new(device, "lines", 256 * size_of::<LineVertex>() as u64),
             depth: DepthTarget::new(device, gpu.size()),
             egui: egui_wgpu::Renderer::new(
@@ -668,6 +853,7 @@ impl Renderer {
         for (buffer, group) in self.instances.iter_mut().zip(&groups) {
             buffer.write(device, queue, bytemuck::cast_slice(group));
         }
+        let skinned_groups = self.prepare_skinned(gpu, list);
         let line_vertices: Vec<LineVertex> = list
             .lines
             .iter()
@@ -710,6 +896,13 @@ impl Renderer {
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
             self.draw_meshes(&mut pass, &groups, false);
+            if !skinned_groups.is_empty() {
+                pass.set_pipeline(&self.skinned_shadow_pipeline);
+                pass.set_bind_group(0, &self.globals_bind_group, &[]);
+                pass.set_bind_group(1, &self.empty_bind_group, &[]);
+                pass.set_bind_group(2, &self.joint_texture.bind_group, &[]);
+                self.draw_skinned(&mut pass, &skinned_groups, false);
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -738,6 +931,12 @@ impl Renderer {
             pass.set_pipeline(&self.lit_pipeline);
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
             self.draw_meshes(&mut pass, &groups, true);
+            if !skinned_groups.is_empty() {
+                pass.set_pipeline(&self.skinned_lit_pipeline);
+                pass.set_bind_group(0, &self.scene_bind_group, &[]);
+                pass.set_bind_group(2, &self.joint_texture.bind_group, &[]);
+                self.draw_skinned(&mut pass, &skinned_groups, true);
+            }
 
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
@@ -860,6 +1059,105 @@ impl Renderer {
             INITIAL_INSTANCE_BYTES,
         ));
         MeshId((self.meshes.len() - 1) as u32)
+    }
+
+    /// Uploads a skinned mesh drawn with `material`. Skinned meshes live for
+    /// the renderer's lifetime: `clear_custom_meshes` and
+    /// `reset_custom_meshes` leave them alone (games upload them once).
+    pub fn add_skinned_mesh(
+        &mut self,
+        gpu: &Gpu,
+        data: &SkinnedMeshData,
+        material: MaterialId,
+    ) -> SkinnedMeshId {
+        let mut mesh = GpuMesh::from_parts(
+            gpu.device(),
+            bytemuck::cast_slice(&data.vertices),
+            &data.indices,
+        );
+        mesh.material = if (material.0 as usize) < self.materials.len() {
+            material.0 as usize
+        } else {
+            0
+        };
+        self.skinned_meshes.push(mesh);
+        self.skinned_instances.push(GrowableBuffer::new(
+            gpu.device(),
+            "skinned instances",
+            64 * size_of::<SkinnedInstanceRaw>() as u64,
+        ));
+        SkinnedMeshId((self.skinned_meshes.len() - 1) as u32)
+    }
+
+    /// Uploads this frame's joint matrices and skinned instances; returns the
+    /// instances by mesh (empty when there is nothing to skin, or too much).
+    fn prepare_skinned(&mut self, gpu: &Gpu, list: &DrawList) -> Vec<Vec<SkinnedInstanceRaw>> {
+        if list.skinned.is_empty() {
+            return Vec::new();
+        }
+        let rows = joint_texture_rows(list.joints.len());
+        if rows > MAX_JOINT_ROWS {
+            if !self.joints_overflowed {
+                log::warn!(
+                    "{} joint matrices in one frame; skinned meshes are not drawn",
+                    list.joints.len()
+                );
+                self.joints_overflowed = true;
+            }
+            return Vec::new();
+        }
+        let (device, queue) = (gpu.device(), gpu.queue());
+        if rows > self.joint_texture.rows {
+            self.joint_texture = JointTexture::new(device, &self.joints_bgl, rows);
+        }
+        let texels = joint_texels(&list.joints, rows);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.joint_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(JOINT_TEXTURE_WIDTH * 16),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width: JOINT_TEXTURE_WIDTH,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        let groups = group_skinned(&list.skinned, self.skinned_meshes.len());
+        for (buffer, group) in self.skinned_instances.iter_mut().zip(&groups) {
+            buffer.write(device, queue, bytemuck::cast_slice(group));
+        }
+        groups
+    }
+
+    fn draw_skinned(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        groups: &[Vec<SkinnedInstanceRaw>],
+        with_material: bool,
+    ) {
+        for (index, group) in groups.iter().enumerate() {
+            let count = group.len() as u32;
+            if count == 0 {
+                continue;
+            }
+            let mesh = &self.skinned_meshes[index];
+            let bytes = count as u64 * size_of::<SkinnedInstanceRaw>() as u64;
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_vertex_buffer(1, self.skinned_instances[index].buffer.slice(..bytes));
+            if with_material {
+                pass.set_bind_group(1, &self.materials[mesh.material], &[]);
+            }
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..count);
+        }
     }
 
     /// Rebuilds a runtime-added mesh (from [`Renderer::add_mesh`] or
