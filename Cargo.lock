@@ -987,6 +987,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "impulse-anim"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "impulse-assets",
+]
+
+[[package]]
 name = "impulse-assets"
 version = "0.1.0"
 dependencies = [
