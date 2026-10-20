@@ -25,7 +25,7 @@ web-time = "1.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 ron = "0.12.2"
 # Models: .glb parsing (images decoded here, not by gltf) and PNG/JPEG decoding.
-gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 
 # native only

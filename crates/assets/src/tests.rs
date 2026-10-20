@@ -1,5 +1,7 @@
 use super::*;
 
+mod skin;
+
 const FLOAT: u32 = 5126;
 const U16: u32 = 5123;
 
@@ -44,6 +46,17 @@ impl Glb {
         };
         self.accessors.push(format!(
             r#"{{"bufferView":{view},"componentType":{FLOAT},"count":{count},"type":"{ty}"{bounds}}}"#
+        ));
+        self.accessors.len() - 1
+    }
+
+    /// Unsigned shorts, e.g. `JOINTS_0` (VEC4).
+    fn u16s(&mut self, data: &[u16], ty: &str, width: usize) -> usize {
+        let bytes: Vec<u8> = data.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let view = self.view(&bytes);
+        self.accessors.push(format!(
+            r#"{{"bufferView":{view},"componentType":{U16},"count":{},"type":"{ty}"}}"#,
+            data.len() / width
         ));
         self.accessors.len() - 1
     }
