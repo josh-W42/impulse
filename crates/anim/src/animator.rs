@@ -40,35 +40,72 @@ impl Playback {
     }
 }
 
+/// A clip fading in over the layers before it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Fade {
-    from: Playback,
+struct Layer {
+    playback: Playback,
     elapsed: f32,
+    /// Seconds to fade in; 0 for the bottom layer.
     duration: f32,
 }
 
+impl Layer {
+    fn weight(&self) -> f32 {
+        if self.duration <= 0.0 {
+            1.0
+        } else {
+            (self.elapsed / self.duration).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Fades in progress at once; starting another drops the oldest (rare: it
+/// takes four clip changes within one fade time).
+const MAX_LAYERS: usize = 4;
+
 /// One unit's animation state: the clip playing (an index into the clips
-/// it is given) and, during a crossfade, the one it is leaving.
+/// it is given) and, while crossfading, the clips it is leaving. Starting a
+/// clip in the middle of a fade fades from the blend shown at that moment,
+/// so the pose never jumps.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Animator {
-    current: Playback,
-    fade: Option<Fade>,
+    /// Bottom first; the last is the clip playing.
+    layers: Vec<Layer>,
 }
 
 impl Animator {
     /// Looping `clip` at normal speed from its start.
     pub fn new(clip: usize) -> Self {
         Self {
-            current: Playback::start(clip, true),
-            fade: None,
+            layers: vec![Layer {
+                playback: Playback::start(clip, true),
+                elapsed: 0.0,
+                duration: 0.0,
+            }],
         }
+    }
+
+    fn top(&self) -> &Playback {
+        &self
+            .layers
+            .last()
+            .expect("an animator always has a layer")
+            .playback
+    }
+
+    fn top_mut(&mut self) -> &mut Playback {
+        &mut self
+            .layers
+            .last_mut()
+            .expect("an animator always has a layer")
+            .playback
     }
 
     /// Switches to `clip`, crossfading over `fade` seconds. If `clip` is
     /// already playing it carries on (only `looping` changes).
     pub fn play(&mut self, clip: usize, looping: bool, fade: f32) {
-        if clip == self.current.clip {
-            self.current.looping = looping;
+        if clip == self.top().clip {
+            self.top_mut().looping = looping;
             return;
         }
         self.restart(clip, looping, fade);
@@ -77,51 +114,57 @@ impl Animator {
     /// Starts `clip` from the beginning even if it is playing (a second
     /// swing of the same attack), crossfading over `fade` seconds.
     pub fn restart(&mut self, clip: usize, looping: bool, fade: f32) {
-        self.fade = (fade > 0.0).then_some(Fade {
-            from: self.current,
+        let layer = Layer {
+            playback: Playback::start(clip, looping),
             elapsed: 0.0,
-            duration: fade,
-        });
-        self.current = Playback::start(clip, looping);
+            duration: fade.max(0.0),
+        };
+        if fade <= 0.0 {
+            self.layers = vec![layer];
+            return;
+        }
+        if self.layers.len() == MAX_LAYERS {
+            self.layers.remove(0);
+        }
+        self.layers.push(layer);
     }
 
     /// The playing clip's rate (1 is as authored).
     pub fn set_speed(&mut self, speed: f32) {
-        self.current.speed = speed;
+        self.top_mut().speed = speed;
     }
 
     pub fn advance(&mut self, dt: f32, clips: &[BoundClip]) {
-        self.current.advance(dt, clips);
-        if let Some(fade) = &mut self.fade {
-            fade.from.advance(dt, clips);
-            fade.elapsed += dt;
-            if fade.elapsed >= fade.duration {
-                self.fade = None;
-            }
+        for layer in &mut self.layers {
+            layer.playback.advance(dt, clips);
+            layer.elapsed += dt;
+        }
+        // A layer fully faded in hides everything below it.
+        if let Some(opaque) = self.layers.iter().rposition(|l| l.weight() >= 1.0) {
+            self.layers.drain(..opaque);
         }
     }
 
     pub fn current(&self) -> usize {
-        self.current.clip
+        self.top().clip
     }
 
     /// Seconds into the playing clip.
     pub fn time(&self) -> f32 {
-        self.current.time
+        self.top().time
     }
 
     /// Sets the time into the playing clip (clamped to it).
     pub fn seek(&mut self, time: f32, clips: &[BoundClip]) {
-        self.current.time = time;
-        self.current.advance(0.0, clips);
+        let top = self.top_mut();
+        top.time = time;
+        top.advance(0.0, clips);
     }
 
     /// A clip played once has reached its end.
     pub fn finished(&self, clips: &[BoundClip]) -> bool {
-        !self.current.looping
-            && clips
-                .get(self.current.clip)
-                .is_none_or(|c| self.current.time >= c.duration)
+        let top = self.top();
+        !top.looping && clips.get(top.clip).is_none_or(|c| top.time >= c.duration)
     }
 
     /// The pose now, into `out`. `scratch` is working space; both must be
@@ -134,15 +177,20 @@ impl Animator {
         out: &mut Pose,
     ) {
         *out = Pose::rest(skeleton);
-        self.current.sample(clips, out);
-        let Some(fade) = &self.fade else { return };
-        *scratch = Pose::rest(skeleton);
-        fade.from.sample(clips, scratch);
-        let w = (fade.elapsed / fade.duration).clamp(0.0, 1.0);
-        for (to, from) in out.local.iter_mut().zip(&scratch.local) {
-            to.translation = from.translation.lerp(to.translation, w);
-            to.rotation = from.rotation.slerp(to.rotation, w);
-            to.scale = from.scale.lerp(to.scale, w);
+        let (bottom, above) = self
+            .layers
+            .split_first()
+            .expect("an animator always has a layer");
+        bottom.playback.sample(clips, out);
+        for layer in above {
+            *scratch = Pose::rest(skeleton);
+            layer.playback.sample(clips, scratch);
+            let w = layer.weight();
+            for (below, this) in out.local.iter_mut().zip(&scratch.local) {
+                below.translation = below.translation.lerp(this.translation, w);
+                below.rotation = below.rotation.slerp(this.rotation, w);
+                below.scale = below.scale.lerp(this.scale, w);
+            }
         }
     }
 }
@@ -272,5 +320,27 @@ mod tests {
         assert!(a.finished(&clips));
         a.seek(0.25, &clips);
         assert!(close(x(&a, &clips, &s), 0.5));
+    }
+    #[test]
+    fn restart_mid_fade_is_continuous() {
+        let s = skeleton();
+        let clips = [
+            slide(0.0, 0.0, &s),
+            slide(2.0, 2.0, &s),
+            slide(10.0, 10.0, &s),
+        ];
+        let mut a = Animator::new(0);
+        a.play(1, true, 0.2);
+        a.advance(0.1, &clips);
+        let before = x(&a, &clips, &s);
+        assert!(close(before, 1.0));
+        // A third clip while the first fade is half done: no jump.
+        a.play(2, true, 0.2);
+        assert!(close(x(&a, &clips, &s), before), "{}", x(&a, &clips, &s));
+        a.advance(0.1, &clips);
+        let mid = x(&a, &clips, &s);
+        assert!(mid > before && mid < 10.0, "{mid}");
+        a.advance(0.2, &clips);
+        assert_eq!(x(&a, &clips, &s), 10.0, "every fade is over");
     }
 }
