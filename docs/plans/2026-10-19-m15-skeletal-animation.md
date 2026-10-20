@@ -1,7 +1,6 @@
 # M15 — Skeletal Animation: Design + Results
 
-**Date:** 2026-10-19 · **Status:** built; results pending the game's browser
-check · **Driven by:** Ashen Crown
+**Date:** 2026-10-19 · **Status:** complete · **Driven by:** Ashen Crown
 (`../ashen-crown/docs/plans/2026-10-19-m15-animation-and-models.md`), which
 replaces its capsules with rigged, animated low-poly characters.
 
@@ -100,10 +99,23 @@ falling needs bodies that move.
 
 ## Results
 
-To be filled in after Ashen Crown's browser check (WebGL2 and WebGPU):
-- screenshots;
-- what had to change;
-- the frame time.
+Checked in Ashen Crown's browser build, in a Chromium-based browser pane, by
+screenshots:
+- **WebGPU:** a skinned Knight standing, running and swinging, with two
+  wolves.
+- **WebGL2:** a Mage, plus eight different skinned models at once (24
+  instances, alive, casting and dead), with weapons attached at hand joints
+  through `model_transforms`.
+- No validation errors on either backend.
+- **Frame time:** at the game's camp, WebGL2 held 60 Hz (16.68 ms mean,
+  16.80 ms p95) both with and without skinned models. vsync bounds both, so
+  this shows no regression rather than the headroom.
+
+What the game's checks changed here: nothing in the engine.
+- The problems found were asset-side (prop orientation in an unarmed idle,
+  model scale) and were solved in the game.
+- One loader rule came from real files: KayKit's skeleton helmets are
+  unskinned meshes under the head joint, so the loader skins them to it.
 
 ## Not done
 
