@@ -1,5 +1,6 @@
 use super::*;
 
+mod clips;
 mod skin;
 
 const FLOAT: u32 = 5126;
@@ -31,8 +32,12 @@ impl Glb {
         let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
         let view = self.view(&bytes);
         let count = data.len() / width;
-        // POSITION accessors must carry min/max.
-        let bounds = if ty == "VEC3" {
+        // POSITION and animation input accessors must carry min/max.
+        let bounds = if ty == "SCALAR" {
+            let lo = data.iter().copied().fold(f32::MAX, f32::min);
+            let hi = data.iter().copied().fold(f32::MIN, f32::max);
+            format!(r#","min":[{lo:?}],"max":[{hi:?}]"#)
+        } else if ty == "VEC3" {
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
             for p in data.chunks(3) {
                 for k in 0..3 {

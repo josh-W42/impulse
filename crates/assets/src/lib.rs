@@ -14,10 +14,12 @@ use gltf::buffer::Source as BufferSource;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::Mode;
 
+mod clips;
 mod colliders;
 mod mips;
 mod skin;
 
+pub use clips::{Channel, Clip, Interpolation, Keyframes, load_clips};
 pub use colliders::{
     bounding_box, bounding_capsule, bounding_sphere, extreme_points, fibonacci_directions,
 };

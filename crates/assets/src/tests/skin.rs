@@ -211,3 +211,24 @@ fn skin_errors() {
         Some(ModelError::TooManyJoints { max: 128 })
     );
 }
+
+#[test]
+fn skinned_models_carry_their_clips() {
+    let mut glb = Glb::default();
+    let prim = skinned_triangle(&mut glb, &ALL_ON_FIRST.0, &ALL_ON_FIRST.1);
+    let ib = matrices(&mut glb, &[Mat4::IDENTITY]);
+    let t = glb.floats(&[0.0, 1.0], "SCALAR", 1);
+    let v = glb.floats(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0], "VEC3", 3);
+    let bytes = glb.build(&format!(
+        r#""meshes":[{{"primitives":[{prim}]}}],
+        "nodes":[{{"mesh":0,"skin":0}},{{"name":"root"}}],
+        "skins":[{{"joints":[1],"inverseBindMatrices":{ib}}}],
+        "animations":[{{"name":"Bob","samplers":[{{"input":{t},"output":{v}}}],
+            "channels":[{{"sampler":0,"target":{{"node":1,"path":"translation"}}}}]}}],
+        "scenes":[{{"nodes":[0,1]}}],"scene":0"#
+    ));
+    let model = load_skinned_glb(&bytes).unwrap();
+    assert_eq!(model.clips.len(), 1);
+    assert_eq!(model.clips[0].name, "Bob");
+    assert_eq!(model.clips[0].channels[0].target, "root");
+}

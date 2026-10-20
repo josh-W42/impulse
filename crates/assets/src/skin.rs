@@ -8,7 +8,10 @@ use glam::{Mat4, Quat, Vec3};
 use gltf::buffer::Source as BufferSource;
 use gltf::mesh::Mode;
 
-use crate::{Limits, MaterialData, ModelError, TextureData, open, read_materials, read_primitive};
+use crate::clips::read_clips;
+use crate::{
+    Clip, Limits, MaterialData, ModelError, TextureData, open, read_materials, read_primitive,
+};
 
 /// A joint's transform relative to its parent: what clips animate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,6 +90,8 @@ pub struct SkinnedModelData {
     pub materials: Vec<MaterialData>,
     pub textures: Vec<TextureData>,
     pub skeleton: Skeleton,
+    /// The animations in the same file (often none: clips may come separately).
+    pub clips: Vec<Clip>,
     /// Bounds of every vertex in bind space.
     pub min: Vec3,
     pub max: Vec3,
@@ -284,6 +289,7 @@ pub fn load_skinned_glb_with(
         materials,
         textures,
         skeleton,
+        clips: read_clips(&gltf)?,
         min,
         max,
     })
