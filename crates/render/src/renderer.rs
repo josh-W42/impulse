@@ -334,7 +334,9 @@ pub struct Renderer {
     /// Bound at group 1 in the skinned shadow pass, which has no material.
     empty_bind_group: wgpu::BindGroup,
     joint_texture: JointTexture,
-    skinned_meshes: Vec<GpuMesh>,
+    /// Each with its material's bind group, held here so the material and
+    /// its textures outlive `clear_custom_meshes`.
+    skinned_meshes: Vec<(GpuMesh, wgpu::BindGroup)>,
     skinned_instances: Vec<GrowableBuffer>,
     /// Set once a frame has had more joint matrices than fit (logged once).
     joints_overflowed: bool,
@@ -1062,7 +1064,7 @@ impl Renderer {
     }
 
     /// Uploads a skinned mesh drawn with `material`. Skinned meshes live for
-    /// the renderer's lifetime: `clear_custom_meshes` and
+    /// the renderer's lifetime, material included: `clear_custom_meshes` and
     /// `reset_custom_meshes` leave them alone (games upload them once).
     pub fn add_skinned_mesh(
         &mut self,
@@ -1070,17 +1072,17 @@ impl Renderer {
         data: &SkinnedMeshData,
         material: MaterialId,
     ) -> SkinnedMeshId {
-        let mut mesh = GpuMesh::from_parts(
+        let mesh = GpuMesh::from_parts(
             gpu.device(),
             bytemuck::cast_slice(&data.vertices),
             &data.indices,
         );
-        mesh.material = if (material.0 as usize) < self.materials.len() {
-            material.0 as usize
-        } else {
-            0
-        };
-        self.skinned_meshes.push(mesh);
+        let group = self
+            .materials
+            .get(material.0 as usize)
+            .unwrap_or(&self.materials[0])
+            .clone();
+        self.skinned_meshes.push((mesh, group));
         self.skinned_instances.push(GrowableBuffer::new(
             gpu.device(),
             "skinned instances",
@@ -1148,12 +1150,12 @@ impl Renderer {
             if count == 0 {
                 continue;
             }
-            let mesh = &self.skinned_meshes[index];
+            let (mesh, material) = &self.skinned_meshes[index];
             let bytes = count as u64 * size_of::<SkinnedInstanceRaw>() as u64;
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, self.skinned_instances[index].buffer.slice(..bytes));
             if with_material {
-                pass.set_bind_group(1, &self.materials[mesh.material], &[]);
+                pass.set_bind_group(1, material, &[]);
             }
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..count);
