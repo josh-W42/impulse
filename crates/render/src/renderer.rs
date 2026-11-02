@@ -8,11 +8,12 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
+use crate::ao::{Ao, AoSettings, NORMAL_FORMAT};
 use crate::draw_list::{
     DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_by_mesh, group_skinned,
     joint_texels, joint_texture_rows,
 };
-use crate::gpu::{DEPTH_FORMAT, Gpu};
+use crate::gpu::{DEPTH_FORMAT, Gpu, VIEW_DEPTH_FORMAT};
 use crate::mesh::{
     MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex,
 };
@@ -59,6 +60,26 @@ pub struct CameraData {
     pub eye: Vec3,
 }
 
+/// Exponential height fog, fading toward the horizon sky.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FogSettings {
+    pub enabled: bool,
+    /// Extinction per metre at y = 0.
+    pub density: f32,
+    /// How fast the fog thins with height (per metre); 0 is uniform fog.
+    pub height_falloff: f32,
+}
+
+impl Default for FogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            density: 0.005,
+            height_falloff: 0.1,
+        }
+    }
+}
+
 /// egui's output for this frame, already tessellated.
 pub struct UiFrame {
     pub primitives: Vec<egui::ClippedPrimitive>,
@@ -88,6 +109,10 @@ struct GlobalsRaw {
     cascade_texel: [f32; CASCADES],
     /// x: cascades in use; y: 1 to tint each cascade.
     shadow_params: [f32; 4],
+    /// x: fog density at y = 0 (0 = off); y: height falloff.
+    fog: [f32; 4],
+    /// x: 1 to show the AO buffer alone.
+    ao: [f32; 4],
 }
 
 /// A material's factors as the shader reads them (see `Material` in scene.wgsl).
@@ -478,6 +503,12 @@ pub struct Renderer {
     sky_sh: [[f32; 4]; 9],
     shadow_range: ShadowRange,
     show_cascades: bool,
+    ao: Ao,
+    ao_settings: AoSettings,
+    fog_settings: FogSettings,
+    /// Normals and depth for AO (lit vertex shaders, `fs_prepass`).
+    prepass_pipeline: wgpu::RenderPipeline,
+    skinned_prepass_pipeline: wgpu::RenderPipeline,
     /// Layout and shared sampler for per-material bind groups (group 1).
     material_bgl: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
@@ -682,11 +713,6 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene"),
-            bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl)],
-            immediate_size: 0,
-        });
         let globals_layout = layout("globals", &globals_bgl);
 
         let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -720,9 +746,25 @@ impl Renderer {
             layout: &empty_bgl,
             entries: &[],
         });
+        let ao = Ao::new(gpu);
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene"),
+            bind_group_layouts: &[
+                Some(&scene_bgl),
+                Some(&material_bgl),
+                Some(&empty_bgl),
+                Some(ao.lit_layout()),
+            ],
+            immediate_size: 0,
+        });
         let skinned_lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("lit skinned"),
-            bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl), Some(&joints_bgl)],
+            bind_group_layouts: &[
+                Some(&scene_bgl),
+                Some(&material_bgl),
+                Some(&joints_bgl),
+                Some(ao.lit_layout()),
+            ],
             immediate_size: 0,
         });
         let caster_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -814,6 +856,50 @@ impl Renderer {
             });
         let joint_texture = JointTexture::new(device, &joints_bgl, 1);
 
+        let prepass = |label, layout: &wgpu::PipelineLayout, vs, buffers: &[_]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &scene_shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &scene_shader,
+                    entry_point: Some("fs_prepass"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(NORMAL_FORMAT.into()), Some(VIEW_DEPTH_FORMAT.into())],
+                }),
+                primitive: solid(),
+                depth_stencil: depth_state(
+                    true,
+                    wgpu::CompareFunction::Less,
+                    wgpu::DepthBiasState::default(),
+                ),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let prepass_pipeline = prepass(
+            "prepass",
+            &globals_layout,
+            "vs_main",
+            &[Some(mesh_layout()), Some(instance_layout())],
+        );
+        let skinned_prepass_pipeline = prepass(
+            "prepass skinned",
+            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("prepass skinned"),
+                bind_group_layouts: &[Some(&globals_bgl), Some(&empty_bgl), Some(&joints_bgl)],
+                immediate_size: 0,
+            }),
+            "vs_skinned",
+            &[Some(skinned_mesh_layout()), Some(skinned_instance_layout())],
+        );
+
         let color_source = ColorSource {
             scene_shader,
             lines_shader,
@@ -857,6 +943,11 @@ impl Renderer {
             sky_sh,
             shadow_range: ShadowRange::Distance(DEFAULT_SHADOW_DISTANCE),
             show_cascades: false,
+            ao,
+            ao_settings: AoSettings::default(),
+            fog_settings: FogSettings::default(),
+            prepass_pipeline,
+            skinned_prepass_pipeline,
             globals,
             scene_bind_group,
             globals_bind_group,
@@ -904,6 +995,7 @@ impl Renderer {
         let scene_target = gpu.scene_target();
         let samples = sample_count(gpu, &self.post_settings);
         self.post.prepare(device, gpu.size(), samples);
+        self.ao.prepare(device, gpu.size());
         if self.color.samples != samples {
             self.color = self
                 .color_source
@@ -941,6 +1033,17 @@ impl Renderer {
                 0.0,
                 0.0,
             ],
+            fog: [
+                if self.fog_settings.enabled {
+                    self.fog_settings.density
+                } else {
+                    0.0
+                },
+                self.fog_settings.height_falloff,
+                0.0,
+                0.0,
+            ],
+            ao: [if self.ao_settings.show { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
@@ -1005,6 +1108,36 @@ impl Renderer {
                 self.draw_skinned(&mut pass, &skinned_groups, false);
             }
         }
+        let ao_on = self.ao_settings.enabled && scene_target.ao;
+        if ao_on {
+            let (color, depth) = self.ao.prepass_attachments();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("prepass"),
+                color_attachments: &color,
+                depth_stencil_attachment: Some(depth),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.prepass_pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            self.draw_meshes(&mut pass, &groups, false);
+            if !skinned_groups.is_empty() {
+                pass.set_pipeline(&self.skinned_prepass_pipeline);
+                pass.set_bind_group(1, &self.empty_bind_group, &[]);
+                pass.set_bind_group(2, &self.joint_texture.bind_group, &[]);
+                self.draw_skinned(&mut pass, &skinned_groups, false);
+            }
+        }
+        if ao_on {
+            self.ao.run(
+                queue,
+                &mut encoder,
+                camera.view_proj,
+                camera.eye,
+                &self.ao_settings,
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -1023,6 +1156,8 @@ impl Renderer {
             });
             pass.set_pipeline(&self.color.lit);
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            pass.set_bind_group(2, &self.empty_bind_group, &[]);
+            pass.set_bind_group(3, self.ao.lit_bind_group(ao_on), &[]);
             self.draw_meshes(&mut pass, &groups, true);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.color.skinned_lit);
@@ -1140,6 +1275,32 @@ impl Renderer {
     }
 
     /// The sky lighting the scene.
+    pub fn ao_settings(&self) -> AoSettings {
+        self.ao_settings
+    }
+
+    /// Takes effect next frame.
+    pub fn set_ao_settings(&mut self, settings: AoSettings) {
+        self.ao_settings = AoSettings {
+            radius: settings.radius.clamp(0.05, 10.0),
+            intensity: settings.intensity.clamp(0.1, 8.0),
+            ..settings
+        };
+    }
+
+    pub fn fog_settings(&self) -> FogSettings {
+        self.fog_settings
+    }
+
+    /// Takes effect next frame.
+    pub fn set_fog_settings(&mut self, settings: FogSettings) {
+        self.fog_settings = FogSettings {
+            density: settings.density.max(0.0),
+            height_falloff: settings.height_falloff.max(0.0),
+            ..settings
+        };
+    }
+
     pub fn post_settings(&self) -> PostSettings {
         self.post_settings
     }
@@ -1157,6 +1318,11 @@ impl Renderer {
     /// Whether the scene renders in HDR (and so whether bloom is available).
     pub fn hdr_supported(&self) -> bool {
         self.post.target().hdr
+    }
+
+    /// Whether ambient occlusion can run here (WebGL2 needs float targets).
+    pub fn ao_supported(&self) -> bool {
+        self.post.target().ao
     }
 
     pub fn msaa_supported(&self) -> bool {

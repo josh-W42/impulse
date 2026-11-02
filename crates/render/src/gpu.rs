@@ -47,11 +47,14 @@ pub struct SceneTarget {
     pub hdr: bool,
     /// 4× MSAA with resolve, for both the colour and the depth format.
     pub msaa: bool,
+    /// Ambient occlusion: needs `R32Float` render targets for view depth.
+    pub ao: bool,
 }
 
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 /// HDR needs half floats rendered, sampled with filtering (bloom) and blended
 /// (bloom's upsample adds); WebGL2 needs `EXT_color_buffer_float` for that.
@@ -59,6 +62,7 @@ fn picks_scene_target(
     hdr: wgpu::TextureFormatFeatures,
     sdr: wgpu::TextureFormatFeatures,
     depth: wgpu::TextureFormatFeatures,
+    view_depth: wgpu::TextureFormatFeatures,
 ) -> SceneTarget {
     use wgpu::TextureFormatFeatureFlags as F;
     use wgpu::TextureUsages as U;
@@ -79,6 +83,9 @@ fn picks_scene_target(
         format,
         hdr: format == HDR_FORMAT,
         msaa: msaa(&colour) && depth.flags.contains(F::MULTISAMPLE_X4),
+        ao: view_depth
+            .allowed_usages
+            .contains(U::RENDER_ATTACHMENT | U::TEXTURE_BINDING),
     }
 }
 
@@ -159,6 +166,7 @@ impl Gpu {
             adapter.get_texture_format_features(HDR_FORMAT),
             adapter.get_texture_format_features(SDR_FORMAT),
             adapter.get_texture_format_features(DEPTH_FORMAT),
+            adapter.get_texture_format_features(VIEW_DEPTH_FORMAT),
         );
         log::info!("scene target: {scene_target:?}");
 
@@ -304,24 +312,36 @@ mod tests {
         features(U::RENDER_ATTACHMENT, F::MULTISAMPLE_X4)
     }
 
+    fn renderable() -> wgpu::TextureFormatFeatures {
+        features(U::RENDER_ATTACHMENT | U::TEXTURE_BINDING, F::empty())
+    }
+
     #[test]
     fn renderable_half_floats_give_hdr_with_msaa() {
-        let target = picks_scene_target(full(), full(), depth_msaa());
+        let target = picks_scene_target(full(), full(), depth_msaa(), renderable());
         assert_eq!(
             target,
             SceneTarget {
                 format: HDR_FORMAT,
                 hdr: true,
-                msaa: true
+                msaa: true,
+                ao: true,
             }
         );
+    }
+
+    #[test]
+    fn ao_needs_renderable_float_view_depth() {
+        // WebGL2 without EXT_color_buffer_float: R32Float only samples.
+        let sample_only = features(U::TEXTURE_BINDING, F::empty());
+        assert!(!picks_scene_target(full(), full(), depth_msaa(), sample_only).ao);
     }
 
     #[test]
     fn half_floats_that_only_sample_fall_back_to_srgb() {
         // WebGL2 without EXT_color_buffer_float: sampleable, not renderable.
         let sample_only = features(U::TEXTURE_BINDING, F::FILTERABLE);
-        let target = picks_scene_target(sample_only, full(), depth_msaa());
+        let target = picks_scene_target(sample_only, full(), depth_msaa(), renderable());
         assert_eq!(target.format, SDR_FORMAT);
         assert!(!target.hdr);
         assert!(target.msaa, "the sRGB target can still be multisampled");
@@ -333,7 +353,7 @@ mod tests {
             U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
             F::FILTERABLE | F::MULTISAMPLE_X4 | F::MULTISAMPLE_RESOLVE,
         );
-        assert!(!picks_scene_target(no_blend, full(), depth_msaa()).hdr);
+        assert!(!picks_scene_target(no_blend, full(), depth_msaa(), renderable()).hdr);
     }
 
     #[test]
@@ -342,9 +362,9 @@ mod tests {
             U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
             F::FILTERABLE | F::BLENDABLE | F::MULTISAMPLE_X4,
         );
-        assert!(!picks_scene_target(no_resolve, full(), depth_msaa()).msaa);
+        assert!(!picks_scene_target(no_resolve, full(), depth_msaa(), renderable()).msaa);
         let single_depth = features(U::RENDER_ATTACHMENT, F::empty());
-        let target = picks_scene_target(full(), full(), single_depth);
+        let target = picks_scene_target(full(), full(), single_depth, renderable());
         assert!(target.hdr && !target.msaa);
     }
 }
