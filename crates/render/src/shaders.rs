@@ -6,8 +6,15 @@
 //! about uniformity rules — it accepted `textureSampleCompare` in non-uniform
 //! control flow. Passing here doesn't replace checking both backends in a browser.
 
-pub const SCENE_WGSL: &str = include_str!("shaders/scene.wgsl");
+pub const SCENE_WGSL: &str = concat!(
+    include_str!("shaders/tonemap.wgsl"),
+    include_str!("shaders/scene.wgsl")
+);
 pub const LINES_WGSL: &str = include_str!("shaders/lines.wgsl");
+pub const POST_WGSL: &str = concat!(
+    include_str!("shaders/tonemap.wgsl"),
+    include_str!("shaders/post.wgsl")
+);
 
 #[cfg(test)]
 mod tests {
@@ -63,6 +70,22 @@ mod tests {
                 ("fs_main", Fragment),
                 ("vs_sky", Vertex),
                 ("fs_sky", Fragment),
+            ],
+        );
+    }
+
+    #[test]
+    fn post_shader_is_valid_for_webgl2() {
+        use naga::ShaderStage::{Fragment, Vertex};
+        check(
+            "post",
+            POST_WGSL,
+            &[
+                ("vs_fullscreen", Vertex),
+                ("fs_downsample", Fragment),
+                ("fs_downsample_first", Fragment),
+                ("fs_upsample", Fragment),
+                ("fs_composite", Fragment),
             ],
         );
     }

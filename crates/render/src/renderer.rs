@@ -1,4 +1,5 @@
-//! Frame rendering: shadow map, lit instanced meshes, debug lines, egui.
+//! Frame rendering: shadow map, lit instanced meshes and debug lines into the
+//! scene target, the post chain, egui.
 
 use std::mem::size_of;
 use std::num::NonZeroU64;
@@ -12,23 +13,16 @@ use crate::draw_list::{
     DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_by_mesh, group_skinned,
     joint_texels, joint_texture_rows,
 };
-use crate::gpu::Gpu;
+use crate::gpu::{DEPTH_FORMAT, Gpu};
 use crate::mesh::{
     MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex,
 };
+use crate::post::{MSAA_SAMPLES, Post, PostSettings};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
 use crate::sky::Sky;
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Within WebGL2's guaranteed texture size.
 const SHADOW_SIZE: u32 = 2048;
-/// Linear-space sky color (the sRGB target encodes it).
-const SKY: wgpu::Color = wgpu::Color {
-    r: 0.18,
-    g: 0.26,
-    b: 0.38,
-    a: 1.0,
-};
 /// Where the shadow map's square is centered, and its half-width, until a
 /// game moves it ([`Renderer::set_shadow_focus`]).
 const DEFAULT_SHADOW_FOCUS: Vec3 = Vec3::ZERO;
@@ -56,8 +50,6 @@ const SKINNED_INSTANCE_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_ar
 /// WebGL2's guaranteed texture height bounds the joint texture: 2048 rows
 /// of 256 matrices.
 const MAX_JOINT_ROWS: u32 = 2048;
-/// Linear HDR → display: a fixed exposure before the tonemapper.
-const EXPOSURE: f32 = 1.0;
 const LINE_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
 
@@ -89,6 +81,8 @@ struct GlobalsRaw {
     sky_horizon: [f32; 4],
     sky_ground: [f32; 4],
     sh: [[f32; 4]; 9],
+    /// x: 1 when the scene shaders tonemap (no HDR target).
+    post: [f32; 4],
 }
 
 /// A material's factors as the shader reads them (see `Material` in scene.wgsl).
@@ -271,30 +265,194 @@ impl GrowableBuffer {
     }
 }
 
-struct DepthTarget {
-    view: wgpu::TextureView,
-    size: (u32, u32),
+const SHADOW_BIAS: wgpu::DepthBiasState = wgpu::DepthBiasState {
+    constant: 2,
+    slope_scale: 2.0,
+    clamp: 0.0,
+};
+
+fn mesh_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &MESH_ATTRS,
+    }
 }
 
-impl DepthTarget {
-    fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth"),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        Self {
-            view: texture.create_view(&Default::default()),
-            size,
+fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: size_of::<InstanceRaw>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &INSTANCE_ATTRS,
+    }
+}
+
+fn skinned_mesh_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: size_of::<SkinnedVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &SKINNED_MESH_ATTRS,
+    }
+}
+
+fn skinned_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: size_of::<SkinnedInstanceRaw>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &SKINNED_INSTANCE_ATTRS,
+    }
+}
+
+fn solid() -> wgpu::PrimitiveState {
+    wgpu::PrimitiveState {
+        front_face: wgpu::FrontFace::Ccw,
+        cull_mode: Some(wgpu::Face::Back),
+        ..Default::default()
+    }
+}
+
+fn depth_state(
+    write: bool,
+    compare: wgpu::CompareFunction,
+    bias: wgpu::DepthBiasState,
+) -> Option<wgpu::DepthStencilState> {
+    Some(wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(write),
+        depth_compare: Some(compare),
+        stencil: wgpu::StencilState::default(),
+        bias,
+    })
+}
+
+/// The scene target's sample count for these settings on this adapter.
+fn sample_count(gpu: &Gpu, settings: &PostSettings) -> u32 {
+    if settings.msaa && gpu.scene_target().msaa {
+        MSAA_SAMPLES
+    } else {
+        1
+    }
+}
+
+/// What the colour pipelines are built from, kept to rebuild them when the
+/// sample count changes.
+struct ColorSource {
+    scene_shader: wgpu::ShaderModule,
+    lines_shader: wgpu::ShaderModule,
+    scene_layout: wgpu::PipelineLayout,
+    skinned_lit_layout: wgpu::PipelineLayout,
+    globals_layout: wgpu::PipelineLayout,
+}
+
+/// The pipelines that draw into the scene target.
+struct ColorPipelines {
+    samples: u32,
+    lit: wgpu::RenderPipeline,
+    skinned_lit: wgpu::RenderPipeline,
+    sky: wgpu::RenderPipeline,
+    lines: wgpu::RenderPipeline,
+}
+
+impl ColorSource {
+    fn pipelines(
+        &self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> ColorPipelines {
+        let multisample = wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        };
+        let pipeline = |label,
+                        layout,
+                        module,
+                        (vs, fs),
+                        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+                        primitive,
+                        depth_stencil| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(format.into())],
+                }),
+                primitive,
+                depth_stencil,
+                multisample,
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let opaque = || {
+            depth_state(
+                true,
+                wgpu::CompareFunction::Less,
+                wgpu::DepthBiasState::default(),
+            )
+        };
+        let overlay = || {
+            depth_state(
+                false,
+                wgpu::CompareFunction::LessEqual,
+                wgpu::DepthBiasState::default(),
+            )
+        };
+        ColorPipelines {
+            samples,
+            lit: pipeline(
+                "lit",
+                &self.scene_layout,
+                &self.scene_shader,
+                ("vs_main", "fs_main"),
+                &[Some(mesh_layout()), Some(instance_layout())],
+                solid(),
+                opaque(),
+            ),
+            skinned_lit: pipeline(
+                "lit skinned",
+                &self.skinned_lit_layout,
+                &self.scene_shader,
+                ("vs_skinned", "fs_main"),
+                &[Some(skinned_mesh_layout()), Some(skinned_instance_layout())],
+                solid(),
+                opaque(),
+            ),
+            // At the far plane, after the scene: only uncovered pixels pass.
+            sky: pipeline(
+                "sky",
+                &self.globals_layout,
+                &self.scene_shader,
+                ("vs_sky", "fs_sky"),
+                &[],
+                wgpu::PrimitiveState::default(),
+                overlay(),
+            ),
+            lines: pipeline(
+                "lines",
+                &self.globals_layout,
+                &self.lines_shader,
+                ("vs_main", "fs_main"),
+                &[Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<LineVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &LINE_ATTRS,
+                })],
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    ..Default::default()
+                },
+                overlay(),
+            ),
         }
     }
 }
@@ -305,8 +463,12 @@ pub struct Renderer {
     scene_bind_group: wgpu::BindGroup,
     /// Globals only: the shadow pass can't bind the texture it renders into.
     globals_bind_group: wgpu::BindGroup,
-    lit_pipeline: wgpu::RenderPipeline,
-    sky_pipeline: wgpu::RenderPipeline,
+    /// Shaders and layouts the colour pipelines are rebuilt from.
+    color_source: ColorSource,
+    /// Lit, skinned, sky and line pipelines at the scene target's sample count.
+    color: ColorPipelines,
+    post: Post,
+    post_settings: PostSettings,
     sky: Sky,
     sky_sh: [[f32; 4]; 9],
     shadow_focus: Vec3,
@@ -323,12 +485,10 @@ pub struct Renderer {
     pinned_textures: usize,
     pinned_materials: usize,
     shadow_pipeline: wgpu::RenderPipeline,
-    line_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
     /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
     meshes: Vec<GpuMesh>,
     instances: Vec<GrowableBuffer>,
-    skinned_lit_pipeline: wgpu::RenderPipeline,
     skinned_shadow_pipeline: wgpu::RenderPipeline,
     joints_bgl: wgpu::BindGroupLayout,
     /// Bound at group 1 in the skinned shadow pass, which has no material.
@@ -341,7 +501,6 @@ pub struct Renderer {
     /// Set once a frame has had more joint matrices than fit (logged once).
     joints_overflowed: bool,
     lines: GrowableBuffer,
-    depth: DepthTarget,
     egui: egui_wgpu::Renderer,
 }
 
@@ -517,57 +676,6 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(LINES_WGSL.into()),
         });
 
-        let mesh_layout = wgpu::VertexBufferLayout {
-            array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &MESH_ATTRS,
-        };
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: size_of::<InstanceRaw>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &INSTANCE_ATTRS,
-        };
-        let solid = wgpu::PrimitiveState {
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            ..Default::default()
-        };
-        let depth = |write, compare, bias| {
-            Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(write),
-                depth_compare: Some(compare),
-                stencil: wgpu::StencilState::default(),
-                bias,
-            })
-        };
-
-        let lit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("lit"),
-            layout: Some(&scene_layout),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(mesh_layout.clone()), Some(instance_layout.clone())],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &scene_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(gpu.view_format().into())],
-            }),
-            primitive: solid,
-            depth_stencil: depth(
-                true,
-                wgpu::CompareFunction::Less,
-                wgpu::DepthBiasState::default(),
-            ),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow"),
             layout: Some(&globals_layout),
@@ -575,19 +683,11 @@ impl Renderer {
                 module: &scene_shader,
                 entry_point: Some("vs_shadow"),
                 compilation_options: Default::default(),
-                buffers: &[Some(mesh_layout), Some(instance_layout)],
+                buffers: &[Some(mesh_layout()), Some(instance_layout())],
             },
             fragment: None,
-            primitive: solid,
-            depth_stencil: depth(
-                true,
-                wgpu::CompareFunction::LessEqual,
-                wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
-                    clamp: 0.0,
-                },
-            ),
+            primitive: solid(),
+            depth_stencil: depth_state(true, wgpu::CompareFunction::LessEqual, SHADOW_BIAS),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -615,49 +715,10 @@ impl Renderer {
             layout: &empty_bgl,
             entries: &[],
         });
-        let skinned_mesh_layout = wgpu::VertexBufferLayout {
-            array_stride: size_of::<SkinnedVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &SKINNED_MESH_ATTRS,
-        };
-        let skinned_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: size_of::<SkinnedInstanceRaw>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &SKINNED_INSTANCE_ATTRS,
-        };
-        let skinned_lit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let skinned_lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("lit skinned"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("lit skinned"),
-                    bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl), Some(&joints_bgl)],
-                    immediate_size: 0,
-                }),
-            ),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vs_skinned"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    Some(skinned_mesh_layout.clone()),
-                    Some(skinned_instance_layout.clone()),
-                ],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &scene_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(gpu.view_format().into())],
-            }),
-            primitive: solid,
-            depth_stencil: depth(
-                true,
-                wgpu::CompareFunction::Less,
-                wgpu::DepthBiasState::default(),
-            ),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
+            bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl), Some(&joints_bgl)],
+            immediate_size: 0,
         });
         let skinned_shadow_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -677,84 +738,28 @@ impl Renderer {
                     module: &scene_shader,
                     entry_point: Some("vs_shadow_skinned"),
                     compilation_options: Default::default(),
-                    buffers: &[Some(skinned_mesh_layout), Some(skinned_instance_layout)],
+                    buffers: &[Some(skinned_mesh_layout()), Some(skinned_instance_layout())],
                 },
                 fragment: None,
-                primitive: solid,
-                depth_stencil: depth(
-                    true,
-                    wgpu::CompareFunction::LessEqual,
-                    wgpu::DepthBiasState {
-                        constant: 2,
-                        slope_scale: 2.0,
-                        clamp: 0.0,
-                    },
-                ),
+                primitive: solid(),
+                depth_stencil: depth_state(true, wgpu::CompareFunction::LessEqual, SHADOW_BIAS),
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
             });
         let joint_texture = JointTexture::new(device, &joints_bgl, 1);
 
-        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sky"),
-            layout: Some(&globals_layout),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vs_sky"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &scene_shader,
-                entry_point: Some("fs_sky"),
-                compilation_options: Default::default(),
-                targets: &[Some(gpu.view_format().into())],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            // At the far plane, after the scene: only uncovered pixels pass.
-            depth_stencil: depth(
-                false,
-                wgpu::CompareFunction::LessEqual,
-                wgpu::DepthBiasState::default(),
-            ),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("lines"),
-            layout: Some(&globals_layout),
-            vertex: wgpu::VertexState {
-                module: &lines_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<LineVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &LINE_ATTRS,
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &lines_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(gpu.view_format().into())],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..Default::default()
-            },
-            depth_stencil: depth(
-                false,
-                wgpu::CompareFunction::LessEqual,
-                wgpu::DepthBiasState::default(),
-            ),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let color_source = ColorSource {
+            scene_shader,
+            lines_shader,
+            scene_layout,
+            skinned_lit_layout,
+            globals_layout,
+        };
+        let post_settings = PostSettings::default();
+        let samples = sample_count(gpu, &post_settings);
+        let color = color_source.pipelines(device, gpu.scene_target().format, samples);
+        let post = Post::new(gpu, samples);
 
         let meshes: Vec<GpuMesh> = MeshKind::ALL
             .iter()
@@ -779,7 +784,10 @@ impl Renderer {
         let sky = Sky::default();
         let sky_sh = sky.irradiance_sh().map(|c| [c.x, c.y, c.z, 0.0]);
         Self {
-            sky_pipeline,
+            color_source,
+            color,
+            post,
+            post_settings,
             sky,
             sky_sh,
             shadow_focus: DEFAULT_SHADOW_FOCUS,
@@ -787,7 +795,6 @@ impl Renderer {
             globals,
             scene_bind_group,
             globals_bind_group,
-            lit_pipeline,
             material_bgl,
             material_sampler,
             textures,
@@ -796,11 +803,9 @@ impl Renderer {
             pinned_textures: 3,
             pinned_materials: 1,
             shadow_pipeline,
-            line_pipeline,
             shadow_view,
             meshes,
             instances,
-            skinned_lit_pipeline,
             skinned_shadow_pipeline,
             joints_bgl,
             empty_bind_group,
@@ -809,7 +814,6 @@ impl Renderer {
             skinned_instances: Vec::new(),
             joints_overflowed: false,
             lines: GrowableBuffer::new(device, "lines", 256 * size_of::<LineVertex>() as u64),
-            depth: DepthTarget::new(device, gpu.size()),
             egui: egui_wgpu::Renderer::new(
                 device,
                 gpu.surface_format(),
@@ -819,7 +823,8 @@ impl Renderer {
     }
 
     /// Draws one frame and submits it; the caller presents. `target` is the sRGB
-    /// view for the scene, `ui_target` the surface-format view for egui.
+    /// view the post pass writes the scene into, `ui_target` the surface-format
+    /// view for egui.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -830,8 +835,13 @@ impl Renderer {
         mut ui: UiFrame,
     ) {
         let (device, queue) = (gpu.device(), gpu.queue());
-        if self.depth.size != gpu.size() {
-            self.depth = DepthTarget::new(device, gpu.size());
+        let scene_target = gpu.scene_target();
+        let samples = sample_count(gpu, &self.post_settings);
+        self.post.prepare(device, gpu.size(), samples);
+        if self.color.samples != samples {
+            self.color = self
+                .color_source
+                .pipelines(device, scene_target.format, samples);
         }
 
         let light_dir = -self.sky.sun_direction;
@@ -842,12 +852,13 @@ impl Renderer {
                 .to_cols_array_2d(),
             inv_view_proj: camera.view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).to_array(),
-            light_dir: light_dir.extend(EXPOSURE).to_array(),
+            light_dir: light_dir.extend(self.post_settings.exposure).to_array(),
             light_color: rgba(self.sky.sun_color),
             sky_zenith: rgba(self.sky.zenith),
             sky_horizon: rgba(self.sky.horizon),
             sky_ground: rgba(self.sky.ground),
             sh: self.sky_sh,
+            post: [if scene_target.hdr { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
@@ -909,17 +920,9 @@ impl Renderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[Some(self.post.color_attachment())],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth.view,
+                    view: self.post.depth_view(),
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -930,28 +933,30 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.lit_pipeline);
+            pass.set_pipeline(&self.color.lit);
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
             self.draw_meshes(&mut pass, &groups, true);
             if !skinned_groups.is_empty() {
-                pass.set_pipeline(&self.skinned_lit_pipeline);
+                pass.set_pipeline(&self.color.skinned_lit);
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 pass.set_bind_group(2, &self.joint_texture.bind_group, &[]);
                 self.draw_skinned(&mut pass, &skinned_groups, true);
             }
 
-            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_pipeline(&self.color.sky);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
             if !line_vertices.is_empty() {
                 let bytes = std::mem::size_of_val(line_vertices.as_slice()) as u64;
-                pass.set_pipeline(&self.line_pipeline);
+                pass.set_pipeline(&self.color.lines);
                 pass.set_bind_group(0, &self.globals_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.lines.buffer.slice(..bytes));
                 pass.draw(0..line_vertices.len() as u32, 0..1);
             }
         }
+        self.post
+            .run(queue, &mut encoder, target, &self.post_settings);
 
         let (width, height) = gpu.size();
         let screen = egui_wgpu::ScreenDescriptor {
@@ -1032,6 +1037,29 @@ impl Renderer {
     }
 
     /// The sky lighting the scene.
+    pub fn post_settings(&self) -> PostSettings {
+        self.post_settings
+    }
+
+    /// Takes effect next frame. MSAA and bloom are ignored where the adapter
+    /// can't do them ([`Renderer::hdr_supported`], [`Renderer::msaa_supported`]).
+    pub fn set_post_settings(&mut self, settings: PostSettings) {
+        self.post_settings = PostSettings {
+            bloom_strength: settings.bloom_strength.clamp(0.0, 1.0),
+            exposure: settings.exposure.max(0.0),
+            ..settings
+        };
+    }
+
+    /// Whether the scene renders in HDR (and so whether bloom is available).
+    pub fn hdr_supported(&self) -> bool {
+        self.post.target().hdr
+    }
+
+    pub fn msaa_supported(&self) -> bool {
+        self.post.target().msaa
+    }
+
     pub fn sky(&self) -> Sky {
         self.sky
     }

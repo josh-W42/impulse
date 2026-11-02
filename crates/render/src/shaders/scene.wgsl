@@ -1,5 +1,5 @@
-// Physically based forward shading (glTF metallic-roughness), a procedural
-// sky as image-based light, and in-shader tonemapping to the sRGB target.
+// Physically based forward shading (glTF metallic-roughness) and a procedural
+// sky as image-based light, into the linear HDR scene target.
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -13,6 +13,8 @@ struct Globals {
     sky_ground: vec4<f32>,
     // Sky irradiance: Σ sh[i] · Y_i(n) (see `sky.rs`).
     sh: array<vec4<f32>, 9>,
+    // x: 1 to tonemap in this shader (no HDR target), 0 to leave it to post
+    post: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
@@ -188,23 +190,14 @@ fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {
     return max(e, vec3<f32>(0.0));
 }
 
-// Khronos PBR Neutral: colours up to mid-brightness pass through unchanged;
-// highlights are compressed toward white.
-fn tonemap(color: vec3<f32>) -> vec3<f32> {
-    let start = 0.8 - 0.04;
-    let desaturation = 0.15;
-    let x = min(color.r, min(color.g, color.b));
-    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
-    var c = color - offset;
-    let peak = max(c.r, max(c.g, c.b));
-    if (peak < start) {
-        return c;
+// Linear HDR for the post pass, capped below half float's maximum (a sharp
+// highlight would otherwise store infinity and bloom would smear it); or
+// tonemapped here when the target can't hold HDR.
+fn finish(color: vec3<f32>) -> vec3<f32> {
+    if (globals.post.x > 0.5) {
+        return tonemap(color);
     }
-    let d = 1.0 - start;
-    let new_peak = 1.0 - d * d / (peak + d - start);
-    c = c * (new_peak / peak);
-    let g = 1.0 - 1.0 / (desaturation * (peak - new_peak) + 1.0);
-    return mix(c, vec3<f32>(new_peak), g);
+    return min(color, vec3<f32>(60000.0));
 }
 
 // Karis' analytic fit of the split-sum environment BRDF (scale, bias on F0).
@@ -280,7 +273,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let ambient = (diffuse_color * irradiance / PI + prefiltered * (f0 * ab.x + ab.y)) * occlusion;
 
     let color = (direct + ambient + emissive) * globals.light_dir.w;
-    return vec4<f32>(tonemap(color), base.a);
+    return vec4<f32>(finish(color), base.a);
 }
 
 // The sky behind everything: a fullscreen triangle at the far plane, drawn
@@ -309,5 +302,5 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let to_sun = -globals.light_dir.xyz;
     let c = dot(dir, to_sun);
     radiance += globals.light_color.rgb * (smoothstep(0.99965, 0.99985, c) * 12.0 + pow(max(c, 0.0), 400.0) * 0.4);
-    return vec4<f32>(tonemap(radiance * globals.light_dir.w), 1.0);
+    return vec4<f32>(finish(radiance * globals.light_dir.w), 1.0);
 }
