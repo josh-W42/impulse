@@ -2,7 +2,7 @@
 
 use glam::{Vec2, Vec3};
 use impulse_physics::{BodyHandle, SolverMode, SolverSettings, StepStats, World};
-use impulse_render::{CameraData, DrawList, backend_name};
+use impulse_render::{CameraData, DrawList, PostSettings, backend_name};
 use web_time::Instant;
 use winit::event::{MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -119,6 +119,7 @@ struct Settings {
     sleeping: bool,
     solver_mode: SolverMode,
     substeps: usize,
+    post: PostSettings,
 }
 
 pub struct Sandbox {
@@ -129,6 +130,9 @@ pub struct Sandbox {
     camera: CameraRig,
     settings: Settings,
     backend: &'static str,
+    /// What the adapter can do (the panel greys out the rest).
+    hdr_supported: bool,
+    msaa_supported: bool,
     /// Clock for the physics profiler.
     start: Instant,
     frame_ms: f32,
@@ -175,6 +179,8 @@ impl Sandbox {
             scene_desc::rebuild(&mut world, &desc, &models).expect("demo scenes are valid");
         let mut sandbox = Self {
             backend: backend_name(cx.gpu.backend()),
+            hdr_supported: cx.renderer.hdr_supported(),
+            msaa_supported: cx.renderer.msaa_supported(),
             world,
             objects,
             timestep: FixedTimestep::new(FIXED_STEP, MAX_STEPS_PER_FRAME),
@@ -202,6 +208,7 @@ impl Sandbox {
                 sleeping: SolverSettings::default().sleeping,
                 solver_mode: SolverSettings::default().mode,
                 substeps: SolverSettings::default().substeps,
+                post: cx.renderer.post_settings(),
             },
             start: Instant::now(),
             frame_ms: 0.0,
@@ -810,6 +817,8 @@ impl Game for Sandbox {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let stats = Stats {
             backend: self.backend,
+            hdr_supported: self.hdr_supported,
+            msaa_supported: self.msaa_supported,
             frame_ms: self.frame_ms,
             bodies: self.world.len(),
             camera: self.camera.mode,
@@ -854,6 +863,7 @@ impl Game for Sandbox {
         for action in std::mem::take(&mut self.actions) {
             self.apply(cx, action);
         }
+        cx.renderer.set_post_settings(self.settings.post);
         // A gesture ends when nothing is being dragged or typed into.
         if self.edit_drag.is_none()
             && !cx.egui.egui_is_using_pointer()
@@ -913,6 +923,8 @@ impl Game for Sandbox {
 
 struct Stats {
     backend: &'static str,
+    hdr_supported: bool,
+    msaa_supported: bool,
     frame_ms: f32,
     bodies: usize,
     camera: CameraMode,
@@ -1158,6 +1170,27 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             ui.checkbox(&mut s.show_grid, "grid");
             ui.checkbox(&mut s.show_axes, "body axes");
             ui.checkbox(&mut s.show_colliders, "model colliders");
+            ui.separator();
+            let post = &mut s.post;
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    stats.msaa_supported,
+                    egui::Checkbox::new(&mut post.msaa, "MSAA 4×"),
+                );
+                ui.add_enabled(stats.hdr_supported, egui::Checkbox::new(&mut post.bloom, "bloom"));
+                if !stats.hdr_supported {
+                    ui.label("(no HDR on this GPU)");
+                }
+            });
+            ui.add_enabled(
+                stats.hdr_supported && post.bloom,
+                egui::Slider::new(&mut post.bloom_strength, 0.0..=0.25).text("bloom strength"),
+            );
+            ui.add(
+                egui::Slider::new(&mut post.exposure, 0.25..=4.0)
+                    .logarithmic(true)
+                    .text("exposure"),
+            );
             ui.horizontal(|ui| {
                 use crate::egui_input::{MAX_UI_SCALE, MIN_UI_SCALE};
                 ui.label("UI size");

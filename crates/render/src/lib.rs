@@ -16,6 +16,7 @@ pub use backend::backend_name;
 mod draw_list;
 mod gpu;
 mod mesh;
+mod post;
 mod renderer;
 mod shaders;
 mod sky;
@@ -25,10 +26,11 @@ pub use draw_list::{
     JOINT_TEXTURE_WIDTH, JointRange, SkinnedInstance, SkinnedInstanceRaw, group_by_mesh,
     group_skinned, joint_texels, joint_texture_rows,
 };
-pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError};
+pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError, SceneTarget};
 pub use mesh::{
     MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex, cylinder,
     perpendicular_tangent, uv_sphere,
 };
+pub use post::PostSettings;
 pub use renderer::{CameraData, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame};
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};

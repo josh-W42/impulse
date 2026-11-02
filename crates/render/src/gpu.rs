@@ -38,6 +38,50 @@ pub enum FrameOutcome {
     SurfaceLost,
 }
 
+/// The scene's colour target format, and whether it can be multisampled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneTarget {
+    pub format: wgpu::TextureFormat,
+    /// Linear HDR, tonemapped by the post pass. Otherwise display-ready sRGB:
+    /// the scene shaders tonemap themselves and there is no bloom.
+    pub hdr: bool,
+    /// 4× MSAA with resolve, for both the colour and the depth format.
+    pub msaa: bool,
+}
+
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub const SDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// HDR needs half floats rendered, sampled with filtering (bloom) and blended
+/// (bloom's upsample adds); WebGL2 needs `EXT_color_buffer_float` for that.
+fn picks_scene_target(
+    hdr: wgpu::TextureFormatFeatures,
+    sdr: wgpu::TextureFormatFeatures,
+    depth: wgpu::TextureFormatFeatures,
+) -> SceneTarget {
+    use wgpu::TextureFormatFeatureFlags as F;
+    use wgpu::TextureUsages as U;
+    let renders = |f: &wgpu::TextureFormatFeatures| {
+        f.allowed_usages
+            .contains(U::RENDER_ATTACHMENT | U::TEXTURE_BINDING)
+            && f.flags.contains(F::FILTERABLE | F::BLENDABLE)
+    };
+    let msaa = |f: &wgpu::TextureFormatFeatures| {
+        f.flags.contains(F::MULTISAMPLE_X4 | F::MULTISAMPLE_RESOLVE)
+    };
+    let (format, colour) = if renders(&hdr) {
+        (HDR_FORMAT, hdr)
+    } else {
+        (SDR_FORMAT, sdr)
+    };
+    SceneTarget {
+        format,
+        hdr: format == HDR_FORMAT,
+        msaa: msaa(&colour) && depth.flags.contains(F::MULTISAMPLE_X4),
+    }
+}
+
 /// Owns the wgpu device and queue and the surface being presented to.
 pub struct Gpu {
     instance: wgpu::Instance,
@@ -46,6 +90,7 @@ pub struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     view_format: wgpu::TextureFormat,
+    scene_target: SceneTarget,
     backend: wgpu::Backend,
 }
 
@@ -110,6 +155,13 @@ impl Gpu {
         }
         surface.configure(&device, &config);
 
+        let scene_target = picks_scene_target(
+            adapter.get_texture_format_features(HDR_FORMAT),
+            adapter.get_texture_format_features(SDR_FORMAT),
+            adapter.get_texture_format_features(DEPTH_FORMAT),
+        );
+        log::info!("scene target: {scene_target:?}");
+
         Ok(Self {
             instance,
             surface,
@@ -117,8 +169,14 @@ impl Gpu {
             queue,
             config,
             view_format,
+            scene_target,
             backend: adapter.get_info().backend,
         })
+    }
+
+    /// What the scene renders into before the post pass.
+    pub fn scene_target(&self) -> SceneTarget {
+        self.scene_target
     }
 
     pub fn backend(&self) -> wgpu::Backend {
@@ -219,4 +277,74 @@ pub struct Frame {
     pub view: wgpu::TextureView,
     /// View in the surface's own format, for egui (which handles gamma itself).
     pub ui_view: wgpu::TextureView,
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::TextureFormatFeatureFlags as F;
+    use wgpu::TextureUsages as U;
+
+    use super::*;
+
+    fn features(usages: U, flags: F) -> wgpu::TextureFormatFeatures {
+        wgpu::TextureFormatFeatures {
+            allowed_usages: usages,
+            flags,
+        }
+    }
+
+    fn full() -> wgpu::TextureFormatFeatures {
+        features(
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            F::FILTERABLE | F::BLENDABLE | F::MULTISAMPLE_X4 | F::MULTISAMPLE_RESOLVE,
+        )
+    }
+
+    fn depth_msaa() -> wgpu::TextureFormatFeatures {
+        features(U::RENDER_ATTACHMENT, F::MULTISAMPLE_X4)
+    }
+
+    #[test]
+    fn renderable_half_floats_give_hdr_with_msaa() {
+        let target = picks_scene_target(full(), full(), depth_msaa());
+        assert_eq!(
+            target,
+            SceneTarget {
+                format: HDR_FORMAT,
+                hdr: true,
+                msaa: true
+            }
+        );
+    }
+
+    #[test]
+    fn half_floats_that_only_sample_fall_back_to_srgb() {
+        // WebGL2 without EXT_color_buffer_float: sampleable, not renderable.
+        let sample_only = features(U::TEXTURE_BINDING, F::FILTERABLE);
+        let target = picks_scene_target(sample_only, full(), depth_msaa());
+        assert_eq!(target.format, SDR_FORMAT);
+        assert!(!target.hdr);
+        assert!(target.msaa, "the sRGB target can still be multisampled");
+    }
+
+    #[test]
+    fn half_floats_that_cannot_blend_fall_back_to_srgb() {
+        let no_blend = features(
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            F::FILTERABLE | F::MULTISAMPLE_X4 | F::MULTISAMPLE_RESOLVE,
+        );
+        assert!(!picks_scene_target(no_blend, full(), depth_msaa()).hdr);
+    }
+
+    #[test]
+    fn msaa_needs_resolve_and_a_multisampled_depth_format() {
+        let no_resolve = features(
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            F::FILTERABLE | F::BLENDABLE | F::MULTISAMPLE_X4,
+        );
+        assert!(!picks_scene_target(no_resolve, full(), depth_msaa()).msaa);
+        let single_depth = features(U::RENDER_ATTACHMENT, F::empty());
+        let target = picks_scene_target(full(), full(), single_depth);
+        assert!(target.hdr && !target.msaa);
+    }
 }
