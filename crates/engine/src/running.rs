@@ -23,6 +23,9 @@ const MAX_STEPS_PER_FRAME: u32 = 5;
 /// Bodies below this height count as gone; once all are, the scene re-drops.
 const RESET_HEIGHT: f32 = -30.0;
 const FLY_SPEED: f32 = 8.0;
+/// Shadow radius around the orbit target: the old single map's ±25 m, so the
+/// farthest cascade is never blurrier than before.
+const DEFAULT_SHADOW_RADIUS: f32 = 25.0;
 /// Farthest an edit drag moves an object from where it started (m).
 const MAX_EDIT_DRAG: f32 = 100.0;
 /// Drag spring stiffness (1/s²) and damping (1/s, slightly above critical 2·√k).
@@ -120,6 +123,10 @@ struct Settings {
     solver_mode: SolverMode,
     substeps: usize,
     post: PostSettings,
+    /// Orbit mode: shadows within this radius of the orbit target. Fly mode:
+    /// shadows out to twice this from the camera.
+    shadow_radius: f32,
+    show_cascades: bool,
 }
 
 pub struct Sandbox {
@@ -209,6 +216,8 @@ impl Sandbox {
                 solver_mode: SolverSettings::default().mode,
                 substeps: SolverSettings::default().substeps,
                 post: cx.renderer.post_settings(),
+                shadow_radius: DEFAULT_SHADOW_RADIUS,
+                show_cascades: false,
             },
             start: Instant::now(),
             frame_ms: 0.0,
@@ -864,6 +873,14 @@ impl Game for Sandbox {
             self.apply(cx, action);
         }
         cx.renderer.set_post_settings(self.settings.post);
+        let radius = self.settings.shadow_radius;
+        match self.camera.mode {
+            CameraMode::Orbit => cx
+                .renderer
+                .set_shadow_focus(self.camera.orbit.target, radius),
+            CameraMode::Fly => cx.renderer.set_shadow_distance(radius * 2.0),
+        }
+        cx.renderer.set_show_cascades(self.settings.show_cascades);
         // A gesture ends when nothing is being dragged or typed into.
         if self.edit_drag.is_none()
             && !cx.egui.egui_is_using_pointer()
@@ -1191,6 +1208,14 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     .logarithmic(true)
                     .text("exposure"),
             );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut s.shadow_radius, 10.0..=100.0)
+                        .step_by(5.0)
+                        .text("shadow radius"),
+                );
+                ui.checkbox(&mut s.show_cascades, "show cascades");
+            });
             ui.horizontal(|ui| {
                 use crate::egui_input::{MAX_UI_SCALE, MIN_UI_SCALE};
                 ui.label("UI size");

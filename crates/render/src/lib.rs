@@ -19,6 +19,7 @@ mod mesh;
 mod post;
 mod renderer;
 mod shaders;
+mod shadow;
 mod sky;
 
 pub use draw_list::{
@@ -33,4 +34,5 @@ pub use mesh::{
 };
 pub use post::PostSettings;
 pub use renderer::{CameraData, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame};
+pub use shadow::ShadowRange;
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};

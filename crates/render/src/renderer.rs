@@ -5,7 +5,6 @@ use std::mem::size_of;
 use std::num::NonZeroU64;
 
 use bytemuck::{Pod, Zeroable};
-use glam::camera::rh::{proj, view};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
@@ -19,16 +18,16 @@ use crate::mesh::{
 };
 use crate::post::{MSAA_SAMPLES, Post, PostSettings};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
+use crate::shadow::{CASCADES, SHADOW_SIZE, ShadowRange, cascades};
 use crate::sky::Sky;
 
-/// Within WebGL2's guaranteed texture size.
-const SHADOW_SIZE: u32 = 2048;
-/// Where the shadow map's square is centered, and its half-width, until a
-/// game moves it ([`Renderer::set_shadow_focus`]).
-const DEFAULT_SHADOW_FOCUS: Vec3 = Vec3::ZERO;
-const DEFAULT_SHADOW_HALF_EXTENT: f32 = 25.0;
-/// Half-widths outside this range waste or starve the shadow map.
-const SHADOW_HALF_EXTENT_RANGE: (f32, f32) = (5.0, 100.0);
+/// How far shadows reach until a game sets a range
+/// ([`Renderer::set_shadow_distance`], [`Renderer::set_shadow_focus`]).
+const DEFAULT_SHADOW_DISTANCE: f32 = 60.0;
+/// Focus radii outside this range waste or starve the shadow map.
+const SHADOW_RADIUS_RANGE: (f32, f32) = (5.0, 100.0);
+/// Shadow distances outside this range (the camera's far plane is 500 m).
+const SHADOW_DISTANCE_RANGE: (f32, f32) = (5.0, 500.0);
 
 const MESH_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 10 => Float32x2, 11 => Float32x4];
@@ -71,7 +70,6 @@ pub struct UiFrame {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct GlobalsRaw {
     view_proj: [[f32; 4]; 4],
-    light_view_proj: [[f32; 4]; 4],
     inv_view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     /// xyz: direction sunlight travels; w: exposure.
@@ -83,6 +81,13 @@ struct GlobalsRaw {
     sh: [[f32; 4]; 9],
     /// x: 1 when the scene shaders tonemap (no HDR target).
     post: [f32; 4],
+    cascades: [[[f32; 4]; 4]; CASCADES],
+    /// xyz: camera forward; w: the view depth where cascade 0 starts.
+    shadow_camera: [f32; 4],
+    cascade_far: [f32; CASCADES],
+    cascade_texel: [f32; CASCADES],
+    /// x: cascades in use; y: 1 to tint each cascade.
+    shadow_params: [f32; 4],
 }
 
 /// A material's factors as the shader reads them (see `Material` in scene.wgsl).
@@ -471,8 +476,8 @@ pub struct Renderer {
     post_settings: PostSettings,
     sky: Sky,
     sky_sh: [[f32; 4]; 9],
-    shadow_focus: Vec3,
-    shadow_half_extent: f32,
+    shadow_range: ShadowRange,
+    show_cascades: bool,
     /// Layout and shared sampler for per-material bind groups (group 1).
     material_bgl: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
@@ -485,13 +490,16 @@ pub struct Renderer {
     pinned_textures: usize,
     pinned_materials: usize,
     shadow_pipeline: wgpu::RenderPipeline,
-    shadow_view: wgpu::TextureView,
+    /// One depth view per cascade (a layer of the shadow array) to render into.
+    shadow_layers: Vec<wgpu::TextureView>,
+    /// Per cascade: its light matrix, bound at group 3 in the shadow passes.
+    casters: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
     meshes: Vec<GpuMesh>,
     instances: Vec<GrowableBuffer>,
     skinned_shadow_pipeline: wgpu::RenderPipeline,
     joints_bgl: wgpu::BindGroupLayout,
-    /// Bound at group 1 in the skinned shadow pass, which has no material.
+    /// Bound at the shadow passes' unused groups.
     empty_bind_group: wgpu::BindGroup,
     joint_texture: JointTexture,
     /// Each with its material's bind group, held here so the material and
@@ -520,7 +528,7 @@ impl Renderer {
             size: wgpu::Extent3d {
                 width: SHADOW_SIZE,
                 height: SHADOW_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: CASCADES as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -529,7 +537,21 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let shadow_view = shadow_texture.create_view(&Default::default());
+        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let shadow_layers = (0..CASCADES as u32)
+            .map(|layer| {
+                shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("shadow cascade"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -568,7 +590,7 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
                         sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                     },
                     count: None,
                 },
@@ -676,23 +698,6 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(LINES_WGSL.into()),
         });
 
-        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow"),
-            layout: Some(&globals_layout),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vs_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(mesh_layout()), Some(instance_layout())],
-            },
-            fragment: None,
-            primitive: solid(),
-            depth_stencil: depth_state(true, wgpu::CompareFunction::LessEqual, SHADOW_BIAS),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
         let joints_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("joint matrices"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -720,6 +725,65 @@ impl Renderer {
             bind_group_layouts: &[Some(&scene_bgl), Some(&material_bgl), Some(&joints_bgl)],
             immediate_size: 0,
         });
+        let caster_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("caster"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(size_of::<Mat4>() as u64),
+                },
+                count: None,
+            }],
+        });
+        let casters = (0..CASCADES)
+            .map(|_| {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("caster"),
+                    size: size_of::<Mat4>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("caster"),
+                    layout: &caster_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                });
+                (buffer, bind_group)
+            })
+            .collect();
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("shadow"),
+                    bind_group_layouts: &[
+                        Some(&empty_bgl),
+                        Some(&empty_bgl),
+                        Some(&empty_bgl),
+                        Some(&caster_bgl),
+                    ],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vs_shadow"),
+                compilation_options: Default::default(),
+                buffers: &[Some(mesh_layout()), Some(instance_layout())],
+            },
+            fragment: None,
+            primitive: solid(),
+            depth_stencil: depth_state(true, wgpu::CompareFunction::LessEqual, SHADOW_BIAS),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let skinned_shadow_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shadow skinned"),
@@ -727,9 +791,10 @@ impl Renderer {
                     &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                         label: Some("shadow skinned"),
                         bind_group_layouts: &[
-                            Some(&globals_bgl),
+                            Some(&empty_bgl),
                             Some(&empty_bgl),
                             Some(&joints_bgl),
+                            Some(&caster_bgl),
                         ],
                         immediate_size: 0,
                     }),
@@ -790,8 +855,8 @@ impl Renderer {
             post_settings,
             sky,
             sky_sh,
-            shadow_focus: DEFAULT_SHADOW_FOCUS,
-            shadow_half_extent: DEFAULT_SHADOW_HALF_EXTENT,
+            shadow_range: ShadowRange::Distance(DEFAULT_SHADOW_DISTANCE),
+            show_cascades: false,
             globals,
             scene_bind_group,
             globals_bind_group,
@@ -803,7 +868,8 @@ impl Renderer {
             pinned_textures: 3,
             pinned_materials: 1,
             shadow_pipeline,
-            shadow_view,
+            shadow_layers,
+            casters,
             meshes,
             instances,
             skinned_shadow_pipeline,
@@ -844,12 +910,18 @@ impl Renderer {
                 .pipelines(device, scene_target.format, samples);
         }
 
-        let light_dir = -self.sky.sun_direction;
+        let light_dir = -self.sky.sun_direction.normalize();
+        let shadows = cascades(camera.view_proj, camera.eye, light_dir, self.shadow_range);
+        for (i, (buffer, _)) in self.casters.iter().enumerate().take(shadows.count) {
+            queue.write_buffer(
+                buffer,
+                0,
+                bytemuck::bytes_of(&shadows.view_proj[i].to_cols_array_2d()),
+            );
+        }
         let rgba = |v: Vec3| v.extend(1.0).to_array();
         let globals = GlobalsRaw {
             view_proj: camera.view_proj.to_cols_array_2d(),
-            light_view_proj: light_view_proj(light_dir, self.shadow_focus, self.shadow_half_extent)
-                .to_cols_array_2d(),
             inv_view_proj: camera.view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).to_array(),
             light_dir: light_dir.extend(self.post_settings.exposure).to_array(),
@@ -859,6 +931,16 @@ impl Renderer {
             sky_ground: rgba(self.sky.ground),
             sh: self.sky_sh,
             post: [if scene_target.hdr { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0],
+            cascades: shadows.view_proj.map(|m| m.to_cols_array_2d()),
+            shadow_camera: shadows.forward.extend(shadows.near).to_array(),
+            cascade_far: shadows.far,
+            cascade_texel: shadows.texel,
+            shadow_params: [
+                shadows.count as f32,
+                if self.show_cascades { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
@@ -890,12 +972,17 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+        for (layer, (_, caster)) in self
+            .shadow_layers
+            .iter()
+            .zip(&self.casters)
+            .take(shadows.count)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_view,
+                    view: layer,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -907,12 +994,13 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            for group in 0..3 {
+                pass.set_bind_group(group, &self.empty_bind_group, &[]);
+            }
+            pass.set_bind_group(3, caster, &[]);
             self.draw_meshes(&mut pass, &groups, false);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.skinned_shadow_pipeline);
-                pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                pass.set_bind_group(1, &self.empty_bind_group, &[]);
                 pass.set_bind_group(2, &self.joint_texture.bind_group, &[]);
                 self.draw_skinned(&mut pass, &skinned_groups, false);
             }
@@ -1024,16 +1112,31 @@ impl Renderer {
         MaterialId((self.materials.len() - 1) as u32)
     }
 
-    /// Centers the shadow map on `focus`. Everything within `half_extent`
-    /// metres of it (clamped to 5..100) casts and receives shadows; the
-    /// light's square can reach further in some directions, but only that
-    /// circle is guaranteed. The map's resolution is fixed, so a bigger
-    /// area means blurrier shadows. Change the extent in coarse steps: a
-    /// continuously changing extent makes shadow edges shimmer.
+    /// Shadows what is within `half_extent` metres of `focus` (clamped to
+    /// 5..100); beyond that, shadows aren't guaranteed. Cascades nearer the
+    /// camera than the focus are sharper; none is blurrier than one map over
+    /// that circle. Change the extent in coarse steps: a continuously
+    /// changing extent makes shadow edges shimmer.
     pub fn set_shadow_focus(&mut self, focus: Vec3, half_extent: f32) {
-        let (lo, hi) = SHADOW_HALF_EXTENT_RANGE;
-        self.shadow_focus = focus;
-        self.shadow_half_extent = half_extent.clamp(lo, hi);
+        let (lo, hi) = SHADOW_RADIUS_RANGE;
+        self.shadow_range = ShadowRange::Focus {
+            focus,
+            radius: half_extent.clamp(lo, hi),
+        };
+    }
+
+    /// Shadows everything in view out to `distance` metres from the camera
+    /// (clamped to 5..500), in cascades that get blurrier with distance. The
+    /// default, at 60 m.
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        let (lo, hi) = SHADOW_DISTANCE_RANGE;
+        self.shadow_range = ShadowRange::Distance(distance.clamp(lo, hi));
+    }
+
+    /// Tints the scene by shadow cascade (red, green, blue, yellow) to show
+    /// where each one reaches.
+    pub fn set_show_cascades(&mut self, show: bool) {
+        self.show_cascades = show;
     }
 
     /// The sky lighting the scene.
@@ -1375,29 +1478,9 @@ fn material_bind_group(
 
 /// Orthographic view from the directional light of the square `half_extent`
 /// metres around `focus`.
-fn light_view_proj(light_dir: Vec3, focus: Vec3, half_extent: f32) -> Mat4 {
-    // Move the focus only in whole shadow texels (in light space), so panning
-    // doesn't make shadow edges shimmer.
-    let rotation = view::look_at_mat4(Vec3::ZERO, light_dir, Vec3::Y);
-    let texel = 2.0 * half_extent / SHADOW_SIZE as f32;
-    let local = rotation.transform_point3(focus);
-    let snap = |v: f32| (v / texel).round() * texel;
-    let center =
-        rotation
-            .inverse()
-            .transform_point3(Vec3::new(snap(local.x), snap(local.y), local.z));
-    let light_view = view::look_at_mat4(center - light_dir * 40.0, center, Vec3::Y);
-    let e = half_extent;
-    proj::directx::orthographic(-e, e, -e, e, 1.0, 80.0) * light_view
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sun() -> Vec3 {
-        -Sky::default().sun_direction
-    }
 
     #[test]
     fn only_runtime_meshes_are_replaceable() {
@@ -1411,50 +1494,5 @@ mod tests {
             !is_custom(MeshId(builtins + 3), builtins + 3),
             "not added yet"
         );
-    }
-
-    #[test]
-    fn default_shadow_matches_old_projection() {
-        let old = proj::directx::orthographic(-25.0, 25.0, -25.0, 25.0, 1.0, 80.0)
-            * view::look_at_mat4(-sun() * 40.0, Vec3::ZERO, Vec3::Y);
-        let new = light_view_proj(sun(), DEFAULT_SHADOW_FOCUS, DEFAULT_SHADOW_HALF_EXTENT);
-        assert!(new.abs_diff_eq(old, 1e-5), "{new:?} vs {old:?}");
-    }
-
-    #[test]
-    fn shadow_covers_the_ground_within_half_extent_of_the_focus() {
-        let focus = Vec3::new(60.0, 0.0, 60.0);
-        let m = light_view_proj(sun(), focus, 30.0);
-        for i in 0..16 {
-            let angle = i as f32 / 16.0 * std::f32::consts::TAU;
-            for r in [0.0, 15.0, 29.0] {
-                let ground = focus + r * Vec3::new(angle.cos(), 0.0, angle.sin());
-                let p = m.project_point3(ground);
-                assert!(
-                    p.x.abs() <= 1.0 && p.y.abs() <= 1.0 && (0.0..=1.0).contains(&p.z),
-                    "{ground} maps outside the shadow map: {p:?}"
-                );
-            }
-        }
-        // ...and the origin, 85 m away, is not covered.
-        let o = m.project_point3(Vec3::ZERO);
-        assert!(o.x.abs() > 1.0 || o.y.abs() > 1.0, "{o:?}");
-    }
-
-    #[test]
-    fn shadow_map_moves_in_whole_texels() {
-        let e = 30.0;
-        let texel = 2.0 * e / SHADOW_SIZE as f32;
-        for i in 0..20 {
-            let focus = Vec3::new(i as f32 * 1.37, 0.0, i as f32 * -0.91);
-            let m = light_view_proj(sun(), focus, e);
-            // The orthographic projection maps light-space x and y to x / e.
-            for offset in [m.w_axis.x * e / texel, m.w_axis.y * e / texel] {
-                assert!(
-                    (offset - offset.round()).abs() < 0.02,
-                    "focus {focus}: offset {offset} texels isn't whole"
-                );
-            }
-        }
     }
 }

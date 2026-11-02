@@ -3,7 +3,6 @@
 
 struct Globals {
     view_proj: mat4x4<f32>,
-    light_view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     light_dir: vec4<f32>,   // xyz: direction sunlight travels; w: exposure
@@ -15,10 +14,27 @@ struct Globals {
     sh: array<vec4<f32>, 9>,
     // x: 1 to tonemap in this shader (no HDR target), 0 to leave it to post
     post: vec4<f32>,
+    // Sun shadows (see `shadow.rs`): world → each cascade's light clip space.
+    cascades: array<mat4x4<f32>, 4>,
+    // xyz: camera forward (view depth runs along it from the eye);
+    // w: the view depth where cascade 0 starts
+    shadow_camera: vec4<f32>,
+    // The view depth where each cascade ends.
+    cascade_far: vec4<f32>,
+    // The world size of a shadow texel in each cascade.
+    cascade_texel: vec4<f32>,
+    // x: cascades in use; y: 1 to tint each cascade (debug)
+    shadow_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(1) var shadow_map: texture_depth_2d_array; // a layer per cascade
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
+
+// The shadow passes' only binding: the cascade being drawn.
+struct Caster {
+    view_proj: mat4x4<f32>,
+};
+@group(3) @binding(0) var<uniform> caster: Caster;
 
 struct Material {
     base_color: vec4<f32>,
@@ -55,7 +71,6 @@ struct VertexOut {
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) light_clip: vec4<f32>,
     @location(4) uv: vec2<f32>,
     @location(5) tangent: vec4<f32>,
     @location(6) pbr: vec2<f32>,
@@ -75,7 +90,6 @@ fn shade_vertex(position: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>, tangent: 
     out.world_pos = world.xyz;
     out.normal = normal_matrix * normal;
     out.color = i.color;
-    out.light_clip = globals.light_view_proj * world;
     out.uv = uv;
     // Tangents follow the surface, so they take the model matrix itself.
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
@@ -90,7 +104,7 @@ fn vs_main(v: VertexIn, i: InstanceIn) -> VertexOut {
 
 @vertex
 fn vs_shadow(v: VertexIn, i: InstanceIn) -> @builtin(position) vec4<f32> {
-    return globals.light_view_proj * model_matrix(i) * vec4<f32>(v.position, 1.0);
+    return caster.view_proj * model_matrix(i) * vec4<f32>(v.position, 1.0);
 }
 
 // Skinning. Joint matrices live in a float texture (WebGL2 has no storage
@@ -147,26 +161,82 @@ fn vs_skinned(v: SkinnedVertexIn, i: InstanceIn, @location(15) first_joint: u32)
 @vertex
 fn vs_shadow_skinned(v: SkinnedVertexIn, i: InstanceIn, @location(15) first_joint: u32) -> @builtin(position) vec4<f32> {
     let skin = skin_matrix(v, first_joint);
-    return globals.light_view_proj * model_matrix(i) * skin * vec4<f32>(v.position, 1.0);
+    return caster.view_proj * model_matrix(i) * skin * vec4<f32>(v.position, 1.0);
 }
 
-fn shadow_factor(light_clip: vec4<f32>) -> f32 {
-    let ndc = light_clip.xyz / light_clip.w;
+// Sun visibility at `p` from cascade `i`: 3x3 PCF on top of the hardware 2x2
+// comparison filter; 1 outside the cascade. The Level variant is allowed in
+// non-uniform control flow (no implicit derivatives).
+fn cascade_visibility(i: u32, p: vec3<f32>) -> f32 {
+    let clip = globals.cascades[i] * vec4<f32>(p, 1.0);
+    let ndc = clip.xyz / clip.w;
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || ndc.z > 1.0) {
         return 1.0;
     }
-    // 3x3 PCF on top of the hardware 2x2 comparison filter. The Level variant is
-    // allowed in non-uniform control flow (no implicit derivatives).
     let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map));
     var sum = 0.0;
     for (var y = -1; y <= 1; y += 1) {
         for (var x = -1; x <= 1; x += 1) {
             let offset = vec2<f32>(f32(x), f32(y)) * texel;
-            sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, ndc.z);
+            sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, i32(i), ndc.z);
         }
     }
     return sum / 9.0;
+}
+
+// How far along the normal a position moves before its shadow lookup, in
+// texels of the cascade: keeps lit surfaces from shadowing themselves.
+const NORMAL_OFFSET: f32 = 1.5;
+// Each cascade blends into the next over this last fraction of its depths;
+// the last one fades to unshadowed.
+const CASCADE_BLEND: f32 = 0.1;
+
+fn offset_visibility(i: u32, world: vec3<f32>, normal: vec3<f32>) -> f32 {
+    return cascade_visibility(i, world + normal * globals.cascade_texel[i] * NORMAL_OFFSET);
+}
+
+// x: sun visibility at `world` (unit geometric `normal`); y: the cascade it
+// came from, fractional while blending into the next.
+fn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let count = u32(globals.shadow_params.x);
+    let depth = dot(world - globals.eye.xyz, globals.shadow_camera.xyz);
+    var start = globals.shadow_camera.w;
+    for (var i = 0u; i < count; i += 1u) {
+        let end = globals.cascade_far[i];
+        if (depth <= end) {
+            var visibility = offset_visibility(i, world, normal);
+            let band = (end - start) * CASCADE_BLEND;
+            let t = clamp((depth - (end - band)) / band, 0.0, 1.0);
+            if (t > 0.0) {
+                var next = 1.0;
+                if (i + 1u < count) {
+                    next = offset_visibility(i + 1u, world, normal);
+                }
+                visibility = mix(visibility, next, t);
+            }
+            return vec2<f32>(visibility, f32(i) + t);
+        }
+        start = end;
+    }
+    return vec2<f32>(1.0, f32(count));
+}
+
+// Debug tint for a (fractional) cascade index: red, green, blue, yellow,
+// fading to white where the last cascade fades out.
+fn cascade_tint(c: f32, count: f32) -> vec3<f32> {
+    let palette = array<vec3<f32>, 4>(
+        vec3<f32>(1.0, 0.35, 0.35),
+        vec3<f32>(0.35, 1.0, 0.35),
+        vec3<f32>(0.4, 0.55, 1.0),
+        vec3<f32>(1.0, 0.9, 0.3),
+    );
+    let i = u32(clamp(floor(c), 0.0, 3.0));
+    var next = vec3<f32>(1.0);
+    if (f32(i) + 1.0 < count) {
+        next = palette[i + 1u];
+    }
+    return mix(palette[i], next, fract(c));
 }
 
 // Mirrors `Sky::radiance` in sky.rs (without the sun disc).
@@ -260,8 +330,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let fresnel = f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
     let specular = distribution * visibility * fresnel;
     let diffuse = (1.0 - fresnel) * diffuse_color / PI;
-    let shadow = shadow_factor(in.light_clip);
-    let direct = (diffuse + specular) * globals.light_color.rgb * n_dot_l * shadow;
+    let sun = sun_visibility(in.world_pos, geometric);
+    let direct = (diffuse + specular) * globals.light_color.rgb * n_dot_l * sun.x;
 
     // Sky: SH irradiance for diffuse; the reflected sky, blurred toward the
     // irradiance as roughness grows, for specular.
@@ -272,7 +342,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let ab = env_brdf(n_dot_v, roughness);
     let ambient = (diffuse_color * irradiance / PI + prefiltered * (f0 * ab.x + ab.y)) * occlusion;
 
-    let color = (direct + ambient + emissive) * globals.light_dir.w;
+    var color = (direct + ambient + emissive) * globals.light_dir.w;
+    if (globals.shadow_params.y > 0.5 && sun.y < globals.shadow_params.x) {
+        color *= cascade_tint(sun.y, globals.shadow_params.x);
+    }
     return vec4<f32>(finish(color), base.a);
 }
 
