@@ -11,6 +11,7 @@ pub const SCENE_WGSL: &str = concat!(
     include_str!("shaders/scene.wgsl")
 );
 pub const LINES_WGSL: &str = include_str!("shaders/lines.wgsl");
+pub const AO_WGSL: &str = include_str!("shaders/ao.wgsl");
 pub const POST_WGSL: &str = concat!(
     include_str!("shaders/tonemap.wgsl"),
     include_str!("shaders/post.wgsl")
@@ -68,6 +69,7 @@ mod tests {
                 ("vs_skinned", Vertex),
                 ("vs_shadow_skinned", Vertex),
                 ("fs_main", Fragment),
+                ("fs_prepass", Fragment),
                 ("vs_sky", Vertex),
                 ("fs_sky", Fragment),
             ],
@@ -86,6 +88,20 @@ mod tests {
                 ("fs_downsample_first", Fragment),
                 ("fs_upsample", Fragment),
                 ("fs_composite", Fragment),
+            ],
+        );
+    }
+
+    #[test]
+    fn ao_shader_is_valid_for_webgl2() {
+        use naga::ShaderStage::{Fragment, Vertex};
+        check(
+            "ao",
+            AO_WGSL,
+            &[
+                ("vs_fullscreen", Vertex),
+                ("fs_gtao", Fragment),
+                ("fs_blur", Fragment),
             ],
         );
     }

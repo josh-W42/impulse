@@ -13,6 +13,7 @@ mod backend;
 
 pub use backend::backend_name;
 
+mod ao;
 mod draw_list;
 mod gpu;
 mod mesh;
@@ -22,6 +23,7 @@ mod shaders;
 mod shadow;
 mod sky;
 
+pub use ao::AoSettings;
 pub use draw_list::{
     DEFAULT_METALLIC, DEFAULT_ROUGHNESS, DebugLine, DrawList, Instance, InstanceRaw,
     JOINT_TEXTURE_WIDTH, JointRange, SkinnedInstance, SkinnedInstanceRaw, group_by_mesh,
@@ -33,6 +35,8 @@ pub use mesh::{
     perpendicular_tangent, uv_sphere,
 };
 pub use post::PostSettings;
-pub use renderer::{CameraData, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame};
+pub use renderer::{
+    CameraData, FogSettings, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame,
+};
 pub use shadow::ShadowRange;
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};

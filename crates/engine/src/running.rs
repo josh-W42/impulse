@@ -2,7 +2,7 @@
 
 use glam::{Vec2, Vec3};
 use impulse_physics::{BodyHandle, SolverMode, SolverSettings, StepStats, World};
-use impulse_render::{CameraData, DrawList, PostSettings, backend_name};
+use impulse_render::{AoSettings, CameraData, DrawList, FogSettings, PostSettings, backend_name};
 use web_time::Instant;
 use winit::event::{MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -127,6 +127,8 @@ struct Settings {
     /// shadows out to twice this from the camera.
     shadow_radius: f32,
     show_cascades: bool,
+    ao: AoSettings,
+    fog: FogSettings,
 }
 
 pub struct Sandbox {
@@ -140,6 +142,7 @@ pub struct Sandbox {
     /// What the adapter can do (the panel greys out the rest).
     hdr_supported: bool,
     msaa_supported: bool,
+    ao_supported: bool,
     /// Clock for the physics profiler.
     start: Instant,
     frame_ms: f32,
@@ -188,6 +191,7 @@ impl Sandbox {
             backend: backend_name(cx.gpu.backend()),
             hdr_supported: cx.renderer.hdr_supported(),
             msaa_supported: cx.renderer.msaa_supported(),
+            ao_supported: cx.renderer.ao_supported(),
             world,
             objects,
             timestep: FixedTimestep::new(FIXED_STEP, MAX_STEPS_PER_FRAME),
@@ -218,6 +222,8 @@ impl Sandbox {
                 post: cx.renderer.post_settings(),
                 shadow_radius: DEFAULT_SHADOW_RADIUS,
                 show_cascades: false,
+                ao: cx.renderer.ao_settings(),
+                fog: cx.renderer.fog_settings(),
             },
             start: Instant::now(),
             frame_ms: 0.0,
@@ -828,6 +834,7 @@ impl Game for Sandbox {
             backend: self.backend,
             hdr_supported: self.hdr_supported,
             msaa_supported: self.msaa_supported,
+            ao_supported: self.ao_supported,
             frame_ms: self.frame_ms,
             bodies: self.world.len(),
             camera: self.camera.mode,
@@ -881,6 +888,8 @@ impl Game for Sandbox {
             CameraMode::Fly => cx.renderer.set_shadow_distance(radius * 2.0),
         }
         cx.renderer.set_show_cascades(self.settings.show_cascades);
+        cx.renderer.set_ao_settings(self.settings.ao);
+        cx.renderer.set_fog_settings(self.settings.fog);
         // A gesture ends when nothing is being dragged or typed into.
         if self.edit_drag.is_none()
             && !cx.egui.egui_is_using_pointer()
@@ -942,6 +951,7 @@ struct Stats {
     backend: &'static str,
     hdr_supported: bool,
     msaa_supported: bool,
+    ao_supported: bool,
     frame_ms: f32,
     bodies: usize,
     camera: CameraMode,
@@ -955,6 +965,63 @@ struct Stats {
     arena: scene_desc::Arena,
     /// Every model's id, name, and whether it is bundled (Model… picker).
     models: Vec<(crate::models::ModelId, String, bool)>,
+}
+
+fn rendering_panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
+    let post = &mut s.post;
+    ui.horizontal(|ui| {
+        ui.add_enabled(
+            stats.msaa_supported,
+            egui::Checkbox::new(&mut post.msaa, "MSAA 4×"),
+        );
+        ui.add_enabled(
+            stats.hdr_supported,
+            egui::Checkbox::new(&mut post.bloom, "bloom"),
+        );
+        if !stats.hdr_supported {
+            ui.label("(no HDR on this GPU)");
+        }
+    });
+    ui.add_enabled(
+        stats.hdr_supported && post.bloom,
+        egui::Slider::new(&mut post.bloom_strength, 0.0..=0.25).text("bloom strength"),
+    );
+    ui.add(
+        egui::Slider::new(&mut post.exposure, 0.25..=4.0)
+            .logarithmic(true)
+            .text("exposure"),
+    );
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Slider::new(&mut s.shadow_radius, 10.0..=100.0)
+                .step_by(5.0)
+                .text("shadow radius"),
+        );
+        ui.checkbox(&mut s.show_cascades, "show cascades");
+    });
+    let ao = &mut s.ao;
+    let ao_on = stats.ao_supported && ao.enabled;
+    ui.horizontal(|ui| {
+        ui.add_enabled(
+            stats.ao_supported,
+            egui::Checkbox::new(&mut ao.enabled, "ambient occlusion"),
+        );
+        ui.add_enabled(ao_on, egui::Checkbox::new(&mut ao.show, "show AO"));
+    });
+    ui.add_enabled_ui(ao_on, |ui| {
+        ui.add(egui::Slider::new(&mut ao.radius, 0.1..=4.0).text("AO radius (m)"));
+        ui.add(egui::Slider::new(&mut ao.intensity, 0.5..=3.0).text("AO intensity"));
+    });
+    let fog = &mut s.fog;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut fog.enabled, "fog");
+        ui.add_enabled(
+            fog.enabled,
+            egui::Slider::new(&mut fog.density, 0.0..=0.05)
+                .logarithmic(true)
+                .text("density"),
+        );
+    });
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<Action>) {
@@ -1188,34 +1255,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
             ui.checkbox(&mut s.show_axes, "body axes");
             ui.checkbox(&mut s.show_colliders, "model colliders");
             ui.separator();
-            let post = &mut s.post;
-            ui.horizontal(|ui| {
-                ui.add_enabled(
-                    stats.msaa_supported,
-                    egui::Checkbox::new(&mut post.msaa, "MSAA 4×"),
-                );
-                ui.add_enabled(stats.hdr_supported, egui::Checkbox::new(&mut post.bloom, "bloom"));
-                if !stats.hdr_supported {
-                    ui.label("(no HDR on this GPU)");
-                }
-            });
-            ui.add_enabled(
-                stats.hdr_supported && post.bloom,
-                egui::Slider::new(&mut post.bloom_strength, 0.0..=0.25).text("bloom strength"),
-            );
-            ui.add(
-                egui::Slider::new(&mut post.exposure, 0.25..=4.0)
-                    .logarithmic(true)
-                    .text("exposure"),
-            );
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Slider::new(&mut s.shadow_radius, 10.0..=100.0)
-                        .step_by(5.0)
-                        .text("shadow radius"),
-                );
-                ui.checkbox(&mut s.show_cascades, "show cascades");
-            });
+            egui::CollapsingHeader::new("Rendering")
+                .default_open(false)
+                .show(ui, |ui| rendering_panel(ui, s, stats));
             ui.horizontal(|ui| {
                 use crate::egui_input::{MAX_UI_SCALE, MIN_UI_SCALE};
                 ui.label("UI size");

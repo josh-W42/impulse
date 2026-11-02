@@ -25,6 +25,11 @@ struct Globals {
     cascade_texel: vec4<f32>,
     // x: cascades in use; y: 1 to tint each cascade (debug)
     shadow_params: vec4<f32>,
+    // Height fog: x density at y = 0 (per metre, 0 = off); y: how fast it
+    // thins with height (per metre)
+    fog: vec4<f32>,
+    // x: 1 to show the AO buffer alone (debug)
+    ao: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var shadow_map: texture_depth_2d_array; // a layer per cascade
@@ -35,6 +40,10 @@ struct Caster {
     view_proj: mat4x4<f32>,
 };
 @group(3) @binding(0) var<uniform> caster: Caster;
+
+// The lit passes' group 3: screen-space ambient occlusion, one texel per
+// pixel (white when AO is off).
+@group(3) @binding(1) var ao_texture: texture_2d<f32>;
 
 struct Material {
     base_color: vec4<f32>,
@@ -279,6 +288,57 @@ fn env_brdf(n_dot_v: f32, roughness: f32) -> vec2<f32> {
     return vec2<f32>(-1.04, 1.04) * a004 + r.zw;
 }
 
+// The AO prepass: world normals encoded into [0, 1], and view depth along
+// the camera's forward axis.
+struct PrepassOut {
+    @location(0) normal: vec4<f32>,
+    @location(1) view_depth: vec4<f32>,
+};
+
+@fragment
+fn fs_prepass(in: VertexOut) -> PrepassOut {
+    var out: PrepassOut;
+    out.normal = vec4<f32>(normalize(in.normal) * 0.5 + 0.5, 1.0);
+    let depth = dot(in.world_pos - globals.eye.xyz, globals.shadow_camera.xyz);
+    out.view_depth = vec4<f32>(depth, 0.0, 0.0, 0.0);
+    return out;
+}
+
+// AO seen through light bouncing between bright surfaces (Jimenez et al.
+// 2016's fit): white walls in a corner don't go grey.
+fn multi_bounce(ao: f32, albedo: vec3<f32>) -> vec3<f32> {
+    let a = 2.0404 * albedo - 0.3324;
+    let b = -4.7951 * albedo + 0.6417;
+    let c = 2.7552 * albedo + 0.6903;
+    return max(vec3<f32>(ao), ((ao * a + b) * ao + c) * ao);
+}
+
+// How much of the reflected sky AO hides, from the diffuse AO (Lagarde).
+fn specular_occlusion(n_dot_v: f32, ao: f32, roughness: f32) -> f32 {
+    return clamp(pow(n_dot_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
+}
+
+// The fraction of `p`'s light replaced by fog on the way to the eye:
+// exponential height fog integrated along the ray (Quilez).
+fn fog_amount(p: vec3<f32>) -> f32 {
+    let density = globals.fog.x;
+    let falloff = globals.fog.y;
+    let ray = p - globals.eye.xyz;
+    let dist = length(ray);
+    let dy = ray.y / max(dist, 1e-4);
+    var optical = density * exp(-falloff * globals.eye.y) * dist;
+    if (abs(dy) > 1e-4) {
+        optical *= (1.0 - exp(-falloff * dist * dy)) / (falloff * dist * dy);
+    }
+    return 1.0 - exp(-max(optical, 0.0));
+}
+
+// What fog looks like along `dir`: the horizon sky, brighter toward the sun.
+fn fog_color(dir: vec3<f32>) -> vec3<f32> {
+    let toward_sun = max(dot(dir, -globals.light_dir.xyz), 0.0);
+    return globals.sky_horizon.rgb + globals.light_color.rgb * pow(toward_sun, 8.0) * 0.15;
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Every texture is sampled first, in uniform control flow (implicit
@@ -288,6 +348,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let normal_sample = textureSample(normal_texture, material_sampler, in.uv).xyz;
     let occlusion_sample = textureSample(occlusion_texture, material_sampler, in.uv).r;
     let emissive_sample = textureSample(emissive_texture, material_sampler, in.uv).rgb;
+    let screen_ao = textureLoad(ao_texture, vec2<i32>(in.clip.xy), 0).r;
 
     let base = base_sample * material.base_color * in.color;
     let metallic = clamp(material.params.x * mr.b * in.pbr.y, 0.0, 1.0);
@@ -340,9 +401,18 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let blur = roughness * roughness;
     let prefiltered = mix(sky_radiance(reflected), irradiance / PI, blur);
     let ab = env_brdf(n_dot_v, roughness);
-    let ambient = (diffuse_color * irradiance / PI + prefiltered * (f0 * ab.x + ab.y)) * occlusion;
+    let ao = min(occlusion, screen_ao);
+    let ambient = diffuse_color * irradiance / PI * multi_bounce(ao, diffuse_color)
+        + prefiltered * (f0 * ab.x + ab.y) * specular_occlusion(n_dot_v, ao, roughness);
+    if (globals.ao.x > 0.5) {
+        return vec4<f32>(finish(vec3<f32>(screen_ao)), 1.0);
+    }
 
-    var color = (direct + ambient + emissive) * globals.light_dir.w;
+    var color = direct + ambient + emissive;
+    if (globals.fog.x > 0.0) {
+        color = mix(color, fog_color(-v), fog_amount(in.world_pos));
+    }
+    color *= globals.light_dir.w;
     if (globals.shadow_params.y > 0.5 && sun.y < globals.shadow_params.x) {
         color *= cascade_tint(sun.y, globals.shadow_params.x);
     }
