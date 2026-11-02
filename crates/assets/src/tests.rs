@@ -365,6 +365,25 @@ fn absent_properties_take_gltf_defaults() {
 }
 
 #[test]
+fn alpha_modes_cutoffs_and_sidedness_come_through() {
+    let mut glb = Glb::default();
+    let prim = triangle(&mut glb, true).replace(r#","indices""#, r#","material":0,"indices""#);
+    let bytes = glb.build(&format!(
+        r#""meshes":[{{"primitives":[{prim}]}}],"nodes":[{{"mesh":0}}],"scenes":[{{"nodes":[0]}}],
+        "materials":[{{"alphaMode":"MASK","alphaCutoff":0.3,"doubleSided":true}},
+                     {{"alphaMode":"MASK"}},
+                     {{"alphaMode":"BLEND"}}]"#
+    ));
+    let materials = load_glb(&bytes).unwrap().materials;
+    assert_eq!(materials[0].alpha_mode, AlphaMode::Mask { cutoff: 0.3 });
+    assert!(materials[0].double_sided);
+    // glTF's default cutoff.
+    assert_eq!(materials[1].alpha_mode, AlphaMode::Mask { cutoff: 0.5 });
+    assert!(!materials[1].double_sided);
+    assert_eq!(materials[2].alpha_mode, AlphaMode::Blend);
+}
+
+#[test]
 fn bad_files_give_specific_errors() {
     assert!(matches!(
         load_glb(b"not a model"),

@@ -97,10 +97,12 @@ pub enum Demo {
     Props,
     /// A roughness × metallic sphere chart and props (M9b's PBR showcase).
     Materials,
+    /// Tinted glass and chain-link fences (R4's transparency showcase).
+    Glass,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 7] = [
+    pub const ALL: [Demo; 8] = [
         Demo::Pit,
         Demo::Tower,
         Demo::Pyramid,
@@ -108,6 +110,7 @@ impl Demo {
         Demo::Joints,
         Demo::Props,
         Demo::Materials,
+        Demo::Glass,
     ];
 
     pub fn label(self) -> &'static str {
@@ -119,6 +122,7 @@ impl Demo {
             Demo::Joints => "Joints",
             Demo::Props => "Props",
             Demo::Materials => "Materials",
+            Demo::Glass => "Glass",
         }
     }
 
@@ -212,13 +216,14 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
         }
         Demo::Props => (props_objects(), Vec::new()),
         Demo::Materials => (materials_objects(), Vec::new()),
+        Demo::Glass => (glass_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
         version: 1,
         name: demo.label().to_string(),
         // The chart is for looking at: no walls in the way.
         arena: match demo {
-            Demo::Materials => Arena::Floor,
+            Demo::Materials | Demo::Glass => Arena::Floor,
             _ => Arena::Pit {
                 half: pit_half(demo),
             },
@@ -323,6 +328,89 @@ fn materials_objects() -> Vec<ObjectDesc> {
             color: [1.0; 3],
             ..ObjectDesc::default()
         });
+    }
+    objects
+}
+
+/// Glass tints: blue, green, amber, rose.
+const GLASS_TINTS: [[f32; 3]; 4] = [
+    [0.55, 0.75, 1.0],
+    [0.6, 1.0, 0.7],
+    [1.0, 0.8, 0.45],
+    [1.0, 0.6, 0.7],
+];
+
+/// Panes and blocks of tinted glass in front of opaque shapes, inside a ring
+/// of chain-link fences: blending, sorting and alpha-tested cut-outs.
+fn glass_objects() -> Vec<ObjectDesc> {
+    let mut objects = Vec::new();
+    // Opaque things to look at through the glass.
+    for (i, x) in [-3.0_f32, 0.0, 3.0].into_iter().enumerate() {
+        let [r, g, b, _] = STACK_COLORS[i];
+        objects.push(ObjectDesc {
+            shape: Some(ShapeDesc::Sphere { radius: 0.6 }),
+            position: [x, 0.6, -2.5],
+            body: BodyType::Static,
+            color: [r, g, b],
+            ..ObjectDesc::default()
+        });
+    }
+    // Upright panes, overlapping in depth so sorting shows.
+    for (i, &tint) in GLASS_TINTS.iter().enumerate() {
+        objects.push(ObjectDesc {
+            shape: Some(ShapeDesc::Box {
+                half_extents: [0.9, 1.0, 0.05],
+            }),
+            position: [i as f32 * 1.4 - 2.1, 1.0, -0.6 + (i % 2) as f32 * 0.8],
+            body: BodyType::Static,
+            color: tint,
+            opacity: 0.35,
+            roughness: 0.05,
+            ..ObjectDesc::default()
+        });
+    }
+    // Glass blocks and balls that fall and stack.
+    for i in 0..8 {
+        let shape = if i % 2 == 0 {
+            ShapeDesc::Box {
+                half_extents: [0.35; 3],
+            }
+        } else {
+            ShapeDesc::Sphere { radius: 0.35 }
+        };
+        objects.push(ObjectDesc {
+            shape: Some(shape),
+            position: [
+                (i % 4) as f32 * 1.0 - 1.5 + spread(i, 0.37) * 0.3,
+                2.5 + (i / 4) as f32 * 1.2,
+                1.6 + spread(i, 0.53) * 0.4,
+            ],
+            body: BodyType::Dynamic { mass: 1.0 },
+            color: GLASS_TINTS[i % GLASS_TINTS.len()],
+            opacity: 0.45,
+            roughness: 0.1,
+            ..ObjectDesc::default()
+        });
+    }
+    // A ring of fence panels around it all.
+    for i in 0..16 {
+        let angle = i as f32 / 16.0 * std::f32::consts::TAU;
+        let radius = 6.0;
+        let mut fence = ObjectDesc {
+            shape: Some(ShapeDesc::Model {
+                name: "fence".to_string(),
+                scale: 1.0,
+                collider: ModelCollider::Box,
+            }),
+            position: [angle.cos() * radius, 0.0, angle.sin() * radius],
+            body: BodyType::Static,
+            color: [1.0; 3],
+            ..ObjectDesc::default()
+        };
+        fence.set_orientation(glam::Quat::from_rotation_y(
+            std::f32::consts::FRAC_PI_2 - angle,
+        ));
+        objects.push(fence);
     }
     objects
 }
@@ -845,7 +933,9 @@ pub fn build_draw_list(
         let body_transform = Mat4::from_rotation_translation(pose.orientation, pose.position);
         let selected = selected == Some(index);
         let color = if selected {
-            object.color.map(|c| c + (1.0 - c) * SELECTED_TINT)
+            let [r, g, b, a] = object.color;
+            let [r, g, b] = [r, g, b].map(|c| c + (1.0 - c) * SELECTED_TINT);
+            [r, g, b, a]
         } else {
             object.color
         };

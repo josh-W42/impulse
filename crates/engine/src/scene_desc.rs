@@ -58,6 +58,8 @@ pub struct ObjectDesc {
     pub restitution: f32,
     pub friction: f32,
     pub color: [f32; 3],
+    /// Below 1, the object draws see-through (blended, like glass).
+    pub opacity: f32,
     pub velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
     /// Surface for built-in shapes (models use their file's material).
@@ -78,6 +80,7 @@ impl Default for ObjectDesc {
             restitution: material.restitution,
             friction: material.friction,
             color: [0.7, 0.7, 0.7],
+            opacity: 1.0,
             velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
             roughness: impulse_render::DEFAULT_ROUGHNESS,
@@ -583,7 +586,7 @@ fn populate(
         let [r, g, b] = object.color;
         objects.push(SceneObject {
             handle,
-            color: [r, g, b, 1.0],
+            color: [r, g, b, object.opacity.clamp(0.0, 1.0)],
             prev: Pose {
                 position,
                 orientation,
@@ -897,6 +900,19 @@ mod tests {
         assert_eq!((o.roughness, o.metallic), (0.6, 0.0));
         let (_, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
         assert_eq!((objects[1].roughness, objects[1].metallic), (0.2, 1.0));
+    }
+
+    #[test]
+    fn opacity_round_trips_reaches_the_draw_colour_and_defaults_to_opaque() {
+        let mut desc = sampler();
+        desc.objects[1].opacity = 0.4;
+        assert_eq!(from_ron(&to_ron(&desc)).unwrap(), desc);
+        let (_, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
+        assert_eq!(objects[1].color[3], 0.4);
+        // Files from before R4 have no opacity: opaque.
+        let old = r#"(version: 2, name: "old", arena: Floor,
+            objects: [(shape: Some(Sphere(radius: 0.5)), position: (0.0, 1.0, 0.0))])"#;
+        assert_eq!(from_ron(old).unwrap().objects[0].opacity, 1.0);
     }
 
     fn object_at(position: [f32; 3], parent: Option<usize>) -> ObjectDesc {

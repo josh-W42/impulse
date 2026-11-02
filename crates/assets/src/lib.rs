@@ -69,6 +69,17 @@ pub struct ModelMesh {
     pub material: Option<usize>,
 }
 
+/// How a material's alpha is used (glTF `alphaMode`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlphaMode {
+    /// Alpha is ignored.
+    Opaque,
+    /// Fully opaque where alpha ≥ `cutoff`, invisible elsewhere (cut-outs).
+    Mask { cutoff: f32 },
+    /// Blended over what is behind (glass).
+    Blend,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaterialData {
     /// Linear RGBA multiplier.
@@ -87,6 +98,9 @@ pub struct MaterialData {
     /// Linear RGB emitted light (multiplies the emissive texture).
     pub emissive: [f32; 3],
     pub emissive_texture: Option<usize>,
+    pub alpha_mode: AlphaMode,
+    /// Both faces drawn (no back-face culling).
+    pub double_sided: bool,
 }
 
 impl Default for MaterialData {
@@ -104,6 +118,8 @@ impl Default for MaterialData {
             occlusion_strength: 1.0,
             emissive: [0.0; 3],
             emissive_texture: None,
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
         }
     }
 }
@@ -312,6 +328,14 @@ fn read_materials(
             metallic: pbr.metallic_factor(),
             roughness: pbr.roughness_factor(),
             emissive: material.emissive_factor(),
+            alpha_mode: match material.alpha_mode() {
+                gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+                gltf::material::AlphaMode::Mask => AlphaMode::Mask {
+                    cutoff: material.alpha_cutoff().unwrap_or(0.5),
+                },
+                gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+            },
+            double_sided: material.double_sided(),
             ..MaterialData::default()
         };
         if let Some(info) = pbr.base_color_texture() {

@@ -659,6 +659,12 @@ pub fn inspector(
                     o.color = color;
                 }
             });
+            if o.shape.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("opacity");
+                    ui.add(egui::Slider::new(&mut o.opacity, 0.05..=1.0));
+                });
+            }
             if !matches!(o.shape, Some(ShapeDesc::Model { .. }) | None) {
                 ui.horizontal(|ui| {
                     ui.label("roughness");

@@ -8,8 +8,8 @@ use impulse_assets::{
     ColorSpace, MaterialData, ModelData, SkinnedMesh, SkinnedModelData, TextureData,
 };
 use impulse_render::{
-    Gpu, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, SkinnedMeshData, SkinnedMeshId,
-    SkinnedVertex, TextureId, Vertex,
+    AlphaMode, Gpu, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, SkinnedMeshData,
+    SkinnedMeshId, SkinnedVertex, TextureId, Vertex,
 };
 
 /// Textures already uploaded, by content: identical pixels in the same
@@ -115,6 +115,12 @@ fn upload_materials(
                 normal_texture: texture(renderer, m.normal_texture),
                 occlusion_texture: texture(renderer, m.occlusion_texture),
                 emissive_texture: texture(renderer, m.emissive_texture),
+                alpha_mode: match m.alpha_mode {
+                    impulse_assets::AlphaMode::Opaque => AlphaMode::Opaque,
+                    impulse_assets::AlphaMode::Mask { cutoff } => AlphaMode::Mask { cutoff },
+                    impulse_assets::AlphaMode::Blend => AlphaMode::Blend,
+                },
+                double_sided: m.double_sided,
             };
             renderer.add_material(gpu, &desc)
         })

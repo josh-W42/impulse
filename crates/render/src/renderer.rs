@@ -10,8 +10,8 @@ use wgpu::util::DeviceExt;
 
 use crate::ao::{Ao, AoSettings, NORMAL_FORMAT};
 use crate::draw_list::{
-    DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_by_mesh, group_skinned,
-    joint_texels, joint_texture_rows,
+    DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_skinned, joint_texels,
+    joint_texture_rows, split_blended,
 };
 use crate::gpu::{DEPTH_FORMAT, Gpu, VIEW_DEPTH_FORMAT};
 use crate::mesh::{
@@ -123,6 +123,83 @@ struct MaterialRaw {
     emissive: [f32; 4],
     /// metallic, roughness, normal scale, occlusion strength
     params: [f32; 4],
+    /// x: alpha mode (0 opaque, 1 mask, 2 blend); y: mask cutoff.
+    alpha: [f32; 4],
+}
+
+/// How a material's alpha is used (glTF `alphaMode`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlphaMode {
+    /// Alpha is ignored.
+    Opaque,
+    /// Opaque where alpha ≥ `cutoff`, invisible elsewhere: cut-outs such as
+    /// leaves and fences. Anti-aliased with alpha-to-coverage under MSAA.
+    Mask { cutoff: f32 },
+    /// Blended over what is behind, sorted back to front: glass. Casts no
+    /// shadow and takes no screen-space AO.
+    Blend,
+}
+
+/// Which pipelines a material draws with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Variant {
+    /// 0 opaque, 1 mask, 2 blend.
+    alpha: usize,
+    double_sided: bool,
+}
+
+impl Variant {
+    const OPAQUE: Variant = Variant {
+        alpha: 0,
+        double_sided: false,
+    };
+    /// What the opaque passes (lit, shadow, prepass) draw: opaque and mask.
+    const SOLID: [Variant; 4] = [
+        Variant::OPAQUE,
+        Variant {
+            alpha: 0,
+            double_sided: true,
+        },
+        Variant {
+            alpha: 1,
+            double_sided: false,
+        },
+        Variant {
+            alpha: 1,
+            double_sided: true,
+        },
+    ];
+
+    fn of(desc: &MaterialDesc) -> Self {
+        let alpha = match desc.alpha_mode {
+            AlphaMode::Opaque => 0,
+            AlphaMode::Mask { .. } => 1,
+            AlphaMode::Blend => 2,
+        };
+        Variant {
+            alpha,
+            double_sided: desc.double_sided,
+        }
+    }
+
+    /// The blended variant with the same sidedness (translucent instances
+    /// of any material blend).
+    fn blended(self) -> Self {
+        Variant { alpha: 2, ..self }
+    }
+
+    fn index(self) -> usize {
+        self.alpha * 2 + self.double_sided as usize
+    }
+
+    fn cull(self) -> Option<wgpu::Face> {
+        (!self.double_sided).then_some(wgpu::Face::Back)
+    }
+}
+
+struct Material {
+    bind_group: wgpu::BindGroup,
+    variant: Variant,
 }
 
 /// A glTF metallic-roughness material. Textures are optional (defaults:
@@ -146,6 +223,9 @@ pub struct MaterialDesc {
     pub occlusion_texture: Option<TextureId>,
     /// sRGB.
     pub emissive_texture: Option<TextureId>,
+    pub alpha_mode: AlphaMode,
+    /// Draw back faces too (no culling); their normals face the viewer.
+    pub double_sided: bool,
 }
 
 impl Default for MaterialDesc {
@@ -162,6 +242,8 @@ impl Default for MaterialDesc {
             normal_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
         }
     }
 }
@@ -377,7 +459,8 @@ struct ColorSource {
 /// The pipelines that draw into the scene target.
 struct ColorPipelines {
     samples: u32,
-    lit: wgpu::RenderPipeline,
+    /// Indexed by [`Variant::index`]: opaque, mask, blend × single, double sided.
+    lit: Vec<wgpu::RenderPipeline>,
     skinned_lit: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
     lines: wgpu::RenderPipeline,
@@ -401,27 +484,18 @@ impl ColorSource {
                         buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
                         primitive,
                         depth_stencil| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(format.into())],
-                }),
+            Self::pipeline(
+                device,
+                label,
+                layout,
+                module,
+                (vs, fs),
+                buffers,
                 primitive,
                 depth_stencil,
+                format.into(),
                 multisample,
-                multiview_mask: None,
-                cache: None,
-            })
+            )
         };
         let opaque = || {
             depth_state(
@@ -437,17 +511,49 @@ impl ColorSource {
                 wgpu::DepthBiasState::default(),
             )
         };
+        let lit = (0..3)
+            .flat_map(|alpha| {
+                [false, true].map(|double_sided| Variant {
+                    alpha,
+                    double_sided,
+                })
+            })
+            .map(|variant| {
+                let blend = variant.alpha == 2;
+                let target = wgpu::ColorTargetState {
+                    format,
+                    blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                };
+                Self::pipeline(
+                    device,
+                    "lit",
+                    &self.scene_layout,
+                    &self.scene_shader,
+                    ("vs_main", "fs_main"),
+                    &[Some(mesh_layout()), Some(instance_layout())],
+                    wgpu::PrimitiveState {
+                        cull_mode: variant.cull(),
+                        ..solid()
+                    },
+                    // Glass tests against the scene but doesn't hide what is
+                    // behind it from later glass.
+                    depth_state(
+                        !blend,
+                        wgpu::CompareFunction::Less,
+                        wgpu::DepthBiasState::default(),
+                    ),
+                    target,
+                    wgpu::MultisampleState {
+                        alpha_to_coverage_enabled: variant.alpha == 1 && samples > 1,
+                        ..multisample
+                    },
+                )
+            })
+            .collect();
         ColorPipelines {
             samples,
-            lit: pipeline(
-                "lit",
-                &self.scene_layout,
-                &self.scene_shader,
-                ("vs_main", "fs_main"),
-                &[Some(mesh_layout()), Some(instance_layout())],
-                solid(),
-                opaque(),
-            ),
+            lit,
             skinned_lit: pipeline(
                 "lit skinned",
                 &self.skinned_lit_layout,
@@ -485,6 +591,42 @@ impl ColorSource {
             ),
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline(
+        device: &wgpu::Device,
+        label: &str,
+        layout: &wgpu::PipelineLayout,
+        module: &wgpu::ShaderModule,
+        (vs, fs): (&str, &str),
+        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+        primitive: wgpu::PrimitiveState,
+        depth_stencil: Option<wgpu::DepthStencilState>,
+        target: wgpu::ColorTargetState,
+        multisample: wgpu::MultisampleState,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some(vs),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(target)],
+            }),
+            primitive,
+            depth_stencil,
+            multisample,
+            multiview_mask: None,
+            cache: None,
+        })
+    }
 }
 
 pub struct Renderer {
@@ -506,21 +648,23 @@ pub struct Renderer {
     ao: Ao,
     ao_settings: AoSettings,
     fog_settings: FogSettings,
-    /// Normals and depth for AO (lit vertex shaders, `fs_prepass`).
-    prepass_pipeline: wgpu::RenderPipeline,
+    /// Normals and depth for AO, per [`Variant::SOLID`] (lit vertex shaders,
+    /// `fs_prepass` / `fs_prepass_mask`).
+    prepass_pipelines: Vec<wgpu::RenderPipeline>,
     skinned_prepass_pipeline: wgpu::RenderPipeline,
     /// Layout and shared sampler for per-material bind groups (group 1).
     material_bgl: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
     /// Texture views; 0 white sRGB, 1 white linear, 2 flat normal.
     textures: Vec<wgpu::TextureView>,
-    /// Material bind groups; 0 is [`MaterialId::DEFAULT`].
-    materials: Vec<wgpu::BindGroup>,
+    /// 0 is [`MaterialId::DEFAULT`].
+    materials: Vec<Material>,
     /// Meshes/textures/materials below these counts survive `clear_custom_meshes`.
     pinned_meshes: usize,
     pinned_textures: usize,
     pinned_materials: usize,
-    shadow_pipeline: wgpu::RenderPipeline,
+    /// Per [`Variant::SOLID`]; masked casters alpha-test.
+    shadow_pipelines: Vec<wgpu::RenderPipeline>,
     /// One depth view per cascade (a layer of the shadow array) to render into.
     shadow_layers: Vec<wgpu::TextureView>,
     /// Per cascade: its light matrix, bound at group 3 in the shadow passes.
@@ -528,6 +672,8 @@ pub struct Renderer {
     /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
     meshes: Vec<GpuMesh>,
     instances: Vec<GrowableBuffer>,
+    /// This frame's blended instances, back to front.
+    blend_instances: GrowableBuffer,
     skinned_shadow_pipeline: wgpu::RenderPipeline,
     joints_bgl: wgpu::BindGroupLayout,
     /// Bound at the shadow passes' unused groups.
@@ -799,33 +945,45 @@ impl Renderer {
                 (buffer, bind_group)
             })
             .collect();
-        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("shadow"),
-                    bind_group_layouts: &[
-                        Some(&empty_bgl),
-                        Some(&empty_bgl),
-                        Some(&empty_bgl),
-                        Some(&caster_bgl),
-                    ],
-                    immediate_size: 0,
-                }),
-            ),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vs_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(mesh_layout()), Some(instance_layout())],
-            },
-            fragment: None,
-            primitive: solid(),
-            depth_stencil: depth_state(true, wgpu::CompareFunction::LessEqual, SHADOW_BIAS),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
+            bind_group_layouts: &[
+                Some(&empty_bgl),
+                Some(&material_bgl),
+                Some(&empty_bgl),
+                Some(&caster_bgl),
+            ],
+            immediate_size: 0,
         });
+        let shadow_pipelines = Variant::SOLID
+            .map(|variant| {
+                let mask = variant.alpha == 1;
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("shadow"),
+                    layout: Some(&shadow_layout),
+                    vertex: wgpu::VertexState {
+                        module: &scene_shader,
+                        entry_point: Some(if mask { "vs_shadow_mask" } else { "vs_shadow" }),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(mesh_layout()), Some(instance_layout())],
+                    },
+                    fragment: mask.then(|| wgpu::FragmentState {
+                        module: &scene_shader,
+                        entry_point: Some("fs_shadow_mask"),
+                        compilation_options: Default::default(),
+                        targets: &[],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: variant.cull(),
+                        ..solid()
+                    },
+                    depth_stencil: depth_state(true, wgpu::CompareFunction::LessEqual, SHADOW_BIAS),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .to_vec();
         let skinned_shadow_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shadow skinned"),
@@ -856,7 +1014,7 @@ impl Renderer {
             });
         let joint_texture = JointTexture::new(device, &joints_bgl, 1);
 
-        let prepass = |label, layout: &wgpu::PipelineLayout, vs, buffers: &[_]| {
+        let prepass = |label, layout: &wgpu::PipelineLayout, vs, fs, buffers: &[_], cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -868,11 +1026,14 @@ impl Renderer {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &scene_shader,
-                    entry_point: Some("fs_prepass"),
+                    entry_point: Some(fs),
                     compilation_options: Default::default(),
                     targets: &[Some(NORMAL_FORMAT.into()), Some(VIEW_DEPTH_FORMAT.into())],
                 }),
-                primitive: solid(),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: cull,
+                    ..solid()
+                },
                 depth_stencil: depth_state(
                     true,
                     wgpu::CompareFunction::Less,
@@ -883,12 +1044,27 @@ impl Renderer {
                 cache: None,
             })
         };
-        let prepass_pipeline = prepass(
-            "prepass",
-            &globals_layout,
-            "vs_main",
-            &[Some(mesh_layout()), Some(instance_layout())],
-        );
+        let prepass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("prepass"),
+            bind_group_layouts: &[Some(&globals_bgl), Some(&material_bgl)],
+            immediate_size: 0,
+        });
+        let prepass_pipelines = Variant::SOLID
+            .map(|variant| {
+                prepass(
+                    "prepass",
+                    &prepass_layout,
+                    "vs_main",
+                    if variant.alpha == 1 {
+                        "fs_prepass_mask"
+                    } else {
+                        "fs_prepass"
+                    },
+                    &[Some(mesh_layout()), Some(instance_layout())],
+                    variant.cull(),
+                )
+            })
+            .to_vec();
         let skinned_prepass_pipeline = prepass(
             "prepass skinned",
             &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -897,7 +1073,9 @@ impl Renderer {
                 immediate_size: 0,
             }),
             "vs_skinned",
+            "fs_prepass",
             &[Some(skinned_mesh_layout()), Some(skinned_instance_layout())],
+            Some(wgpu::Face::Back),
         );
 
         let color_source = ColorSource {
@@ -946,7 +1124,7 @@ impl Renderer {
             ao,
             ao_settings: AoSettings::default(),
             fog_settings: FogSettings::default(),
-            prepass_pipeline,
+            prepass_pipelines,
             skinned_prepass_pipeline,
             globals,
             scene_bind_group,
@@ -954,15 +1132,19 @@ impl Renderer {
             material_bgl,
             material_sampler,
             textures,
-            materials: vec![default_material],
+            materials: vec![Material {
+                bind_group: default_material,
+                variant: Variant::OPAQUE,
+            }],
             pinned_meshes: MeshKind::ALL.len(),
             pinned_textures: 3,
             pinned_materials: 1,
-            shadow_pipeline,
+            shadow_pipelines,
             shadow_layers,
             casters,
             meshes,
             instances,
+            blend_instances: GrowableBuffer::new(device, "blend instances", INITIAL_INSTANCE_BYTES),
             skinned_shadow_pipeline,
             joints_bgl,
             empty_bind_group,
@@ -1022,7 +1204,12 @@ impl Renderer {
             sky_horizon: rgba(self.sky.horizon),
             sky_ground: rgba(self.sky.ground),
             sh: self.sky_sh,
-            post: [if scene_target.hdr { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0],
+            post: [
+                if scene_target.hdr { 0.0 } else { 1.0 },
+                0.0,
+                if samples > 1 { 1.0 } else { 0.0 },
+                0.0,
+            ],
             cascades: shadows.view_proj.map(|m| m.to_cols_array_2d()),
             shadow_camera: shadows.forward.extend(shadows.near).to_array(),
             cascade_far: shadows.far,
@@ -1047,10 +1234,16 @@ impl Renderer {
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
-        let groups = group_by_mesh(&list.instances, self.meshes.len());
+        let (groups, blended) =
+            split_blended(&list.instances, self.meshes.len(), camera.eye, |mesh| {
+                self.materials[self.meshes[mesh].material].variant.alpha == 2
+            });
         for (buffer, group) in self.instances.iter_mut().zip(&groups) {
             buffer.write(device, queue, bytemuck::cast_slice(group));
         }
+        let blend_raws: Vec<InstanceRaw> = blended.iter().map(|(_, raw)| *raw).collect();
+        self.blend_instances
+            .write(device, queue, bytemuck::cast_slice(&blend_raws));
         let skinned_groups = self.prepare_skinned(gpu, list);
         let line_vertices: Vec<LineVertex> = list
             .lines
@@ -1096,14 +1289,14 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.shadow_pipeline);
-            for group in 0..3 {
+            for group in [0, 2] {
                 pass.set_bind_group(group, &self.empty_bind_group, &[]);
             }
             pass.set_bind_group(3, caster, &[]);
-            self.draw_meshes(&mut pass, &groups, false);
+            self.draw_solid(&mut pass, &groups, &self.shadow_pipelines);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.skinned_shadow_pipeline);
+                pass.set_bind_group(1, &self.empty_bind_group, &[]);
                 pass.set_bind_group(2, &self.joint_texture.bind_group, &[]);
                 self.draw_skinned(&mut pass, &skinned_groups, false);
             }
@@ -1119,9 +1312,8 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.prepass_pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            self.draw_meshes(&mut pass, &groups, false);
+            self.draw_solid(&mut pass, &groups, &self.prepass_pipelines);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.skinned_prepass_pipeline);
                 pass.set_bind_group(1, &self.empty_bind_group, &[]);
@@ -1154,11 +1346,10 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.color.lit);
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
             pass.set_bind_group(2, &self.empty_bind_group, &[]);
             pass.set_bind_group(3, self.ao.lit_bind_group(ao_on), &[]);
-            self.draw_meshes(&mut pass, &groups, true);
+            self.draw_solid(&mut pass, &groups, &self.color.lit[..4]);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.color.skinned_lit);
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
@@ -1169,6 +1360,28 @@ impl Renderer {
             pass.set_pipeline(&self.color.sky);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
             pass.draw(0..3, 0..1);
+
+            if !blended.is_empty() {
+                pass.set_bind_group(0, &self.scene_bind_group, &[]);
+                pass.set_bind_group(2, &self.empty_bind_group, &[]);
+                pass.set_bind_group(3, self.ao.lit_bind_group(ao_on), &[]);
+                pass.set_vertex_buffer(1, self.blend_instances.buffer.slice(..));
+                let mut bound = None;
+                for (i, (index, _)) in blended.iter().enumerate() {
+                    let mesh = &self.meshes[*index];
+                    let material = &self.materials[mesh.material];
+                    let variant = material.variant.blended();
+                    if bound != Some(variant) {
+                        pass.set_pipeline(&self.color.lit[variant.index()]);
+                        bound = Some(variant);
+                    }
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    let i = i as u32;
+                    pass.draw_indexed(0..mesh.index_count, 0, i..i + 1);
+                }
+            }
 
             if !line_vertices.is_empty() {
                 let bytes = std::mem::size_of_val(line_vertices.as_slice()) as u64;
@@ -1243,7 +1456,10 @@ impl Renderer {
             &self.textures,
             desc,
         );
-        self.materials.push(group);
+        self.materials.push(Material {
+            bind_group: group,
+            variant: Variant::of(desc),
+        });
         MaterialId((self.materials.len() - 1) as u32)
     }
 
@@ -1378,7 +1594,9 @@ impl Renderer {
             .materials
             .get(material.0 as usize)
             .unwrap_or(&self.materials[0])
+            .bind_group
             .clone();
+        // Skinned meshes draw opaque and single-sided whatever the material says.
         self.skinned_meshes.push((mesh, group));
         self.skinned_instances.push(GrowableBuffer::new(
             gpu.device(),
@@ -1500,28 +1718,34 @@ impl Renderer {
         self.clear_custom_meshes();
     }
 
-    /// `with_material`: bind each mesh's texture (the lit pass; the shadow pass
-    /// has no material group).
-    fn draw_meshes(
+    /// Draws the opaque and masked meshes, each variant with its pipeline
+    /// (`pipelines` in [`Variant::SOLID`] order); materials bind at group 1.
+    fn draw_solid(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         groups: &[Vec<InstanceRaw>],
-        with_material: bool,
+        pipelines: &[wgpu::RenderPipeline],
     ) {
-        for (index, group) in groups.iter().enumerate() {
-            let count = group.len() as u32;
-            if count == 0 {
-                continue;
+        for (variant, pipeline) in Variant::SOLID.iter().zip(pipelines) {
+            let mut bound = false;
+            for (index, group) in groups.iter().enumerate() {
+                let count = group.len() as u32;
+                let mesh = &self.meshes[index];
+                let material = &self.materials[mesh.material];
+                if count == 0 || material.variant != *variant {
+                    continue;
+                }
+                if !bound {
+                    pass.set_pipeline(pipeline);
+                    bound = true;
+                }
+                let bytes = count as u64 * size_of::<InstanceRaw>() as u64;
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_vertex_buffer(1, self.instances[index].buffer.slice(..bytes));
+                pass.set_bind_group(1, &material.bind_group, &[]);
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..count);
             }
-            let mesh = &self.meshes[index];
-            let bytes = count as u64 * size_of::<InstanceRaw>() as u64;
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_vertex_buffer(1, self.instances[index].buffer.slice(..bytes));
-            if with_material {
-                pass.set_bind_group(1, &self.materials[mesh.material], &[]);
-            }
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..count);
         }
     }
 }
@@ -1605,6 +1829,11 @@ fn material_bind_group(
             desc.normal_scale,
             desc.occlusion_strength,
         ],
+        alpha: match desc.alpha_mode {
+            AlphaMode::Opaque => [0.0; 4],
+            AlphaMode::Mask { cutoff } => [1.0, cutoff, 0.0, 0.0],
+            AlphaMode::Blend => [2.0, 0.0, 0.0, 0.0],
+        },
     };
     let factors = gpu
         .device()
