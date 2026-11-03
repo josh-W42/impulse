@@ -181,9 +181,8 @@ pub struct Sandbox {
     listed: Option<usize>,
     /// Panel requests from this frame's UI, carried out in `draw`.
     actions: Vec<Action>,
-    /// The sky last handed to the renderer (changing it re-integrates the
-    /// ambient light, so only on a change).
-    applied_sky: Option<scene_desc::SkyPreset>,
+    /// Keeps the renderer's sky in step with the scene's.
+    skies: crate::skies::Skies,
     /// What the renderer did with last frame's lights.
     light_stats: LightStats,
 }
@@ -256,7 +255,7 @@ impl Sandbox {
             model_meshes: ModelMeshes::new(),
             listed: None,
             actions: Vec::new(),
-            applied_sky: None,
+            skies: crate::skies::Skies::default(),
             light_stats: LightStats::default(),
         };
         sandbox.upload_models(cx);
@@ -916,10 +915,11 @@ impl Game for Sandbox {
         cx.renderer
             .set_show_light_clusters(self.settings.show_light_clusters);
         self.light_stats = cx.renderer.light_stats();
-        let sky = self.editor.desc().sky;
-        if self.applied_sky != Some(sky) {
-            cx.renderer.set_sky(sky.sky());
-            self.applied_sky = Some(sky);
+        if let Err(e) = self
+            .skies
+            .apply(cx.gpu, cx.renderer, self.editor.desc().sky)
+        {
+            self.message = Some(e);
         }
         // A gesture ends when nothing is being dragged or typed into.
         if self.edit_drag.is_none()

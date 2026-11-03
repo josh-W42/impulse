@@ -45,29 +45,41 @@ pub enum Arena {
     Empty,
 }
 
-/// The sky a scene is lit by.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The sky a scene is lit by: procedural (day, dusk, night) or a bundled
+/// HDR photo (clouds, sunset; see `skies.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SkyPreset {
     #[default]
     Day,
     Dusk,
     Night,
+    Clouds,
+    Sunset,
 }
 
 impl SkyPreset {
-    pub const ALL: [SkyPreset; 3] = [SkyPreset::Day, SkyPreset::Dusk, SkyPreset::Night];
+    pub const ALL: [SkyPreset; 5] = [
+        SkyPreset::Day,
+        SkyPreset::Dusk,
+        SkyPreset::Night,
+        SkyPreset::Clouds,
+        SkyPreset::Sunset,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             SkyPreset::Day => "day",
             SkyPreset::Dusk => "dusk",
             SkyPreset::Night => "night",
+            SkyPreset::Clouds => "clouds (HDR)",
+            SkyPreset::Sunset => "sunset (HDR)",
         }
     }
 
+    /// The procedural sky; the HDR skies fall back to day.
     pub fn sky(self) -> Sky {
         match self {
-            SkyPreset::Day => Sky::default(),
+            SkyPreset::Day | SkyPreset::Clouds | SkyPreset::Sunset => Sky::default(),
             SkyPreset::Dusk => Sky::dusk(),
             SkyPreset::Night => Sky::night(),
         }

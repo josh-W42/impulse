@@ -1050,6 +1050,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "glam",
+ "impulse-assets",
  "log",
  "naga",
  "wgpu",

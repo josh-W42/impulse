@@ -1,6 +1,6 @@
 # R4 — Transparency and Cut-outs: Plan + Results
 
-**Date:** 2026-11-02 · **Status:** built, awaiting hand check · **Track:**
+**Date:** 2026-11-02 · **Status:** hand-checked and merged (PR #8) · **Track:**
 [render quality](2026-11-02-render-quality-track.md)
 
 ## Why
