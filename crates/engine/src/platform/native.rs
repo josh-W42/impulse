@@ -30,7 +30,7 @@ pub fn backend_override() -> Option<BackendOverride> {
 
 /// Scenes are picked from the page URL, so desktop builds never have one.
 pub fn scene_override() -> Option<String> {
-    None
+    std::env::var("IMPULSE_SCENE").ok()
 }
 
 /// Desktop lists saved scenes itself; the browser uses a file picker.

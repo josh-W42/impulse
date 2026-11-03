@@ -36,7 +36,7 @@ pub use mesh::{
 };
 pub use post::PostSettings;
 pub use renderer::{
-    CameraData, FogSettings, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame,
+    AlphaMode, CameraData, FogSettings, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame,
 };
 pub use shadow::ShadowRange;
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};

@@ -50,8 +50,19 @@ struct Material {
     emissive: vec4<f32>,
     // metallic, roughness, normal scale, occlusion strength
     params: vec4<f32>,
+    // x: alpha mode (0 opaque, 1 mask, 2 blend); y: mask cutoff
+    alpha: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> material: Material;
+
+const ALPHA_MASK: f32 = 1.0;
+// How much a cut-out's alpha grows per mip level (see `fs_main`).
+const MIP_ALPHA_SCALE: f32 = 0.25;
+const ALPHA_BLEND: f32 = 2.0;
+
+fn is_mask() -> bool {
+    return abs(material.alpha.x - ALPHA_MASK) < 0.5;
+}
 @group(1) @binding(1) var base_texture: texture_2d<f32>;      // sRGB
 @group(1) @binding(2) var mr_texture: texture_2d<f32>;        // G roughness, B metallic
 @group(1) @binding(3) var normal_texture: texture_2d<f32>;    // tangent space
@@ -114,6 +125,28 @@ fn vs_main(v: VertexIn, i: InstanceIn) -> VertexOut {
 @vertex
 fn vs_shadow(v: VertexIn, i: InstanceIn) -> @builtin(position) vec4<f32> {
     return caster.view_proj * model_matrix(i) * vec4<f32>(v.position, 1.0);
+}
+
+// Cut-out casters: the shadow pass alpha-tests them too.
+struct ShadowMaskOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_shadow_mask(v: VertexIn, i: InstanceIn) -> ShadowMaskOut {
+    var out: ShadowMaskOut;
+    out.clip = caster.view_proj * model_matrix(i) * vec4<f32>(v.position, 1.0);
+    out.uv = v.uv;
+    return out;
+}
+
+@fragment
+fn fs_shadow_mask(in: ShadowMaskOut) {
+    let alpha = textureSample(base_texture, material_sampler, in.uv).a * material.base_color.a;
+    if (alpha < material.alpha.y) {
+        discard;
+    }
 }
 
 // Skinning. Joint matrices live in a float texture (WebGL2 has no storage
@@ -295,13 +328,29 @@ struct PrepassOut {
     @location(1) view_depth: vec4<f32>,
 };
 
-@fragment
-fn fs_prepass(in: VertexOut) -> PrepassOut {
+fn prepass_out(in: VertexOut, front: bool) -> PrepassOut {
     var out: PrepassOut;
-    out.normal = vec4<f32>(normalize(in.normal) * 0.5 + 0.5, 1.0);
+    let n = normalize(in.normal) * select(-1.0, 1.0, front);
+    out.normal = vec4<f32>(n * 0.5 + 0.5, 1.0);
     let depth = dot(in.world_pos - globals.eye.xyz, globals.shadow_camera.xyz);
     out.view_depth = vec4<f32>(depth, 0.0, 0.0, 0.0);
     return out;
+}
+
+@fragment
+fn fs_prepass(in: VertexOut, @builtin(front_facing) front: bool) -> PrepassOut {
+    return prepass_out(in, front);
+}
+
+// Cut-outs: only what survives the alpha test occludes.
+@fragment
+fn fs_prepass_mask(in: VertexOut, @builtin(front_facing) front: bool) -> PrepassOut {
+    let alpha = textureSample(base_texture, material_sampler, in.uv).a
+        * material.base_color.a * in.color.a;
+    if (alpha < material.alpha.y) {
+        discard;
+    }
+    return prepass_out(in, front);
 }
 
 // AO seen through light bouncing between bright surfaces (Jimenez et al.
@@ -340,7 +389,7 @@ fn fog_color(dir: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     // Every texture is sampled first, in uniform control flow (implicit
     // derivatives for mips).
     let base_sample = textureSample(base_texture, material_sampler, in.uv);
@@ -351,11 +400,32 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let screen_ao = textureLoad(ao_texture, vec2<i32>(in.clip.xy), 0).r;
 
     let base = base_sample * material.base_color * in.color;
+    // Cut-outs. Under MSAA the alpha becomes coverage (alpha-to-coverage),
+    // sharpened to about a pixel around the cutoff so edges stay crisp but
+    // anti-aliased; without MSAA, a plain alpha test. `fwidth` needs uniform
+    // control flow, so it's taken before any branch.
+    // Mips average thin opaque detail (wires, leaves) below the cutoff, so it
+    // would vanish with distance: scale alpha up with the mip level (Golus).
+    let texels = in.uv * vec2<f32>(textureDimensions(base_texture));
+    let dx = dpdx(texels);
+    let dy = dpdy(texels);
+    let lod = max(0.5 * log2(max(dot(dx, dx), dot(dy, dy))), 0.0);
+    let mask_alpha = base.a * (1.0 + lod * MIP_ALPHA_SCALE);
+    let cutoff = material.alpha.y;
+    let coverage = clamp((mask_alpha - cutoff) / max(fwidth(mask_alpha), 1e-4) + 0.5, 0.0, 1.0);
+    let mask = is_mask();
+    if (mask && globals.post.z < 0.5 && mask_alpha < cutoff) {
+        discard;
+    }
+    // Blended surfaces: what's behind shows through, so the screen-space AO
+    // texel (computed for that) doesn't apply.
+    let blended = material.alpha.x > ALPHA_BLEND - 0.5 || in.color.a < 1.0;
     let metallic = clamp(material.params.x * mr.b * in.pbr.y, 0.0, 1.0);
     let roughness = clamp(material.params.y * mr.g * in.pbr.x, 0.045, 1.0);
 
     // Normal mapping in tangent space (flat default map: the vertex normal).
-    let geometric = normalize(in.normal);
+    // Double-sided materials show back faces: their normals face the viewer.
+    let geometric = normalize(in.normal) * select(-1.0, 1.0, front);
     var n = geometric;
     let t_raw = in.tangent.xyz - geometric * dot(geometric, in.tangent.xyz);
     if (dot(t_raw, t_raw) > 1e-8) {
@@ -401,7 +471,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let blur = roughness * roughness;
     let prefiltered = mix(sky_radiance(reflected), irradiance / PI, blur);
     let ab = env_brdf(n_dot_v, roughness);
-    let ao = min(occlusion, screen_ao);
+    let ao = min(occlusion, select(screen_ao, 1.0, blended));
     let ambient = diffuse_color * irradiance / PI * multi_bounce(ao, diffuse_color)
         + prefiltered * (f0 * ab.x + ab.y) * specular_occlusion(n_dot_v, ao, roughness);
     if (globals.ao.x > 0.5) {
@@ -416,7 +486,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (globals.shadow_params.y > 0.5 && sun.y < globals.shadow_params.x) {
         color *= cascade_tint(sun.y, globals.shadow_params.x);
     }
-    return vec4<f32>(finish(color), base.a);
+    return vec4<f32>(finish(color), select(base.a, coverage, mask && !blended));
 }
 
 // The sky behind everything: a fullscreen triangle at the far plane, drawn

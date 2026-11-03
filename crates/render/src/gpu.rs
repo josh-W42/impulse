@@ -129,6 +129,13 @@ impl Gpu {
             })
             .await
             .map_err(GpuInitError::Device)?;
+        // Browsers report validation errors only to an uncaptured-error
+        // handler; without one a bad pipeline silently blanks every frame.
+        // (Native keeps wgpu's default: panic with the message.)
+        #[cfg(target_arch = "wasm32")]
+        device.on_uncaptured_error(std::sync::Arc::new(|error| {
+            log::error!("GPU error: {error}");
+        }));
 
         let (width, height) =
             clamp_surface_size(width, height, device.limits().max_texture_dimension_2d);
