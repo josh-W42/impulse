@@ -3,6 +3,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
 
+use crate::lights::Light;
 #[cfg(test)]
 use crate::mesh::MeshKind;
 use crate::mesh::{MeshId, SkinnedMeshId};
@@ -16,6 +17,8 @@ pub struct Instance {
     /// Multiply the material's roughness and metallic factors.
     pub roughness: f32,
     pub metallic: f32,
+    /// Light the surface gives off: this times its base colour (0: none).
+    pub emissive: f32,
 }
 
 /// Roughness and metallic for built-in meshes drawn without their own values:
@@ -56,6 +59,8 @@ pub struct DrawList {
     pub skinned: Vec<SkinnedInstance>,
     /// Skinning matrices for this frame's skinned instances.
     pub joints: Vec<Mat4>,
+    /// Point and spot lights besides the sun.
+    pub lights: Vec<Light>,
 }
 
 impl DrawList {
@@ -64,6 +69,7 @@ impl DrawList {
         self.lines.clear();
         self.skinned.clear();
         self.joints.clear();
+        self.lights.clear();
     }
 
     /// Adds one model's skinning matrices; pass the range to
@@ -111,13 +117,32 @@ impl DrawList {
         roughness: f32,
         metallic: f32,
     ) {
+        self.push_instance_emissive(mesh, transform, color, roughness, metallic, 0.0);
+    }
+
+    /// An instance that glows: `emissive` times its colour is light it gives
+    /// off (pair it with a [`Light`] to light its surroundings).
+    pub fn push_instance_emissive(
+        &mut self,
+        mesh: impl Into<MeshId>,
+        transform: Mat4,
+        color: [f32; 4],
+        roughness: f32,
+        metallic: f32,
+        emissive: f32,
+    ) {
         self.instances.push(Instance {
             mesh: mesh.into(),
             transform,
             color,
             roughness,
             metallic,
+            emissive,
         });
+    }
+
+    pub fn push_light(&mut self, light: Light) {
+        self.lights.push(light);
     }
 
     pub fn push_line(&mut self, a: Vec3, b: Vec3, color: [f32; 4]) {
@@ -134,7 +159,7 @@ pub struct InstanceRaw {
     /// to surfaces under non-uniform scale. Columns padded to vec4.
     pub normal: [[f32; 4]; 3],
     pub color: [f32; 4],
-    /// x: roughness, y: metallic.
+    /// x: roughness, y: metallic, z: emissive.
     pub pbr: [f32; 4],
 }
 
@@ -146,7 +171,12 @@ impl InstanceRaw {
             model: instance.transform.to_cols_array_2d(),
             normal: [pad(n.x_axis), pad(n.y_axis), pad(n.z_axis)],
             color: instance.color,
-            pbr: [instance.roughness, instance.metallic, 0.0, 0.0],
+            pbr: [
+                instance.roughness,
+                instance.metallic,
+                instance.emissive,
+                0.0,
+            ],
         }
     }
 }
@@ -198,6 +228,7 @@ pub fn group_skinned(
                     color: i.color,
                     roughness: i.roughness,
                     metallic: i.metallic,
+                    emissive: 0.0,
                 }),
                 joints: [i.joints.offset, 0, 0, 0],
             });
@@ -262,6 +293,7 @@ mod tests {
             transform: Mat4::from_translation(Vec3::X * x),
             roughness: DEFAULT_ROUGHNESS,
             metallic: DEFAULT_METALLIC,
+            emissive: 0.0,
             color: [1.0; 4],
         }
     }
@@ -340,6 +372,7 @@ mod tests {
             mesh: MeshKind::Cube.into(),
             roughness: DEFAULT_ROUGHNESS,
             metallic: DEFAULT_METALLIC,
+            emissive: 0.0,
             transform,
             color: [1.0; 4],
         });

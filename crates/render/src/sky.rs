@@ -36,6 +36,28 @@ impl Default for Sky {
 }
 
 impl Sky {
+    /// Just after sunset: a low orange sun, a dim sky, and lamps that read.
+    pub fn dusk() -> Self {
+        Self {
+            zenith: Vec3::new(0.012, 0.02, 0.055),
+            horizon: Vec3::new(0.09, 0.05, 0.045),
+            ground: Vec3::new(0.012, 0.01, 0.009),
+            sun_direction: Vec3::new(-0.7, 0.08, -0.5).normalize(),
+            sun_color: Vec3::new(0.45, 0.17, 0.06),
+        }
+    }
+
+    /// Moonlight: faint, cool, from high up; local lights do the work.
+    pub fn night() -> Self {
+        Self {
+            zenith: Vec3::new(0.004, 0.006, 0.016),
+            horizon: Vec3::new(0.012, 0.016, 0.028),
+            ground: Vec3::new(0.004, 0.004, 0.005),
+            sun_direction: Vec3::new(0.3, 0.8, -0.4).normalize(),
+            sun_color: Vec3::new(0.05, 0.07, 0.12),
+        }
+    }
+
     /// Sky radiance seen along unit `dir`, without the sun disc. Mirrored in
     /// `scene.wgsl` (`sky_radiance`).
     pub fn radiance(&self, dir: Vec3) -> Vec3 {

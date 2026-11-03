@@ -2,7 +2,9 @@
 
 use glam::{Vec2, Vec3};
 use impulse_physics::{BodyHandle, SolverMode, SolverSettings, StepStats, World};
-use impulse_render::{AoSettings, CameraData, DrawList, FogSettings, PostSettings, backend_name};
+use impulse_render::{
+    AoSettings, CameraData, DrawList, FogSettings, LightStats, PostSettings, backend_name,
+};
 use web_time::Instant;
 use winit::event::{MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -84,6 +86,7 @@ enum Action {
     Redo,
     Add(NewShape),
     AddEmpty,
+    AddLight,
     AddModel(crate::models::ModelId),
     /// Desktop: import a `.glb` from the `models/` folder and add it.
     ImportFile(usize),
@@ -92,6 +95,8 @@ enum Action {
     New,
     /// Change the authored scene's surroundings (undoable).
     SetArena(scene_desc::Arena),
+    /// Change the authored scene's sky (undoable).
+    SetSky(scene_desc::SkyPreset),
     Inspector(InspectorAction),
     Save,
     /// Desktop: a scene from the `scenes/` folder.
@@ -129,6 +134,7 @@ struct Settings {
     show_cascades: bool,
     ao: AoSettings,
     fog: FogSettings,
+    show_light_clusters: bool,
 }
 
 pub struct Sandbox {
@@ -175,6 +181,11 @@ pub struct Sandbox {
     listed: Option<usize>,
     /// Panel requests from this frame's UI, carried out in `draw`.
     actions: Vec<Action>,
+    /// The sky last handed to the renderer (changing it re-integrates the
+    /// ambient light, so only on a change).
+    applied_sky: Option<scene_desc::SkyPreset>,
+    /// What the renderer did with last frame's lights.
+    light_stats: LightStats,
 }
 
 impl Sandbox {
@@ -224,6 +235,7 @@ impl Sandbox {
                 show_cascades: false,
                 ao: cx.renderer.ao_settings(),
                 fog: cx.renderer.fog_settings(),
+                show_light_clusters: false,
             },
             start: Instant::now(),
             frame_ms: 0.0,
@@ -244,6 +256,8 @@ impl Sandbox {
             model_meshes: ModelMeshes::new(),
             listed: None,
             actions: Vec::new(),
+            applied_sky: None,
+            light_stats: LightStats::default(),
         };
         sandbox.upload_models(cx);
         sandbox
@@ -558,6 +572,9 @@ impl Sandbox {
             Action::SetArena(arena) => {
                 self.editor.modify(|d| d.arena = arena);
             }
+            Action::SetSky(sky) => {
+                self.editor.modify(|d| d.sky = sky);
+            }
             Action::Save => {
                 self.editor.commit();
                 let Some(stem) = scene_desc::file_stem(&self.settings.file_name) else {
@@ -586,6 +603,10 @@ impl Sandbox {
             Action::AddEmpty => {
                 let target = self.camera.orbit.target;
                 self.editor.add_empty(Vec3::new(target.x, 1.0, target.z));
+            }
+            Action::AddLight => {
+                let target = self.camera.orbit.target;
+                self.editor.add_light(Vec3::new(target.x, 2.0, target.z));
             }
             Action::Inspector(InspectorAction::Reparent(parent)) => {
                 if let Some(child) = self.editor.selected()
@@ -848,6 +869,8 @@ impl Game for Sandbox {
             can_redo: self.editor.can_redo(),
             message: self.message.clone(),
             arena: self.editor.desc().arena,
+            sky: self.editor.desc().sky,
+            light_stats: self.light_stats,
             models: self
                 .models
                 .list()
@@ -890,6 +913,14 @@ impl Game for Sandbox {
         cx.renderer.set_show_cascades(self.settings.show_cascades);
         cx.renderer.set_ao_settings(self.settings.ao);
         cx.renderer.set_fog_settings(self.settings.fog);
+        cx.renderer
+            .set_show_light_clusters(self.settings.show_light_clusters);
+        self.light_stats = cx.renderer.light_stats();
+        let sky = self.editor.desc().sky;
+        if self.applied_sky != Some(sky) {
+            cx.renderer.set_sky(sky.sky());
+            self.applied_sky = Some(sky);
+        }
         // A gesture ends when nothing is being dragged or typed into.
         if self.edit_drag.is_none()
             && !cx.egui.egui_is_using_pointer()
@@ -923,6 +954,7 @@ impl Game for Sandbox {
                 alpha: self.alpha,
                 show_grid: self.settings.show_grid,
                 show_axes: self.settings.show_axes,
+                show_lights: self.mode == Mode::Edit,
             },
         );
         if let Some(drag) = &self.drag
@@ -963,6 +995,8 @@ struct Stats {
     message: Option<String>,
     /// The authored scene's surroundings.
     arena: scene_desc::Arena,
+    sky: scene_desc::SkyPreset,
+    light_stats: LightStats,
     /// Every model's id, name, and whether it is bundled (Model… picker).
     models: Vec<(crate::models::ModelId, String, bool)>,
 }
@@ -1022,6 +1056,22 @@ fn rendering_panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
                 .text("density"),
         );
     });
+    let lights = stats.light_stats;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut s.show_light_clusters, "show light clusters");
+        ui.label(format!(
+            "lights {} / {} · ≤ {} per cluster",
+            lights.visible, lights.submitted, lights.max_per_cluster
+        ));
+    });
+    if lights.dropped > 0 || lights.overflow > 0 {
+        ui.label(format!(
+            "{} lights over the {} cap, {} cluster entries dropped",
+            lights.dropped,
+            impulse_render::MAX_LIGHTS,
+            lights.overflow
+        ));
+    }
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<Action>) {
@@ -1066,6 +1116,9 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     }
                     if ui.button("Empty").clicked() {
                         actions.push(Action::AddEmpty);
+                    }
+                    if ui.button("Light").clicked() {
+                        actions.push(Action::AddLight);
                     }
                     // Loaded models, then (desktop) files in models/ not yet
                     // imported: picking one imports and adds it.
@@ -1150,6 +1203,13 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                     for (arena, current, label) in choices {
                         if ui.selectable_label(current, label).clicked() && !current {
                             actions.push(Action::SetArena(arena));
+                        }
+                    }
+                    ui.label("sky");
+                    for sky in scene_desc::SkyPreset::ALL {
+                        let current = stats.sky == sky;
+                        if ui.selectable_label(current, sky.label()).clicked() && !current {
+                            actions.push(Action::SetSky(sky));
                         }
                     }
                     if let Arena::Pit { half } = stats.arena {

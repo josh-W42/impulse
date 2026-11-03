@@ -14,6 +14,10 @@ use crate::draw_list::{
     joint_texture_rows, split_blended,
 };
 use crate::gpu::{DEPTH_FORMAT, Gpu, VIEW_DEPTH_FORMAT};
+use crate::lights::{
+    CLUSTERS_X, CLUSTERS_Y, CLUSTERS_Z, GRID_ROWS, GRID_WIDTH, LightRaw, LightStats, MAX_LIGHTS,
+    MAX_SPOT_SHADOWS, SPOT_SHADOW_SIZE, cluster,
+};
 use crate::mesh::{
     MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex,
 };
@@ -113,6 +117,12 @@ struct GlobalsRaw {
     fog: [f32; 4],
     /// x: 1 to show the AO buffer alone.
     ao: [f32; 4],
+    spot_shadows: [[[f32; 4]; 4]; MAX_SPOT_SHADOWS],
+    /// x, y: light cluster tiles per pixel across and down; z: the view
+    /// depth the slices start at; w: slices per unit of ln(depth / z).
+    clusters: [f32; 4],
+    /// x: 1 to show lights per cluster.
+    light_params: [f32; 4],
 }
 
 /// A material's factors as the shader reads them (see `Material` in scene.wgsl).
@@ -667,8 +677,17 @@ pub struct Renderer {
     shadow_pipelines: Vec<wgpu::RenderPipeline>,
     /// One depth view per cascade (a layer of the shadow array) to render into.
     shadow_layers: Vec<wgpu::TextureView>,
-    /// Per cascade: its light matrix, bound at group 3 in the shadow passes.
+    /// Per cascade, then per shadowed spot: its light matrix, bound at
+    /// group 3 in the shadow passes.
     casters: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// One depth view per shadowed spot light.
+    spot_shadow_layers: Vec<wgpu::TextureView>,
+    /// This frame's lights (`LightRaw`, up to `MAX_LIGHTS`).
+    lights: wgpu::Buffer,
+    /// Cluster headers and light indices (see `lights.rs`).
+    light_grid: wgpu::Texture,
+    show_light_clusters: bool,
+    light_stats: LightStats,
     /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
     meshes: Vec<GpuMesh>,
     instances: Vec<GrowableBuffer>,
@@ -729,6 +748,56 @@ impl Renderer {
                 })
             })
             .collect();
+        let spot_shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spot shadow map"),
+            size: wgpu::Extent3d {
+                width: SPOT_SHADOW_SIZE,
+                height: SPOT_SHADOW_SIZE,
+                depth_or_array_layers: MAX_SPOT_SHADOWS as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let spot_shadow_view = spot_shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let spot_shadow_layers = (0..MAX_SPOT_SHADOWS as u32)
+            .map(|layer| {
+                spot_shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("spot shadow"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let lights = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lights"),
+            size: (MAX_LIGHTS * size_of::<LightRaw>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_grid = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("light grid"),
+            size: wgpu::Extent3d {
+                width: GRID_WIDTH,
+                height: GRID_ROWS,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let light_grid_view = light_grid.create_view(&Default::default());
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -777,6 +846,38 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(
+                            (MAX_LIGHTS * size_of::<LightRaw>()) as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
             ],
         });
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -802,6 +903,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&spot_shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: lights.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&light_grid_view),
                 },
             ],
         });
@@ -926,7 +1039,7 @@ impl Renderer {
                 count: None,
             }],
         });
-        let casters = (0..CASCADES)
+        let casters = (0..CASCADES + MAX_SPOT_SHADOWS)
             .map(|_| {
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("caster"),
@@ -1142,6 +1255,11 @@ impl Renderer {
             shadow_pipelines,
             shadow_layers,
             casters,
+            spot_shadow_layers,
+            lights,
+            light_grid,
+            show_light_clusters: false,
+            light_stats: LightStats::default(),
             meshes,
             instances,
             blend_instances: GrowableBuffer::new(device, "blend instances", INITIAL_INSTANCE_BYTES),
@@ -1193,6 +1311,42 @@ impl Renderer {
                 bytemuck::bytes_of(&shadows.view_proj[i].to_cols_array_2d()),
             );
         }
+        let clustered = cluster(&list.lights, camera.view_proj, camera.eye);
+        self.light_stats = clustered.stats;
+        if !clustered.lights.is_empty() {
+            queue.write_buffer(&self.lights, 0, bytemuck::cast_slice(&clustered.lights));
+        }
+        let mut grid = clustered.grid;
+        let rows = grid.len().div_ceil(GRID_WIDTH as usize);
+        grid.resize(rows * GRID_WIDTH as usize, 0);
+        queue.write_texture(
+            self.light_grid.as_image_copy(),
+            bytemuck::cast_slice(&grid),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(GRID_WIDTH * 4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: GRID_WIDTH,
+                height: rows as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        for (matrix, (buffer, _)) in clustered.spot_shadows.iter().zip(&self.casters[CASCADES..]) {
+            queue.write_buffer(buffer, 0, bytemuck::bytes_of(&matrix.to_cols_array_2d()));
+        }
+        let mut spot_shadows = [Mat4::IDENTITY.to_cols_array_2d(); MAX_SPOT_SHADOWS];
+        for (slot, matrix) in spot_shadows.iter_mut().zip(&clustered.spot_shadows) {
+            *slot = matrix.to_cols_array_2d();
+        }
+        let (width, height) = gpu.size();
+        let cluster_slices = if clustered.far > clustered.near {
+            CLUSTERS_Z as f32 / (clustered.far / clustered.near).ln()
+        } else {
+            0.0
+        };
+
         let rgba = |v: Vec3| v.extend(1.0).to_array();
         let globals = GlobalsRaw {
             view_proj: camera.view_proj.to_cols_array_2d(),
@@ -1231,6 +1385,19 @@ impl Renderer {
                 0.0,
             ],
             ao: [if self.ao_settings.show { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            spot_shadows,
+            clusters: [
+                CLUSTERS_X as f32 / width.max(1) as f32,
+                CLUSTERS_Y as f32 / height.max(1) as f32,
+                clustered.near,
+                cluster_slices,
+            ],
+            light_params: [
+                if self.show_light_clusters { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
@@ -1268,12 +1435,17 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
-        for (layer, (_, caster)) in self
+        let cascade_passes = self
             .shadow_layers
             .iter()
             .zip(&self.casters)
-            .take(shadows.count)
-        {
+            .take(shadows.count);
+        let spot_passes = self
+            .spot_shadow_layers
+            .iter()
+            .zip(&self.casters[CASCADES..])
+            .take(clustered.spot_shadows.len());
+        for (layer, (_, caster)) in cascade_passes.chain(spot_passes) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[],
@@ -1394,7 +1566,6 @@ impl Renderer {
         self.post
             .run(queue, &mut encoder, target, &self.post_settings);
 
-        let (width, height) = gpu.size();
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [width, height],
             pixels_per_point: ui.pixels_per_point,
@@ -1490,7 +1661,6 @@ impl Renderer {
         self.show_cascades = show;
     }
 
-    /// The sky lighting the scene.
     pub fn ao_settings(&self) -> AoSettings {
         self.ao_settings
     }
@@ -1545,8 +1715,27 @@ impl Renderer {
         self.post.target().msaa
     }
 
+    /// The sky lighting the scene.
     pub fn sky(&self) -> Sky {
         self.sky
+    }
+
+    /// Changes the sky (background, ambient light and sun); takes effect
+    /// next frame.
+    pub fn set_sky(&mut self, sky: Sky) {
+        self.sky = sky;
+        self.sky_sh = sky.irradiance_sh().map(|c| [c.x, c.y, c.z, 0.0]);
+    }
+
+    /// Tints the scene by how many lights each cluster shades (blue 1, red
+    /// 16 or more), to show where local lights cost the most.
+    pub fn set_show_light_clusters(&mut self, show: bool) {
+        self.show_light_clusters = show;
+    }
+
+    /// What the last frame did with its [`crate::Light`]s.
+    pub fn light_stats(&self) -> LightStats {
+        self.light_stats
     }
 
     /// Uploads a mesh with the default material (e.g. a convex hull's shape).

@@ -7,8 +7,11 @@ use impulse_physics::World;
 use std::collections::HashSet;
 
 use crate::editor::{Editor, ReparentError, is_within};
-use crate::scene::{SceneObject, default_name};
-use crate::scene_desc::{BodyType, JointKindSpec, ModelCollider, ObjectDesc, SceneDesc, ShapeDesc};
+use crate::scene::{self, SceneObject, default_name};
+use crate::scene_desc::{
+    BodyType, JointKindSpec, LightDesc, LightKindDesc, ModelCollider, ObjectDesc, SceneDesc,
+    ShapeDesc,
+};
 
 /// Requests from the inspector that the app carries out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,16 +98,55 @@ pub fn new_model_object(
     Some(object)
 }
 
-/// The object whose body the ray hits first (arena planes don't count).
+/// The object whose body the ray (unit `dir`) hits first, or whose light
+/// marker it passes through for lights with no shape (arena planes don't
+/// count).
 pub fn object_at(
     world: &World,
     objects: &[SceneObject],
     origin: Vec3,
     dir: Vec3,
 ) -> Option<(usize, Vec3)> {
-    let hit = world.raycast(origin, dir, 500.0)?;
-    let index = objects.iter().position(|o| o.handle == hit.body)?;
-    Some((index, hit.point))
+    let body = world.raycast(origin, dir, 500.0).and_then(|hit| {
+        let index = objects.iter().position(|o| o.handle == hit.body)?;
+        Some((index, hit.point.distance(origin)))
+    });
+    let light = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.light.is_some())
+        .filter_map(|(i, o)| {
+            let body = world.body(o.handle)?;
+            if body.collider().is_some() {
+                return None;
+            }
+            ray_sphere(origin, dir, body.position(), scene::LIGHT_MARKER).map(|t| (i, t))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let (index, t) = match (body, light) {
+        (Some(b), Some(l)) => {
+            if l.1 < b.1 {
+                l
+            } else {
+                b
+            }
+        }
+        (b, l) => b.or(l)?,
+    };
+    Some((index, origin + dir * t))
+}
+
+/// Where the ray (unit `dir`) first enters the sphere, as a distance along
+/// it; `None` if it misses or the sphere is behind.
+fn ray_sphere(origin: Vec3, dir: Vec3, center: Vec3, radius: f32) -> Option<f32> {
+    let to = center - origin;
+    let along = to.dot(dir);
+    let gap2 = to.length_squared() - along * along;
+    if gap2 > radius * radius {
+        return None;
+    }
+    let t = along - (radius * radius - gap2).sqrt();
+    (t >= 0.0).then_some(t)
 }
 
 /// Where the ray meets the plane through `point` with `normal`; `None` if it
@@ -184,6 +226,53 @@ impl ShapeKind {
             }),
             Self::Gem | Self::Model => old.clone(),
         }
+    }
+}
+
+/// The inspector's light section: on/off, then point or spot and its
+/// settings.
+fn light_editor(ui: &mut egui::Ui, light: &mut Option<LightDesc>) {
+    ui.separator();
+    let mut on = light.is_some();
+    if ui.checkbox(&mut on, "light").changed() {
+        *light = on.then(LightDesc::default);
+    }
+    let Some(l) = light else { return };
+    ui.horizontal(|ui| {
+        let spot = matches!(l.kind, LightKindDesc::Spot { .. });
+        if ui.selectable_label(!spot, "point").clicked() {
+            l.kind = LightKindDesc::Point;
+        }
+        if ui.selectable_label(spot, "spot (shines down −Y)").clicked() && !spot {
+            l.kind = LightKindDesc::Spot {
+                inner_deg: 20.0,
+                outer_deg: 30.0,
+            };
+        }
+        ui.label("color");
+        let mut color = l.color;
+        if ui.color_edit_button_rgb(&mut color).changed() {
+            l.color = color;
+        }
+    });
+    ui.add(
+        egui::Slider::new(&mut l.intensity, 0.1..=500.0)
+            .logarithmic(true)
+            .text("intensity"),
+    );
+    ui.add(
+        egui::Slider::new(&mut l.range, 0.5..=50.0)
+            .logarithmic(true)
+            .text("range (m)"),
+    );
+    if let LightKindDesc::Spot {
+        inner_deg,
+        outer_deg,
+    } = &mut l.kind
+    {
+        ui.add(egui::Slider::new(outer_deg, 1.0..=80.0).text("cone (°)"));
+        ui.add(egui::Slider::new(inner_deg, 0.0..=*outer_deg).text("full strength within (°)"));
+        ui.checkbox(&mut l.shadows, "shadows");
     }
 }
 
@@ -664,7 +753,12 @@ pub fn inspector(
                     ui.label("opacity");
                     ui.add(egui::Slider::new(&mut o.opacity, 0.05..=1.0));
                 });
+                ui.horizontal(|ui| {
+                    ui.label("glow");
+                    ui.add(egui::Slider::new(&mut o.emissive, 0.0..=20.0));
+                });
             }
+            light_editor(ui, &mut o.light);
             if !matches!(o.shape, Some(ShapeDesc::Model { .. }) | None) {
                 ui.horizontal(|ui| {
                     ui.label("roughness");
@@ -721,6 +815,7 @@ mod tests {
             version: SCENE_VERSION,
             name: "pick".into(),
             arena: Arena::Pit { half: 6.0 },
+            sky: Default::default(),
             objects: vec![
                 new_object(NewShape::Box, Vec3::new(-2.0, 1.0, 0.0), 0),
                 new_object(NewShape::Sphere, Vec3::new(2.0, 1.0, 0.0), 1),
@@ -740,6 +835,41 @@ mod tests {
             Some(0)
         );
         assert_eq!(object_at(&world, &objects, eye, Vec3::NEG_Y), None, "floor");
+    }
+
+    #[test]
+    fn picking_finds_a_bare_light_by_its_marker_unless_a_body_is_in_front() {
+        let light = |z: f32| ObjectDesc {
+            position: [0.0, 1.0, z],
+            body: BodyType::Static,
+            light: Some(LightDesc::default()),
+            ..ObjectDesc::default()
+        };
+        let desc = SceneDesc {
+            version: SCENE_VERSION,
+            name: "pick".into(),
+            arena: Arena::Floor,
+            sky: Default::default(),
+            objects: vec![
+                light(0.0),
+                new_object(NewShape::Box, Vec3::new(3.0, 1.0, 0.0), 1),
+                light(-2.0),
+            ],
+            joints: Vec::new(),
+        };
+        let (world, objects) =
+            build_world(&desc, &crate::models::ModelRegistry::default()).unwrap();
+        let eye = Vec3::new(0.0, 1.0, 10.0);
+        let (index, point) = object_at(&world, &objects, eye, Vec3::NEG_Z).unwrap();
+        assert_eq!(index, 0, "the nearer of two lights in line");
+        assert!((point.z - scene::LIGHT_MARKER).abs() < 1e-4);
+        // Just off the marker: nothing.
+        let past = (Vec3::new(0.5, 1.0, 0.0) - eye).normalize();
+        assert_eq!(object_at(&world, &objects, eye, past), None);
+        // A body between the eye and a light wins.
+        let side = Vec3::new(6.0, 1.0, 0.0);
+        let (index, _) = object_at(&world, &objects, side, Vec3::NEG_X).unwrap();
+        assert_eq!(index, 1);
     }
 
     /// Idle frames must not touch the scene (each touch rebuilds the world).
@@ -845,6 +975,7 @@ mod tests {
             version: SCENE_VERSION,
             name: "t".into(),
             arena: Arena::Empty,
+            sky: Default::default(),
             // Children listed before their parents too: tree order comes from
             // the links, not the list.
             objects: vec![

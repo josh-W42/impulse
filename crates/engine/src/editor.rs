@@ -7,7 +7,7 @@
 use glam::{Quat, Vec3};
 
 use crate::scene_desc::{
-    BodyType, JointSpec, ObjectDesc, SceneDesc, set_parent_keep_world, world_poses,
+    BodyType, JointSpec, LightDesc, ObjectDesc, SceneDesc, set_parent_keep_world, world_poses,
 };
 
 pub const UNDO_DEPTH: usize = 100;
@@ -253,6 +253,19 @@ impl Editor {
         count
     }
 
+    /// Adds a bare point light (an empty carrying one) at `at` and selects it.
+    pub fn add_light(&mut self, at: Vec3) -> usize {
+        let index = self.desc.objects.len();
+        self.add(ObjectDesc {
+            name: format!("light {index}"),
+            shape: None,
+            position: at.to_array(),
+            body: BodyType::Static,
+            light: Some(LightDesc::default()),
+            ..ObjectDesc::default()
+        })
+    }
+
     /// Adds an empty (no shape, static: a folder for the hierarchy, or a joint
     /// anchor) at `at` and selects it.
     pub fn add_empty(&mut self, at: Vec3) -> usize {
@@ -362,6 +375,7 @@ mod tests {
             version: SCENE_VERSION,
             name: "test".into(),
             arena: Arena::Floor,
+            sky: Default::default(),
             objects: (0..5).map(|i| ball(i as f32)).collect(),
             joints: [(0, 1), (2, 3), (1, 3)]
                 .map(|(a, b)| JointSpec::ball_socket(a, b, Vec3::ZERO))
@@ -492,6 +506,7 @@ mod tests {
             version: SCENE_VERSION,
             name: "tree".into(),
             arena: Arena::Empty,
+            sky: Default::default(),
             objects: vec![
                 node("A", None, [0.0, 1.0, 0.0]),
                 node("B", Some(0), [1.0, 0.0, 0.0]),
