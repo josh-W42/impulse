@@ -5,7 +5,7 @@ use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 
 use impulse_physics::{BodyHandle, Collider, ConvexHull, HullId, Material, World};
-use impulse_render::{DrawList, MeshData, MeshId, MeshKind, Vertex};
+use impulse_render::{DrawList, Light, LightKind, MeshData, MeshId, MeshKind, Vertex};
 
 /// Renderer meshes registered for the hull shapes in the world.
 pub type HullMeshes = HashMap<HullId, MeshId>;
@@ -13,7 +13,8 @@ pub type HullMeshes = HashMap<HullId, MeshId>;
 use crate::models::{ModelMeshes, ModelVisual};
 use crate::pose::{Pose, interpolate};
 use crate::scene_desc::{
-    Arena, BodyType, ModelCollider, ObjectDesc, SCENE_VERSION, SceneDesc, ShapeDesc,
+    Arena, BodyType, LightDesc, LightKindDesc, ModelCollider, ObjectDesc, SCENE_VERSION, SceneDesc,
+    ShapeDesc, SkyPreset,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,6 +28,10 @@ pub struct SceneObject {
     /// Surface for built-in shapes (models use their own material).
     pub roughness: f32,
     pub metallic: f32,
+    /// Glow strength (times the colour).
+    pub emissive: f32,
+    /// A light at the body's origin.
+    pub light: Option<LightDesc>,
 }
 
 /// Spheres, boxes, and capsules in turn.
@@ -99,10 +104,12 @@ pub enum Demo {
     Materials,
     /// Tinted glass and chain-link fences (R4's transparency showcase).
     Glass,
+    /// Lamps, stage spots and glowing balls at dusk (R5's lights showcase).
+    Lights,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 8] = [
+    pub const ALL: [Demo; 9] = [
         Demo::Pit,
         Demo::Tower,
         Demo::Pyramid,
@@ -111,6 +118,7 @@ impl Demo {
         Demo::Props,
         Demo::Materials,
         Demo::Glass,
+        Demo::Lights,
     ];
 
     pub fn label(self) -> &'static str {
@@ -123,6 +131,7 @@ impl Demo {
             Demo::Props => "Props",
             Demo::Materials => "Materials",
             Demo::Glass => "Glass",
+            Demo::Lights => "Lights",
         }
     }
 
@@ -153,6 +162,7 @@ pub fn empty_desc() -> SceneDesc {
         version: SCENE_VERSION,
         name: "untitled".to_string(),
         arena: Arena::Empty,
+        sky: SkyPreset::Day,
         objects: vec![ObjectDesc {
             name: "floor".to_string(),
             shape: Some(ShapeDesc::Box {
@@ -217,16 +227,21 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
         Demo::Props => (props_objects(), Vec::new()),
         Demo::Materials => (materials_objects(), Vec::new()),
         Demo::Glass => (glass_objects(), Vec::new()),
+        Demo::Lights => (lights_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
         version: 1,
         name: demo.label().to_string(),
         // The chart is for looking at: no walls in the way.
         arena: match demo {
-            Demo::Materials | Demo::Glass => Arena::Floor,
+            Demo::Materials | Demo::Glass | Demo::Lights => Arena::Floor,
             _ => Arena::Pit {
                 half: pit_half(demo),
             },
+        },
+        sky: match demo {
+            Demo::Lights => SkyPreset::Dusk,
+            _ => SkyPreset::Day,
         },
         objects,
         joints,
@@ -411,6 +426,140 @@ fn glass_objects() -> Vec<ObjectDesc> {
             std::f32::consts::FRAC_PI_2 - angle,
         ));
         objects.push(fence);
+    }
+    objects
+}
+
+/// Lamp colours: warm white, amber, teal, violet.
+const LAMP_COLORS: [[f32; 3]; 4] = [
+    [1.0, 0.82, 0.6],
+    [1.0, 0.55, 0.2],
+    [0.3, 0.9, 0.85],
+    [0.7, 0.45, 1.0],
+];
+
+/// A colonnade of coloured lamps, two shadowed stage spots over a pile of
+/// blocks, glowing balls that roll, and a field of 64 small lanterns: every
+/// light kind, moving lights, and enough of them for clustering to matter.
+fn lights_objects() -> Vec<ObjectDesc> {
+    let mut objects = Vec::new();
+    let lamp = |position: [f32; 3], radius: f32, color: [f32; 3], light: LightDesc| ObjectDesc {
+        shape: Some(ShapeDesc::Sphere { radius }),
+        position,
+        body: BodyType::Static,
+        color,
+        emissive: 4.0,
+        light: Some(LightDesc { color, ..light }),
+        ..ObjectDesc::default()
+    };
+    // Pillars down both sides, a lamp on the inside of each.
+    for side in [-1.0_f32, 1.0] {
+        for i in 0..6 {
+            let z = i as f32 * 2.4 - 6.0;
+            objects.push(ObjectDesc {
+                shape: Some(ShapeDesc::Box {
+                    half_extents: [0.25, 1.5, 0.25],
+                }),
+                position: [side * 3.5, 1.5, z],
+                body: BodyType::Static,
+                color: [0.75, 0.72, 0.68],
+                ..ObjectDesc::default()
+            });
+            objects.push(lamp(
+                [side * 3.1, 2.3, z],
+                0.1,
+                LAMP_COLORS[(i + side as usize) % LAMP_COLORS.len()],
+                LightDesc {
+                    intensity: 5.0,
+                    range: 7.0,
+                    ..LightDesc::default()
+                },
+            ));
+        }
+    }
+    // Two stage spots high up, crossing over the middle.
+    for (side, color) in [(-1.0_f32, [1.0, 0.92, 0.82]), (1.0, [0.6, 0.75, 1.0])] {
+        let mut spot = ObjectDesc {
+            name: "stage spot".to_string(),
+            position: [side * 2.0, 6.5, 0.0],
+            body: BodyType::Static,
+            light: Some(LightDesc {
+                kind: LightKindDesc::Spot {
+                    inner_deg: 16.0,
+                    outer_deg: 24.0,
+                },
+                color,
+                intensity: 70.0,
+                range: 14.0,
+                shadows: true,
+            }),
+            ..ObjectDesc::default()
+        };
+        spot.rotation_deg = [0.0, 0.0, side * 18.0];
+        objects.push(spot);
+    }
+    // A pile of pale blocks for the spots to light and shadow.
+    for i in 0..10 {
+        objects.push(ObjectDesc {
+            shape: Some(ShapeDesc::Box {
+                half_extents: [0.35; 3],
+            }),
+            position: [
+                spread(i, 0.37) * 1.6 - 0.8,
+                0.4 + (i / 3) as f32 * 0.75,
+                spread(i, 0.53) * 1.6 - 0.8,
+            ],
+            body: BodyType::Dynamic { mass: 1.0 },
+            color: [0.8, 0.8, 0.78],
+            ..ObjectDesc::default()
+        });
+    }
+    // Glowing balls dropped down the aisle, rolling as they land.
+    for i in 0..6 {
+        let color = LAMP_COLORS[(i + 1) % LAMP_COLORS.len()];
+        objects.push(ObjectDesc {
+            shape: Some(ShapeDesc::Sphere { radius: 0.2 }),
+            position: [
+                spread(i, 0.71) * 3.0 - 1.5,
+                3.0 + i as f32 * 0.5,
+                i as f32 * 1.8 - 4.5,
+            ],
+            body: BodyType::Dynamic { mass: 0.5 },
+            color,
+            emissive: 4.0,
+            velocity: [
+                spread(i, 0.29) * 4.0 - 2.0,
+                0.0,
+                spread(i, 0.61) * 4.0 - 2.0,
+            ],
+            light: Some(LightDesc {
+                color,
+                intensity: 2.5,
+                range: 4.0,
+                ..LightDesc::default()
+            }),
+            ..ObjectDesc::default()
+        });
+    }
+    // A field of small lanterns behind the colonnade.
+    for i in 0..64 {
+        let (x, z) = ((i % 8) as f32, (i / 8) as f32);
+        let hue = spread(i, 0.618);
+        let color = [
+            0.55 + 0.45 * (hue * std::f32::consts::TAU).cos(),
+            0.55 + 0.45 * ((hue + 0.33) * std::f32::consts::TAU).cos(),
+            0.55 + 0.45 * ((hue + 0.67) * std::f32::consts::TAU).cos(),
+        ];
+        objects.push(lamp(
+            [x * 1.4 - 4.9, 0.3, -9.0 - z * 1.4],
+            0.06,
+            color,
+            LightDesc {
+                intensity: 0.8,
+                range: 2.2,
+                ..LightDesc::default()
+            },
+        ));
     }
     objects
 }
@@ -865,6 +1014,56 @@ fn push_collider_wireframe(
     }
 }
 
+/// How big a light's marker is (m); also how near a click must come to
+/// pick a light with no shape.
+pub const LIGHT_MARKER: f32 = 0.2;
+
+/// A light's marker in its own colour: a six-pointed star, plus its reach
+/// when selected (rings for a point light, the cone for a spot).
+fn push_light_marker(list: &mut DrawList, light: &Light, selected: bool) {
+    let peak = light.color.max_element().max(1e-3);
+    let color = (light.color / peak).extend(1.0).to_array();
+    let p = light.position;
+    for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+        list.push_line(p - axis * LIGHT_MARKER, p + axis * LIGHT_MARKER, color);
+    }
+    if !selected {
+        return;
+    }
+    let ring = |list: &mut DrawList, center: Vec3, radius: f32, u: Vec3, v: Vec3| {
+        let point = |k: usize| {
+            let (s, c) = (k as f32 / 32.0 * std::f32::consts::TAU).sin_cos();
+            center + (u * c + v * s) * radius
+        };
+        for k in 0..32 {
+            list.push_line(point(k), point(k + 1), color);
+        }
+    };
+    match light.kind {
+        LightKind::Point => {
+            ring(list, p, light.range, Vec3::X, Vec3::Z);
+            ring(list, p, light.range, Vec3::X, Vec3::Y);
+            ring(list, p, light.range, Vec3::Y, Vec3::Z);
+        }
+        LightKind::Spot {
+            direction,
+            outer_angle,
+            ..
+        } => {
+            let u = direction.any_orthonormal_vector();
+            let v = direction.cross(u);
+            let (s, c) = outer_angle.sin_cos();
+            let center = p + direction * light.range * c;
+            let radius = light.range * s;
+            ring(list, center, radius, u, v);
+            for k in 0..8 {
+                let (ks, kc) = (k as f32 / 8.0 * std::f32::consts::TAU).sin_cos();
+                list.push_line(p, center + (u * kc + v * ks) * radius, color);
+            }
+        }
+    }
+}
+
 /// The 12 edges of a box of `half` extents placed by `transform`.
 fn push_box_outline(list: &mut DrawList, transform: Mat4, half: Vec3) {
     push_box_outline_colored(list, transform, half, OUTLINE_COLOR);
@@ -897,6 +1096,8 @@ pub struct DrawOptions {
     pub alpha: f32,
     pub show_grid: bool,
     pub show_axes: bool,
+    /// Draw a marker at each light (and its reach, when selected).
+    pub show_lights: bool,
 }
 
 pub fn build_draw_list(
@@ -915,6 +1116,7 @@ pub fn build_draw_list(
         alpha,
         show_grid,
         show_axes,
+        show_lights,
     } = options;
     list.clear();
     push_scenery(list, arena);
@@ -922,16 +1124,23 @@ pub fn build_draw_list(
         let Some(body) = world.body(object.handle) else {
             continue;
         };
-        let Some(collider) = body.collider() else {
-            continue;
-        };
         let current = Pose {
             position: body.position(),
             orientation: body.orientation(),
         };
         let pose = interpolate(object.prev, current, alpha);
-        let body_transform = Mat4::from_rotation_translation(pose.orientation, pose.position);
         let selected = selected == Some(index);
+        if let Some(light) = &object.light {
+            let light = light.at(pose.position, pose.orientation);
+            list.push_light(light);
+            if show_lights {
+                push_light_marker(list, &light, selected);
+            }
+        }
+        let Some(collider) = body.collider() else {
+            continue;
+        };
+        let body_transform = Mat4::from_rotation_translation(pose.orientation, pose.position);
         let color = if selected {
             let [r, g, b, a] = object.color;
             let [r, g, b] = [r, g, b].map(|c| c + (1.0 - c) * SELECTED_TINT);
@@ -943,12 +1152,13 @@ pub fn build_draw_list(
             Some(visual) => {
                 for &mesh in model_meshes.get(&visual.model).into_iter().flatten() {
                     // 1, 1: the model's own material decides.
-                    list.push_instance_pbr(
+                    list.push_instance_emissive(
                         mesh,
                         body_transform * visual.transform,
                         color,
                         1.0,
                         1.0,
+                        object.emissive,
                     );
                 }
                 if show_colliders {
@@ -957,12 +1167,13 @@ pub fn build_draw_list(
             }
             None => {
                 for (mesh, local) in collider_visual(collider, hull_meshes) {
-                    list.push_instance_pbr(
+                    list.push_instance_emissive(
                         mesh,
                         body_transform * local,
                         color,
                         object.roughness,
                         object.metallic,
+                        object.emissive,
                     );
                 }
             }
@@ -1308,6 +1519,65 @@ mod tests {
     }
 
     #[test]
+    fn lights_demo_hands_every_light_to_the_renderer_where_its_object_is() {
+        let desc = demo_desc(Demo::Lights);
+        assert_eq!(desc.sky, SkyPreset::Dusk);
+        let (world, objects) =
+            crate::scene_desc::build_world(&desc, &crate::models::ModelRegistry::default())
+                .unwrap();
+        let mut list = DrawList::default();
+        let options = DrawOptions {
+            arena: desc.arena,
+            selected: None,
+            show_colliders: false,
+            alpha: 1.0,
+            show_grid: false,
+            show_axes: false,
+            show_lights: false,
+        };
+        build_draw_list(
+            &mut list,
+            &world,
+            &objects,
+            &HullMeshes::new(),
+            &ModelMeshes::new(),
+            &[],
+            options,
+        );
+        let carriers: Vec<&SceneObject> = objects.iter().filter(|o| o.light.is_some()).collect();
+        assert_eq!(list.lights.len(), carriers.len());
+        assert!(list.lights.len() >= 80, "{}", list.lights.len());
+        for (light, object) in list.lights.iter().zip(&carriers) {
+            assert_eq!(
+                light.position,
+                world.body(object.handle).unwrap().position()
+            );
+        }
+        let spots = list
+            .lights
+            .iter()
+            .filter(|l| matches!(l.kind, LightKind::Spot { .. }) && l.shadows)
+            .count();
+        assert_eq!(spots, 2);
+        // Bulbs glow; markers only when asked for.
+        assert!(list.instances.iter().any(|i| i.emissive > 0.0));
+        let lines = list.lines.len();
+        build_draw_list(
+            &mut list,
+            &world,
+            &objects,
+            &HullMeshes::new(),
+            &ModelMeshes::new(),
+            &[],
+            DrawOptions {
+                show_lights: true,
+                ..options
+            },
+        );
+        assert_eq!(list.lines.len(), lines + 3 * carriers.len());
+    }
+
+    #[test]
     fn draw_list_has_scenery_and_every_ball_at_the_interpolated_pose() {
         let mut world = World::default();
         let mut objects = demo_scene(&mut world);
@@ -1328,6 +1598,7 @@ mod tests {
                 alpha: 0.0,
                 show_grid: true,
                 show_axes: false,
+                show_lights: false,
             },
         );
         // One instance per body, except capsules: cylinder + two end spheres.

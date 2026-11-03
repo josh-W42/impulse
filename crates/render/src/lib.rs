@@ -16,6 +16,7 @@ pub use backend::backend_name;
 mod ao;
 mod draw_list;
 mod gpu;
+mod lights;
 mod mesh;
 mod post;
 mod renderer;
@@ -30,6 +31,7 @@ pub use draw_list::{
     group_skinned, joint_texels, joint_texture_rows,
 };
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError, SceneTarget};
+pub use lights::{Light, LightKind, LightStats, MAX_LIGHTS, MAX_SPOT_SHADOWS};
 pub use mesh::{
     MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex, cylinder,
     perpendicular_tangent, uv_sphere,

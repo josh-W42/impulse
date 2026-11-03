@@ -30,10 +30,39 @@ struct Globals {
     fog: vec4<f32>,
     // x: 1 to show the AO buffer alone (debug)
     ao: vec4<f32>,
+    // Shadowed spot lights: world → each one's clip space.
+    spot_shadows: array<mat4x4<f32>, 4>,
+    // Light clusters (see `lights.rs`): x, y: tiles per pixel across and
+    // down; z: the view depth the slices start at; w: slices per unit of
+    // ln(depth / z), 0 with no lights
+    clusters: vec4<f32>,
+    // x: 1 to show how many lights each cluster shades (debug)
+    light_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var shadow_map: texture_depth_2d_array; // a layer per cascade
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
+@group(0) @binding(3) var spot_shadow_map: texture_depth_2d_array; // a layer per shadowed spot
+
+// Point and spot lights; must match `LightRaw` in lights.rs.
+struct Light {
+    position_range: vec4<f32>, // xyz: position; w: range
+    color: vec4<f32>,          // rgb: colour × intensity; w: spot shadow layer or -1
+    direction: vec4<f32>,      // xyz: spot direction; w: cone scale
+    spot: vec4<f32>,           // x: cone offset; y: shadow texel size per metre
+};
+struct Lights {
+    items: array<Light, 256>,
+};
+@group(0) @binding(4) var<uniform> lights: Lights;
+// A header per cluster (offset of its light indices | count << 20), then
+// the indices, in rows of LIGHT_GRID_WIDTH.
+@group(0) @binding(5) var light_grid: texture_2d<u32>;
+const LIGHT_GRID_WIDTH: u32 = 1024u;
+const CLUSTERS_X: u32 = 16u;
+const CLUSTERS_Y: u32 = 9u;
+const CLUSTERS_Z: u32 = 24u;
+const CLUSTER_COUNT: u32 = 3456u;
 
 // The shadow passes' only binding: the cascade being drawn.
 struct Caster {
@@ -93,7 +122,8 @@ struct VertexOut {
     @location(2) color: vec4<f32>,
     @location(4) uv: vec2<f32>,
     @location(5) tangent: vec4<f32>,
-    @location(6) pbr: vec2<f32>,
+    // x: roughness, y: metallic, z: emissive
+    @location(6) pbr: vec3<f32>,
 };
 
 fn model_matrix(i: InstanceIn) -> mat4x4<f32> {
@@ -113,7 +143,7 @@ fn shade_vertex(position: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>, tangent: 
     out.uv = uv;
     // Tangents follow the surface, so they take the model matrix itself.
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
-    out.pbr = i.pbr.xy;
+    out.pbr = i.pbr.xyz;
     return out;
 }
 
@@ -264,6 +294,57 @@ fn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(1.0, f32(count));
 }
 
+// Visibility at `p` from shadowed spot `layer`: 3x3 PCF, 1 outside its map.
+fn spot_visibility(layer: i32, p: vec3<f32>) -> f32 {
+    let clip = globals.spot_shadows[layer] * vec4<f32>(p, 1.0);
+    if (clip.w <= 0.0) {
+        return 1.0;
+    }
+    let ndc = clip.xyz / clip.w;
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || ndc.z > 1.0) {
+        return 1.0;
+    }
+    let texel = 1.0 / vec2<f32>(textureDimensions(spot_shadow_map));
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y += 1) {
+        for (var x = -1; x <= 1; x += 1) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            sum += textureSampleCompareLevel(spot_shadow_map, shadow_sampler, uv + offset, layer, ndc.z);
+        }
+    }
+    return sum / 9.0;
+}
+
+fn grid_texel(i: u32) -> u32 {
+    return textureLoad(light_grid, vec2<i32>(i32(i % LIGHT_GRID_WIDTH), i32(i / LIGHT_GRID_WIDTH)), 0).r;
+}
+
+// The header of the light cluster holding a fragment at `pixel` and view
+// `depth` (mirrors `cluster_of` in lights.rs's tests); 0 (no lights) past
+// the slices.
+fn cluster_header(pixel: vec2<f32>, depth: f32) -> u32 {
+    let scale = globals.clusters.w;
+    if (scale <= 0.0) {
+        return 0u;
+    }
+    let s = floor(log(max(depth, globals.clusters.z) / globals.clusters.z) * scale);
+    if (s >= f32(CLUSTERS_Z)) {
+        return 0u;
+    }
+    let tile = min(vec2<u32>(pixel * globals.clusters.xy), vec2<u32>(CLUSTERS_X - 1u, CLUSTERS_Y - 1u));
+    return grid_texel(tile.x + tile.y * CLUSTERS_X + u32(max(s, 0.0)) * CLUSTERS_X * CLUSTERS_Y);
+}
+
+// Debug: lights per cluster, blue (1) through green and yellow to red (16+).
+fn heat(count: u32) -> vec3<f32> {
+    if (count == 0u) {
+        return vec3<f32>(0.0);
+    }
+    let t = clamp(f32(count - 1u) / 15.0, 0.0, 1.0);
+    return clamp(vec3<f32>(t * 2.0 - 0.5, 1.5 - abs(t * 2.0 - 1.0) * 1.5, 1.0 - t * 2.0), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 // Debug tint for a (fractional) cascade index: red, green, blue, yellow,
 // fading to white where the last cascade fades out.
 fn cascade_tint(c: f32, count: f32) -> vec3<f32> {
@@ -310,6 +391,39 @@ fn finish(color: vec3<f32>) -> vec3<f32> {
         return tonemap(color);
     }
     return min(color, vec3<f32>(60000.0));
+}
+
+// What the BRDF needs of a shaded point.
+struct Surface {
+    n: vec3<f32>,
+    v: vec3<f32>,
+    n_dot_v: f32,
+    f0: vec3<f32>,
+    diffuse_color: vec3<f32>,
+    // GGX's α², roughness to the fourth
+    a2: f32,
+};
+
+// Light reflected toward the eye per unit of radiance arriving from unit
+// direction `l`, cosine included: Cook-Torrance (GGX, height-correlated
+// Smith, Schlick) plus Lambert.
+fn brdf(s: Surface, l: vec3<f32>) -> vec3<f32> {
+    let h = normalize(l + s.v);
+    let n_dot_l = max(dot(s.n, l), 0.0);
+    let n_dot_h = max(dot(s.n, h), 0.0);
+    let v_dot_h = max(dot(s.v, h), 0.0);
+    let a2 = s.a2;
+    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    let distribution = a2 / (PI * denom * denom);
+    let visibility = 0.5 / max(
+        n_dot_l * sqrt(s.n_dot_v * s.n_dot_v * (1.0 - a2) + a2)
+            + s.n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2),
+        1e-5,
+    );
+    let fresnel = s.f0 + (1.0 - s.f0) * pow(1.0 - v_dot_h, 5.0);
+    let specular = distribution * visibility * fresnel;
+    let diffuse = (1.0 - fresnel) * s.diffuse_color / PI;
+    return (diffuse + specular) * n_dot_l;
 }
 
 // Karis' analytic fit of the split-sum environment BRDF (scale, bias on F0).
@@ -436,33 +550,50 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
         n = normalize(t * tn.x + b * tn.y + geometric * tn.z);
     }
     let occlusion = 1.0 + material.params.w * (occlusion_sample - 1.0);
-    let emissive = emissive_sample * material.emissive.rgb;
+    let emissive = emissive_sample * material.emissive.rgb + base.rgb * in.pbr.z;
 
     let v = normalize(globals.eye.xyz - in.world_pos);
-    let n_dot_v = max(dot(n, v), 1e-4);
-    let f0 = mix(vec3<f32>(0.04), base.rgb, metallic);
-    let diffuse_color = base.rgb * (1.0 - metallic);
-
-    // Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick).
-    let l = -globals.light_dir.xyz;
-    let h = normalize(l + v);
-    let n_dot_l = max(dot(n, l), 0.0);
-    let n_dot_h = max(dot(n, h), 0.0);
-    let v_dot_h = max(dot(v, h), 0.0);
     let a = roughness * roughness;
-    let a2 = a * a;
-    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-    let distribution = a2 / (PI * denom * denom);
-    let visibility = 0.5 / max(
-        n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2)
-            + n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2),
-        1e-5,
-    );
-    let fresnel = f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
-    let specular = distribution * visibility * fresnel;
-    let diffuse = (1.0 - fresnel) * diffuse_color / PI;
+    let surface = Surface(n, v, max(dot(n, v), 1e-4), mix(vec3<f32>(0.04), base.rgb, metallic),
+        base.rgb * (1.0 - metallic), a * a);
+    let n_dot_v = surface.n_dot_v;
+    let f0 = surface.f0;
+    let diffuse_color = surface.diffuse_color;
+
+    // Sun.
     let sun = sun_visibility(in.world_pos, geometric);
-    let direct = (diffuse + specular) * globals.light_color.rgb * n_dot_l * sun.x;
+    var direct = brdf(surface, -globals.light_dir.xyz) * globals.light_color.rgb * sun.x;
+
+    // Local lights: only those binned into this fragment's cluster.
+    let view_depth = dot(in.world_pos - globals.eye.xyz, globals.shadow_camera.xyz);
+    let header = cluster_header(in.clip.xy, view_depth);
+    let first = CLUSTER_COUNT + (header & 0xFFFFFu);
+    let count = header >> 20u;
+    for (var i = 0u; i < count; i += 1u) {
+        let light = lights.items[grid_texel(first + i)];
+        let to_light = light.position_range.xyz - in.world_pos;
+        let d2 = max(dot(to_light, to_light), 1e-8);
+        let range2 = light.position_range.w * light.position_range.w;
+        if (d2 >= range2) {
+            continue;
+        }
+        let l = to_light * inverseSqrt(d2);
+        // Inverse square, windowed to reach 0 at the range (Karis).
+        let ratio = d2 / range2;
+        let window = clamp(1.0 - ratio * ratio, 0.0, 1.0);
+        var strength = window * window / max(d2, 0.01);
+        // Spot cone (glTF KHR_lights_punctual); 1 for point lights.
+        let cone = clamp(dot(light.direction.xyz, -l) * light.direction.w + light.spot.x, 0.0, 1.0);
+        strength *= cone * cone;
+        if (strength <= 0.0) {
+            continue;
+        }
+        if (light.color.w >= 0.0) {
+            let texel = sqrt(d2) * light.spot.y;
+            strength *= spot_visibility(i32(light.color.w), in.world_pos + geometric * texel * NORMAL_OFFSET);
+        }
+        direct += brdf(surface, l) * light.color.rgb * strength;
+    }
 
     // Sky: SH irradiance for diffuse; the reflected sky, blurred toward the
     // irradiance as roughness grows, for specular.
@@ -485,6 +616,9 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     color *= globals.light_dir.w;
     if (globals.shadow_params.y > 0.5 && sun.y < globals.shadow_params.x) {
         color *= cascade_tint(sun.y, globals.shadow_params.x);
+    }
+    if (globals.light_params.x > 0.5) {
+        color = mix(color, heat(count), select(0.0, 0.7, count > 0u));
     }
     return vec4<f32>(finish(color), select(base.a, coverage, mask && !blended));
 }

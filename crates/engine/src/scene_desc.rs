@@ -8,6 +8,7 @@ use glam::{EulerRot, Quat, Vec3};
 use impulse_physics::{
     BodyDesc, BodyError, BodyHandle, Collider, HullError, JointDesc, JointError, Material, World,
 };
+use impulse_render::{Light, LightKind, Sky};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{ModelRegistry, model_collider};
@@ -25,6 +26,9 @@ pub struct SceneDesc {
     pub version: u32,
     pub name: String,
     pub arena: Arena,
+    /// Daylight, dusk or night (older files: day).
+    #[serde(default)]
+    pub sky: SkyPreset,
     pub objects: Vec<ObjectDesc>,
     #[serde(default)]
     pub joints: Vec<JointSpec>,
@@ -39,6 +43,98 @@ pub enum Arena {
     Floor,
     /// No surroundings: only the scene's own objects (e.g. a floor object).
     Empty,
+}
+
+/// The sky a scene is lit by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkyPreset {
+    #[default]
+    Day,
+    Dusk,
+    Night,
+}
+
+impl SkyPreset {
+    pub const ALL: [SkyPreset; 3] = [SkyPreset::Day, SkyPreset::Dusk, SkyPreset::Night];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SkyPreset::Day => "day",
+            SkyPreset::Dusk => "dusk",
+            SkyPreset::Night => "night",
+        }
+    }
+
+    pub fn sky(self) -> Sky {
+        match self {
+            SkyPreset::Day => Sky::default(),
+            SkyPreset::Dusk => Sky::dusk(),
+            SkyPreset::Night => Sky::night(),
+        }
+    }
+}
+
+/// A light an object carries at its origin.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightDesc {
+    pub kind: LightKindDesc,
+    /// Linear RGB.
+    pub color: [f32; 3],
+    /// Radiance at 1 m (inverse-square falloff beyond).
+    pub intensity: f32,
+    /// Where the light fades out (m).
+    pub range: f32,
+    /// Spots only: cast shadows (the four nearest the camera do).
+    pub shadows: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum LightKindDesc {
+    Point,
+    /// Shines along the object's local −Y: full strength within `inner_deg`
+    /// of it, fading out by `outer_deg` (half angles).
+    Spot {
+        inner_deg: f32,
+        outer_deg: f32,
+    },
+}
+
+impl Default for LightDesc {
+    fn default() -> Self {
+        Self {
+            kind: LightKindDesc::Point,
+            color: [1.0, 0.85, 0.6],
+            intensity: 8.0,
+            range: 8.0,
+            shadows: false,
+        }
+    }
+}
+
+impl LightDesc {
+    /// The renderer's light for an object at `position` turned by
+    /// `orientation`.
+    pub fn at(&self, position: Vec3, orientation: Quat) -> Light {
+        Light {
+            position,
+            color: vec3(self.color),
+            intensity: self.intensity,
+            range: self.range,
+            kind: match self.kind {
+                LightKindDesc::Point => LightKind::Point,
+                LightKindDesc::Spot {
+                    inner_deg,
+                    outer_deg,
+                } => LightKind::Spot {
+                    direction: orientation * Vec3::NEG_Y,
+                    inner_angle: inner_deg.to_radians(),
+                    outer_angle: outer_deg.to_radians(),
+                },
+            },
+            shadows: self.shadows,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +161,10 @@ pub struct ObjectDesc {
     /// Surface for built-in shapes (models use their file's material).
     pub roughness: f32,
     pub metallic: f32,
+    /// Glow: this times `color` is light the surface gives off.
+    pub emissive: f32,
+    /// A light at the object's origin.
+    pub light: Option<LightDesc>,
 }
 
 impl Default for ObjectDesc {
@@ -85,6 +185,8 @@ impl Default for ObjectDesc {
             angular_velocity: [0.0; 3],
             roughness: impulse_render::DEFAULT_ROUGHNESS,
             metallic: impulse_render::DEFAULT_METALLIC,
+            emissive: 0.0,
+            light: None,
         }
     }
 }
@@ -594,6 +696,8 @@ fn populate(
             model,
             roughness: object.roughness,
             metallic: object.metallic,
+            emissive: object.emissive.max(0.0),
+            light: object.light,
         });
     }
     for (index, joint) in desc.joints.iter().enumerate() {
@@ -684,6 +788,7 @@ mod tests {
             version: SCENE_VERSION,
             name: "sampler".into(),
             arena: Arena::Pit { half: 6.0 },
+            sky: Default::default(),
             objects: vec![
                 object(None, [0.0, 5.0, 0.0], BodyType::Static),
                 object(
@@ -915,6 +1020,57 @@ mod tests {
         assert_eq!(from_ron(old).unwrap().objects[0].opacity, 1.0);
     }
 
+    #[test]
+    fn lights_glow_and_sky_round_trip_and_old_files_have_none() {
+        let mut desc = sampler();
+        desc.sky = SkyPreset::Night;
+        desc.objects[1].emissive = 3.0;
+        desc.objects[1].light = Some(LightDesc {
+            kind: LightKindDesc::Spot {
+                inner_deg: 10.0,
+                outer_deg: 25.0,
+            },
+            shadows: true,
+            ..LightDesc::default()
+        });
+        assert_eq!(from_ron(&to_ron(&desc)).unwrap(), desc);
+        let (_, objects) = build_world(&desc, &ModelRegistry::default()).unwrap();
+        assert_eq!(objects[1].emissive, 3.0);
+        assert_eq!(objects[1].light, desc.objects[1].light);
+        // Files from before R5: daylight, nothing glows, no lights.
+        let old = r#"(version: 2, name: "old", arena: Floor,
+            objects: [(shape: Some(Sphere(radius: 0.5)), position: (0.0, 1.0, 0.0))])"#;
+        let old = from_ron(old).unwrap();
+        assert_eq!(old.sky, SkyPreset::Day);
+        assert_eq!(old.objects[0].emissive, 0.0);
+        assert_eq!(old.objects[0].light, None);
+    }
+
+    #[test]
+    fn spots_shine_down_the_objects_local_minus_y() {
+        let light = LightDesc {
+            kind: LightKindDesc::Spot {
+                inner_deg: 10.0,
+                outer_deg: 30.0,
+            },
+            ..LightDesc::default()
+        };
+        let at = |orientation| light.at(Vec3::ONE, orientation);
+        let direction = |l: Light| match l.kind {
+            LightKind::Spot { direction, .. } => direction,
+            LightKind::Point => panic!("a spot"),
+        };
+        assert!(direction(at(Quat::IDENTITY)).abs_diff_eq(Vec3::NEG_Y, 1e-6));
+        // Tipped 90° about X, −Y turns to −Z.
+        let tipped = at(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2));
+        assert!(direction(tipped).abs_diff_eq(Vec3::NEG_Z, 1e-6));
+        let LightKind::Spot { outer_angle, .. } = tipped.kind else {
+            unreachable!()
+        };
+        assert!((outer_angle - 30_f32.to_radians()).abs() < 1e-6);
+        assert_eq!(tipped.position, Vec3::ONE);
+    }
+
     fn object_at(position: [f32; 3], parent: Option<usize>) -> ObjectDesc {
         ObjectDesc {
             name: "o".into(),
@@ -931,6 +1087,7 @@ mod tests {
             version: SCENE_VERSION,
             name: "t".into(),
             arena: Arena::Empty,
+            sky: Default::default(),
             objects,
             joints,
         }
