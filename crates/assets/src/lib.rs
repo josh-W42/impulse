@@ -16,6 +16,7 @@ use gltf::mesh::Mode;
 
 mod clips;
 mod colliders;
+mod hdr;
 mod mips;
 mod skin;
 
@@ -23,6 +24,7 @@ pub use clips::{Channel, Clip, Interpolation, Keyframes, load_clips};
 pub use colliders::{
     bounding_box, bounding_capsule, bounding_sphere, extreme_points, fibonacci_directions,
 };
+pub use hdr::{HdrError, HdrImage, MAX_HDR_WIDTH, load_hdr};
 pub use mips::{ColorSpace, MipLevel, mip_chain};
 pub use skin::{
     Joint, JointTransform, Skeleton, SkinnedMesh, SkinnedModelData, SkinnedVertex,

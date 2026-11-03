@@ -15,6 +15,7 @@ pub use backend::backend_name;
 
 mod ao;
 mod draw_list;
+mod environment;
 mod gpu;
 mod lights;
 mod mesh;
@@ -30,6 +31,7 @@ pub use draw_list::{
     JOINT_TEXTURE_WIDTH, JointRange, SkinnedInstance, SkinnedInstanceRaw, group_by_mesh,
     group_skinned, joint_texels, joint_texture_rows,
 };
+pub use environment::{ENV_FACE, ENV_MIPS, Environment};
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError, SceneTarget};
 pub use lights::{Light, LightKind, LightStats, MAX_LIGHTS, MAX_SPOT_SHADOWS};
 pub use mesh::{

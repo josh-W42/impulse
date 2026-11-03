@@ -21,6 +21,7 @@ mod running;
 mod scene;
 mod scene_desc;
 mod shell;
+mod skies;
 mod timestep;
 pub mod upload;
 

@@ -48,7 +48,10 @@ to exactly what you authored.
 - **UI size** (A−/A+ in the panel) scales the interface, 75–200%; the browser starts at 125%
 - **New** starts a blank scene with a finite floor object (a static box you can
   resize, move, or delete; things fall off its edges). In Edit mode, **arena** adds
-  built-in surroundings to any scene: none, an infinite floor, or a walled pit
+  built-in surroundings to any scene: none, an infinite floor, or a walled pit,
+  and **sky** picks its lighting: procedural day, dusk or night, or one of two
+  bundled CC0 HDR photos (clouds, sunset; `assets/env/`, see its `LICENSES.md`)
+  that light, reflect and shadow the scene
 - **Capture pose** (in Play) writes the simulated poses back as the starting scene
 - Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
   opens them. The demos are available as starting points.

@@ -241,6 +241,8 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
         },
         sky: match demo {
             Demo::Lights => SkyPreset::Dusk,
+            // Metals reflecting a real sky.
+            Demo::Materials => SkyPreset::Clouds,
             _ => SkyPreset::Day,
         },
         objects,

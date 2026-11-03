@@ -13,6 +13,7 @@ use crate::draw_list::{
     DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_skinned, joint_texels,
     joint_texture_rows, split_blended,
 };
+use crate::environment::{ENV_MIPS, Environment};
 use crate::gpu::{DEPTH_FORMAT, Gpu, VIEW_DEPTH_FORMAT};
 use crate::lights::{
     CLUSTERS_X, CLUSTERS_Y, CLUSTERS_Z, GRID_ROWS, GRID_WIDTH, LightRaw, LightStats, MAX_LIGHTS,
@@ -123,6 +124,127 @@ struct GlobalsRaw {
     clusters: [f32; 4],
     /// x: 1 to show lights per cluster.
     light_params: [f32; 4],
+    /// x: 1 when an environment map replaces the procedural sky; y: its
+    /// last mip level (roughness 1).
+    env: [f32; 4],
+}
+
+/// What the scene bind group (group 0 of the lit and sky passes) is built
+/// from, kept to rebuild it when the environment map changes.
+struct SceneBindings {
+    layout: wgpu::BindGroupLayout,
+    globals: wgpu::Buffer,
+    shadow_view: wgpu::TextureView,
+    shadow_sampler: wgpu::Sampler,
+    spot_shadow_view: wgpu::TextureView,
+    lights: wgpu::Buffer,
+    light_grid_view: wgpu::TextureView,
+    env_sampler: wgpu::Sampler,
+    /// A black 1×1 cube, bound while there is no environment map.
+    no_env: wgpu::TextureView,
+}
+
+impl SceneBindings {
+    fn bind_group(&self, device: &wgpu::Device, env: &wgpu::TextureView) -> wgpu::BindGroup {
+        let view = wgpu::BindingResource::TextureView;
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: view(&self.shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: view(&self.spot_shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lights.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: view(&self.light_grid_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: view(env),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                },
+            ],
+        })
+    }
+}
+
+/// The environment map's lighting, while one is set.
+struct EnvLight {
+    sh: [[f32; 4]; 9],
+    sun_direction: Vec3,
+    sun_color: Vec3,
+}
+
+/// A cube texture (`face`² per side, `mips` levels) of `Rgba16Float`; a 6-layer
+/// square texture, which WebGL2 also takes as a cube map.
+fn env_cube(device: &wgpu::Device, face: u32, mips: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("environment"),
+        size: wgpu::Extent3d {
+            width: face,
+            height: face,
+            depth_or_array_layers: 6,
+        },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn cube_view(texture: &wgpu::Texture) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    })
+}
+
+/// Uploads `levels` (each six faces of RGBA half floats) into `texture`.
+fn write_cube(queue: &wgpu::Queue, texture: &wgpu::Texture, face: u32, levels: &[Vec<[u16; 4]>]) {
+    for (mip, texels) in levels.iter().enumerate() {
+        let size = (face >> mip).max(1);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 8),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 6,
+            },
+        );
+    }
 }
 
 /// A material's factors as the shader reads them (see `Material` in scene.wgsl).
@@ -464,6 +586,8 @@ struct ColorSource {
     scene_layout: wgpu::PipelineLayout,
     skinned_lit_layout: wgpu::PipelineLayout,
     globals_layout: wgpu::PipelineLayout,
+    /// The scene bind group alone (the sky reads the environment map).
+    sky_layout: wgpu::PipelineLayout,
 }
 
 /// The pipelines that draw into the scene target.
@@ -576,7 +700,7 @@ impl ColorSource {
             // At the far plane, after the scene: only uncovered pixels pass.
             sky: pipeline(
                 "sky",
-                &self.globals_layout,
+                &self.sky_layout,
                 &self.scene_shader,
                 ("vs_sky", "fs_sky"),
                 &[],
@@ -641,8 +765,12 @@ impl ColorSource {
 
 pub struct Renderer {
     globals: wgpu::Buffer,
-    /// Globals + shadow map + comparison sampler (lit pass).
+    /// Globals, shadow maps, lights and the environment map (lit and sky
+    /// passes).
     scene_bind_group: wgpu::BindGroup,
+    scene_bindings: SceneBindings,
+    /// Replaces the procedural sky while set ([`Renderer::set_environment`]).
+    environment: Option<EnvLight>,
     /// Globals only: the shadow pass can't bind the texture it renders into.
     globals_bind_group: wgpu::BindGroup,
     /// Shaders and layouts the colour pipelines are rebuilt from.
@@ -878,6 +1006,22 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -888,36 +1032,27 @@ impl Renderer {
                 resource: globals.as_entire_binding(),
             }],
         });
-        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene"),
-            layout: &scene_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&spot_shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: lights.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&light_grid_view),
-                },
-            ],
+        let env_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("environment"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
         });
+        let no_env = env_cube(device, 1, 1);
+        write_cube(gpu.queue(), &no_env, 1, &[vec![[0, 0, 0, 0x3c00]; 6]]);
+        let scene_bindings = SceneBindings {
+            layout: scene_bgl.clone(),
+            globals: globals.clone(),
+            shadow_view,
+            shadow_sampler,
+            spot_shadow_view,
+            lights: lights.clone(),
+            light_grid_view,
+            env_sampler,
+            no_env: cube_view(&no_env),
+        };
+        let scene_bind_group = scene_bindings.bind_group(device, &scene_bindings.no_env);
 
         let layout = |label, bgl: &wgpu::BindGroupLayout| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -973,6 +1108,7 @@ impl Renderer {
             ..Default::default()
         });
         let globals_layout = layout("globals", &globals_bgl);
+        let sky_layout = layout("sky", &scene_bindings.layout);
 
         let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
@@ -1197,6 +1333,7 @@ impl Renderer {
             scene_layout,
             skinned_lit_layout,
             globals_layout,
+            sky_layout,
         };
         let post_settings = PostSettings::default();
         let samples = sample_count(gpu, &post_settings);
@@ -1241,6 +1378,8 @@ impl Renderer {
             skinned_prepass_pipeline,
             globals,
             scene_bind_group,
+            scene_bindings,
+            environment: None,
             globals_bind_group,
             material_bgl,
             material_sampler,
@@ -1302,7 +1441,11 @@ impl Renderer {
                 .pipelines(device, scene_target.format, samples);
         }
 
-        let light_dir = -self.sky.sun_direction.normalize();
+        let (sun_direction, sun_color, sh) = match &self.environment {
+            Some(env) => (env.sun_direction, env.sun_color, env.sh),
+            None => (self.sky.sun_direction, self.sky.sun_color, self.sky_sh),
+        };
+        let light_dir = -sun_direction.normalize();
         let shadows = cascades(camera.view_proj, camera.eye, light_dir, self.shadow_range);
         for (i, (buffer, _)) in self.casters.iter().enumerate().take(shadows.count) {
             queue.write_buffer(
@@ -1353,11 +1496,11 @@ impl Renderer {
             inv_view_proj: camera.view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).to_array(),
             light_dir: light_dir.extend(self.post_settings.exposure).to_array(),
-            light_color: rgba(self.sky.sun_color),
+            light_color: rgba(sun_color),
             sky_zenith: rgba(self.sky.zenith),
             sky_horizon: rgba(self.sky.horizon),
             sky_ground: rgba(self.sky.ground),
-            sh: self.sky_sh,
+            sh,
             post: [
                 if scene_target.hdr { 0.0 } else { 1.0 },
                 0.0,
@@ -1395,6 +1538,12 @@ impl Renderer {
             light_params: [
                 if self.show_light_clusters { 1.0 } else { 0.0 },
                 0.0,
+                0.0,
+                0.0,
+            ],
+            env: [
+                if self.environment.is_some() { 1.0 } else { 0.0 },
+                (ENV_MIPS - 1) as f32,
                 0.0,
                 0.0,
             ],
@@ -1530,7 +1679,7 @@ impl Renderer {
             }
 
             pass.set_pipeline(&self.color.sky);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_bind_group(0, &self.scene_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
             if !blended.is_empty() {
@@ -1725,6 +1874,29 @@ impl Renderer {
     pub fn set_sky(&mut self, sky: Sky) {
         self.sky = sky;
         self.sky_sh = sky.irradiance_sh().map(|c| [c.x, c.y, c.z, 0.0]);
+    }
+
+    /// Lights the scene from a baked HDR sky (background, reflections,
+    /// ambient light and the sun it found) instead of the procedural
+    /// [`Sky`]; `None` goes back to the procedural sky. Uploads the maps, so
+    /// call it when the sky changes, not every frame.
+    pub fn set_environment(&mut self, gpu: &Gpu, environment: Option<&Environment>) {
+        let device = gpu.device();
+        let Some(env) = environment else {
+            self.environment = None;
+            self.scene_bind_group = self
+                .scene_bindings
+                .bind_group(device, &self.scene_bindings.no_env);
+            return;
+        };
+        let texture = env_cube(device, env.face, env.levels.len() as u32);
+        write_cube(gpu.queue(), &texture, env.face, &env.levels);
+        self.scene_bind_group = self.scene_bindings.bind_group(device, &cube_view(&texture));
+        self.environment = Some(EnvLight {
+            sh: env.irradiance_sh.map(|c| [c.x, c.y, c.z, 0.0]),
+            sun_direction: env.sun_direction,
+            sun_color: env.sun_color,
+        });
     }
 
     /// Tints the scene by how many lights each cluster shades (blue 1, red

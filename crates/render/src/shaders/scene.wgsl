@@ -38,6 +38,9 @@ struct Globals {
     clusters: vec4<f32>,
     // x: 1 to show how many lights each cluster shades (debug)
     light_params: vec4<f32>,
+    // x: 1 when the environment map replaces the procedural sky; y: its
+    // last mip (roughness 1)
+    env: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var shadow_map: texture_depth_2d_array; // a layer per cascade
@@ -63,6 +66,16 @@ const CLUSTERS_X: u32 = 16u;
 const CLUSTERS_Y: u32 = 9u;
 const CLUSTERS_Z: u32 = 24u;
 const CLUSTER_COUNT: u32 = 3456u;
+
+// A baked HDR sky (see `environment.rs`): mip i is prefiltered for GGX
+// roughness i / globals.env.y; the sun is taken out (it's the directional
+// light).
+@group(0) @binding(6) var env_map: texture_cube<f32>;
+@group(0) @binding(7) var env_sampler: sampler;
+
+fn has_env() -> bool {
+    return globals.env.x > 0.5;
+}
 
 // The shadow passes' only binding: the cascade being drawn.
 struct Caster {
@@ -496,10 +509,16 @@ fn fog_amount(p: vec3<f32>) -> f32 {
     return 1.0 - exp(-max(optical, 0.0));
 }
 
-// What fog looks like along `dir`: the horizon sky, brighter toward the sun.
+// What fog looks like along `dir`: the sky just above the horizon (blurred,
+// from the environment map when there is one), brighter toward the sun.
 fn fog_color(dir: vec3<f32>) -> vec3<f32> {
     let toward_sun = max(dot(dir, -globals.light_dir.xyz), 0.0);
-    return globals.sky_horizon.rgb + globals.light_color.rgb * pow(toward_sun, 8.0) * 0.15;
+    var horizon = globals.sky_horizon.rgb;
+    if (has_env()) {
+        let level = normalize(vec3<f32>(dir.x, max(dir.y, 0.05), dir.z));
+        horizon = textureSampleLevel(env_map, env_sampler, level, globals.env.y - 1.0).rgb;
+    }
+    return horizon + globals.light_color.rgb * pow(toward_sun, 8.0) * 0.15;
 }
 
 @fragment
@@ -511,7 +530,10 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     let normal_sample = textureSample(normal_texture, material_sampler, in.uv).xyz;
     let occlusion_sample = textureSample(occlusion_texture, material_sampler, in.uv).r;
     let emissive_sample = textureSample(emissive_texture, material_sampler, in.uv).rgb;
-    let screen_ao = textureLoad(ao_texture, vec2<i32>(in.clip.xy), 0).r;
+    // Clamped: with AO off this is a 1×1 white texture, and an
+    // out-of-bounds load returns anything.
+    let ao_last = vec2<i32>(textureDimensions(ao_texture)) - 1;
+    let screen_ao = textureLoad(ao_texture, min(vec2<i32>(in.clip.xy), ao_last), 0).r;
 
     let base = base_sample * material.base_color * in.color;
     // Cut-outs. Under MSAA the alpha becomes coverage (alpha-to-coverage),
@@ -600,7 +622,10 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     let irradiance = sky_irradiance(n);
     let reflected = reflect(-v, n);
     let blur = roughness * roughness;
-    let prefiltered = mix(sky_radiance(reflected), irradiance / PI, blur);
+    var prefiltered = mix(sky_radiance(reflected), irradiance / PI, blur);
+    if (has_env()) {
+        prefiltered = textureSampleLevel(env_map, env_sampler, reflected, roughness * globals.env.y).rgb;
+    }
     let ab = env_brdf(n_dot_v, roughness);
     let ao = min(occlusion, select(screen_ao, 1.0, blended));
     let ambient = diffuse_color * irradiance / PI * multi_bounce(ao, diffuse_color)
@@ -645,6 +670,9 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let far = globals.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - globals.eye.xyz);
     var radiance = sky_radiance(dir);
+    if (has_env()) {
+        radiance = textureSampleLevel(env_map, env_sampler, dir, 0.0).rgb;
+    }
     // The sun's disc (about 1.5° across) with a soft glow around it.
     let to_sun = -globals.light_dir.xyz;
     let c = dot(dir, to_sun);
