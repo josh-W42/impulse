@@ -5,16 +5,16 @@ use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 
 use impulse_physics::{BodyHandle, Collider, ConvexHull, HullId, Material, World};
-use impulse_render::{DrawList, Light, LightKind, MeshData, MeshId, MeshKind, Vertex};
+use impulse_render::{DrawList, Instance, Light, LightKind, MeshData, MeshId, MeshKind, Vertex};
 
 /// Renderer meshes registered for the hull shapes in the world.
 pub type HullMeshes = HashMap<HullId, MeshId>;
 
-use crate::models::{ModelMeshes, ModelVisual};
+use crate::models::{ModelMeshes, ModelRegistry, ModelVisual, fitting_scale};
 use crate::pose::{Pose, interpolate};
 use crate::scene_desc::{
-    Arena, BodyType, LightDesc, LightKindDesc, ModelCollider, ObjectDesc, SCENE_VERSION, SceneDesc,
-    ShapeDesc, SkyPreset,
+    Arena, BodyType, LightDesc, LightKindDesc, ModelCollider, ObjectDesc, SCENE_VERSION, Scatter,
+    SceneDesc, ShapeDesc, SkyPreset,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,10 +106,12 @@ pub enum Demo {
     Glass,
     /// Lamps, stage spots and glowing balls at dusk (R5's lights showcase).
     Lights,
+    /// 10,000 scattered props on a wide floor (R7's culling and LOD showcase).
+    Field,
 }
 
 impl Demo {
-    pub const ALL: [Demo; 9] = [
+    pub const ALL: [Demo; 10] = [
         Demo::Pit,
         Demo::Tower,
         Demo::Pyramid,
@@ -119,6 +121,7 @@ impl Demo {
         Demo::Materials,
         Demo::Glass,
         Demo::Lights,
+        Demo::Field,
     ];
 
     pub fn label(self) -> &'static str {
@@ -132,6 +135,7 @@ impl Demo {
             Demo::Materials => "Materials",
             Demo::Glass => "Glass",
             Demo::Lights => "Lights",
+            Demo::Field => "Field",
         }
     }
 
@@ -163,6 +167,7 @@ pub fn empty_desc() -> SceneDesc {
         name: "untitled".to_string(),
         arena: Arena::Empty,
         sky: SkyPreset::Day,
+        scatter: None,
         objects: vec![ObjectDesc {
             name: "floor".to_string(),
             shape: Some(ShapeDesc::Box {
@@ -228,6 +233,7 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
         Demo::Materials => (materials_objects(), Vec::new()),
         Demo::Glass => (glass_objects(), Vec::new()),
         Demo::Lights => (lights_objects(), Vec::new()),
+        Demo::Field => (field_objects(), Vec::new()),
     };
     let mut desc = SceneDesc {
         version: 1,
@@ -235,6 +241,8 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
         // The chart is for looking at: no walls in the way.
         arena: match demo {
             Demo::Materials | Demo::Glass | Demo::Lights => Arena::Floor,
+            // Its own floor object, as wide as the props.
+            Demo::Field => Arena::Empty,
             _ => Arena::Pit {
                 half: pit_half(demo),
             },
@@ -242,9 +250,10 @@ pub fn demo_world_desc(demo: Demo) -> SceneDesc {
         sky: match demo {
             Demo::Lights => SkyPreset::Dusk,
             // Metals reflecting a real sky.
-            Demo::Materials => SkyPreset::Clouds,
+            Demo::Materials | Demo::Field => SkyPreset::Clouds,
             _ => SkyPreset::Day,
         },
+        scatter: (demo == Demo::Field).then_some(FIELD_SCATTER),
         objects,
         joints,
     };
@@ -726,6 +735,132 @@ fn stack_cube(position: Vec3, layer: usize) -> ObjectDesc {
         Vec3::ZERO,
         Vec3::ZERO,
     )
+}
+
+/// The Field demo's props.
+pub const FIELD_SCATTER: Scatter = Scatter {
+    count: 10_000,
+    half_extent: 100.0,
+    seed: 1,
+};
+
+/// A floor reaching past the scattered props, and a short tower to knock.
+fn field_objects() -> Vec<ObjectDesc> {
+    let [r, g, b, _] = FLOOR_COLOR;
+    let half = FIELD_SCATTER.half_extent + 10.0;
+    let mut objects = vec![ObjectDesc {
+        name: "floor".to_string(),
+        shape: Some(ShapeDesc::Box {
+            half_extents: [half, 0.5, half],
+        }),
+        position: [0.0, -0.5, 0.0],
+        body: BodyType::Static,
+        restitution: STATIC_MATERIAL.restitution,
+        friction: STATIC_MATERIAL.friction,
+        color: [r, g, b],
+        ..ObjectDesc::default()
+    }];
+    objects.extend((0..5).map(|i| stack_cube(Vec3::new(0.0, 0.5 + i as f32, 0.0), i)));
+    objects
+}
+
+/// Bundled models a scatter places, and their sizes (m).
+const SCATTER_MODELS: [(&str, f32); 6] = [
+    ("rock-a", 1.2),
+    ("rock-b", 1.6),
+    ("tree-log", 1.8),
+    ("barrel", 0.9),
+    ("box", 0.7),
+    ("bucket", 0.45),
+];
+/// Earthy colours for the plain spheres and boxes.
+const SCATTER_COLORS: [[f32; 4]; 5] = [
+    [0.55, 0.50, 0.45, 1.0],
+    [0.40, 0.45, 0.35, 1.0],
+    [0.62, 0.55, 0.40, 1.0],
+    [0.35, 0.38, 0.42, 1.0],
+    [0.70, 0.45, 0.30, 1.0],
+];
+
+/// The instances a [`Scatter`] draws: `count` props (bundled models, plain
+/// spheres and boxes) at seeded random spots, sizes and headings on y = 0,
+/// clear of the middle. Deterministic. Models that aren't uploaded are left
+/// out (plain shapes take their place); a model prop is one instance per
+/// mesh.
+pub fn scatter_instances(
+    scatter: &Scatter,
+    models: &ModelRegistry,
+    meshes: &ModelMeshes,
+) -> Vec<Instance> {
+    // xorshift64*, in [0, 1).
+    let mut state = (scatter.seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let kinds: Vec<(&Vec<MeshId>, f32, f32)> = SCATTER_MODELS
+        .iter()
+        .filter_map(|&(name, size)| {
+            let id = models.id(name)?;
+            let asset = models.get(id)?;
+            let scale = fitting_scale(asset, size);
+            Some((meshes.get(&id)?, scale, -asset.data.min.y))
+        })
+        .collect();
+    let half = scatter.half_extent;
+    let clear = (half * 0.5).min(6.0);
+    let mut instances = Vec::with_capacity(scatter.count as usize * 5 / 4);
+    let mut placed = 0;
+    while placed < scatter.count {
+        let (x, z) = ((next() * 2.0 - 1.0) * half, (next() * 2.0 - 1.0) * half);
+        if x * x + z * z < clear * clear {
+            continue;
+        }
+        placed += 1;
+        let ground = Vec3::new(x, 0.0, z);
+        let heading = glam::Quat::from_rotation_y(next() * std::f32::consts::TAU);
+        let pick = next();
+        let jitter = 0.7 + 0.6 * next();
+        let color = SCATTER_COLORS[(next() * SCATTER_COLORS.len() as f32) as usize];
+        let roughness = 0.3 + 0.6 * next();
+        let plain = |mesh: MeshKind, size: f32| Instance {
+            mesh: mesh.into(),
+            transform: Mat4::from_scale_rotation_translation(
+                Vec3::splat(size),
+                heading,
+                ground + Vec3::Y * size * 0.5,
+            ),
+            color,
+            roughness,
+            metallic: 0.0,
+            emissive: 0.0,
+        };
+        if pick < 0.2 || kinds.is_empty() {
+            instances.push(plain(MeshKind::Sphere, 0.6 * jitter + 0.2));
+        } else if pick < 0.3 {
+            instances.push(plain(MeshKind::Cube, 0.5 * jitter + 0.2));
+        } else {
+            let (ids, scale, lift) = kinds[(next() * kinds.len() as f32) as usize % kinds.len()];
+            let scale = scale * jitter;
+            let transform = Mat4::from_scale_rotation_translation(
+                Vec3::splat(scale),
+                heading,
+                ground + Vec3::Y * lift * scale,
+            );
+            // 1, 1: the model's own material decides.
+            instances.extend(ids.iter().map(|&mesh| Instance {
+                mesh,
+                transform,
+                color: [1.0; 4],
+                roughness: 1.0,
+                metallic: 1.0,
+                emissive: 0.0,
+            }));
+        }
+    }
+    instances
 }
 
 fn pit_objects() -> Vec<ObjectDesc> {
@@ -1577,6 +1712,46 @@ mod tests {
             },
         );
         assert_eq!(list.lines.len(), lines + 3 * carriers.len());
+    }
+
+    #[test]
+    fn scatters_are_deterministic_sized_and_clear_of_the_middle() {
+        let models = ModelRegistry::bundled();
+        // Mesh ids stand in for uploaded meshes.
+        let meshes: ModelMeshes = models
+            .list()
+            .map(|(id, _, _)| (id, vec![MeshId(100 + id.0)]))
+            .collect();
+        let scatter = Scatter {
+            count: 2_000,
+            half_extent: 40.0,
+            seed: 7,
+        };
+        let a = scatter_instances(&scatter, &models, &meshes);
+        assert_eq!(a, scatter_instances(&scatter, &models, &meshes));
+        assert_ne!(
+            a,
+            scatter_instances(&Scatter { seed: 8, ..scatter }, &models, &meshes)
+        );
+        // Every bundled model here has one mesh: one instance per prop.
+        assert_eq!(a.len(), 2_000);
+        let modelled = a.iter().filter(|i| i.mesh.0 >= 100).count();
+        assert!((1_200..1_600).contains(&modelled), "{modelled} model props");
+        for i in &a {
+            let p = i.transform.w_axis.truncate();
+            assert!(p.x.abs() <= 40.0 && p.z.abs() <= 40.0, "{p}");
+            assert!(p.x * p.x + p.z * p.z >= 36.0, "{p} in the middle");
+            assert!((0.0..2.0).contains(&p.y), "{p} off the ground");
+        }
+        // Without models, plain shapes only; and a tiny field still fills.
+        let plain = scatter_instances(&scatter, &ModelRegistry::default(), &ModelMeshes::new());
+        assert!(plain.iter().all(|i| i.mesh.0 < MeshKind::ALL.len() as u32));
+        let tiny = Scatter {
+            count: 50,
+            half_extent: 1.0,
+            seed: 0,
+        };
+        assert_eq!(scatter_instances(&tiny, &models, &meshes).len(), 50);
     }
 
     #[test]

@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use impulse_assets::{
-    ColorSpace, MaterialData, ModelData, SkinnedMesh, SkinnedModelData, TextureData,
+    ColorSpace, MaterialData, ModelData, ModelVertex, SkinnedMesh, SkinnedModelData, TextureData,
 };
 use impulse_render::{
-    AlphaMode, Gpu, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, SkinnedMeshData,
-    SkinnedMeshId, SkinnedVertex, TextureId, Vertex,
+    AlphaMode, Gpu, MaterialDesc, MaterialId, MeshData, MeshId, MeshLod, Renderer, SkinnedMeshData,
+    SkinnedMeshId, SkinnedVertex, TextureId, Vertex, lod_error,
 };
 
 /// Textures already uploaded, by content: identical pixels in the same
@@ -21,7 +21,8 @@ pub struct TextureCache {
 }
 
 /// Uploads a model's textures, materials and meshes (one mesh per glTF
-/// primitive, in order).
+/// primitive, in order), with any authored levels of detail; their errors
+/// are measured here.
 pub fn upload_model(
     renderer: &mut Renderer,
     gpu: &Gpu,
@@ -34,22 +35,36 @@ pub fn upload_model(
         .iter()
         .map(|mesh| {
             let material = material_for(renderer, gpu, &materials, mesh.material, &mut default);
-            let mesh_data = MeshData {
-                vertices: mesh
-                    .vertices
-                    .iter()
-                    .map(|v| Vertex {
-                        position: v.position,
-                        normal: v.normal,
-                        uv: v.uv,
-                        tangent: v.tangent,
-                    })
-                    .collect(),
-                indices: mesh.indices.clone(),
-            };
-            renderer.add_mesh_with_material(gpu, &mesh_data, material)
+            let full = mesh_data(&mesh.vertices, &mesh.indices);
+            let lods: Vec<MeshLod> = mesh
+                .lods
+                .iter()
+                .map(|lod| {
+                    let data = mesh_data(&lod.vertices, &lod.indices);
+                    MeshLod {
+                        error: lod_error(&full, &data),
+                        data,
+                    }
+                })
+                .collect();
+            renderer.add_mesh_with_lods(gpu, &full, &lods, material)
         })
         .collect()
+}
+
+fn mesh_data(vertices: &[ModelVertex], indices: &[u32]) -> MeshData {
+    MeshData {
+        vertices: vertices
+            .iter()
+            .map(|v| Vertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                tangent: v.tangent,
+            })
+            .collect(),
+        indices: indices.to_vec(),
+    }
 }
 
 /// Uploads a skinned model's textures, materials and meshes (in order). Draw

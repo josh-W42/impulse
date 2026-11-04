@@ -100,6 +100,7 @@ mod tests {
                 vertices,
                 indices: vec![0, 1, 2],
                 material: None,
+                lods: Vec::new(),
             }],
             materials: Vec::new(),
             textures: Vec::new(),

@@ -3,7 +3,7 @@
 A 3D game engine in Rust + wgpu whose deep spike is rigid-body physics.
 Runs natively and in the browser (WebGPU, falling back to WebGL2).
 
-Live demo: https://impulse-engine.web.app (scenes: `?scene=pit|tower|pyramid|rain|joints|props|materials|glass|lights`; desktop: `IMPULSE_SCENE=glass`)
+Live demo: https://impulse-engine.web.app (scenes: `?scene=pit|tower|pyramid|rain|joints|props|materials|glass|lights|field`; desktop: `IMPULSE_SCENE=glass`)
 
 Design: `docs/plans/2026-09-24-impulse-engine-design.md` (one plan per milestone
 in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
@@ -29,6 +29,10 @@ in `docs/plans/`, each with its results). Performance: `BENCHMARKS.md`.
 - Rendering: physically based (glTF metallic-roughness with normal, occlusion,
   and emissive maps), a procedural sky as image-based light and background,
   Khronos PBR Neutral tonemapping, PCF shadows; WebGPU with a WebGL2 fallback
+- Rendering at scale: per-pass frustum culling (camera, each shadow cascade and spot) and
+  levels of detail switched under a pixel of error (built-in round meshes, and
+  glTF nodes named `<node>_LOD1`, `_LOD2`, ...); the Field demo draws 10,000
+  props at 60 fps
 - Engine: fixed timestep with interpolation, instanced renderer, egui panel,
   mouse grab/throw
 
@@ -51,7 +55,8 @@ to exactly what you authored.
   built-in surroundings to any scene: none, an infinite floor, or a walled pit,
   and **sky** picks its lighting: procedural day, dusk or night, or one of two
   bundled CC0 HDR photos (clouds, sunset; `assets/env/`, see its `LICENSES.md`)
-  that light, reflect and shadow the scene
+  that light, reflect and shadow the scene; **scatter** spreads draw-only props
+  (no bodies, not in the objects list) over the ground
 - **Capture pose** (in Play) writes the simulated poses back as the starting scene
 - Scenes are RON files: desktop saves to `scenes/`, the browser downloads and
   opens them. The demos are available as starting points.

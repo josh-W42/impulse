@@ -9,9 +9,13 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::ao::{Ao, AoSettings, NORMAL_FORMAT};
+use crate::cull::{
+    Bounds, Buckets, CAMERA_PASS, DrawStats, Frustum, LodView, MAX_PASSES, MeshCull, bucket,
+    cascade_pass, spot_pass,
+};
 use crate::draw_list::{
     DrawList, InstanceRaw, JOINT_TEXTURE_WIDTH, SkinnedInstanceRaw, group_skinned, joint_texels,
-    joint_texture_rows, split_blended,
+    joint_texture_rows,
 };
 use crate::environment::{ENV_MIPS, Environment};
 use crate::gpu::{DEPTH_FORMAT, Gpu, VIEW_DEPTH_FORMAT};
@@ -20,7 +24,8 @@ use crate::lights::{
     MAX_SPOT_SHADOWS, SPOT_SHADOW_SIZE, cluster,
 };
 use crate::mesh::{
-    MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex,
+    MAX_LODS, MeshData, MeshId, MeshKind, MeshLod, SkinnedMeshData, SkinnedMeshId, SkinnedVertex,
+    Vertex,
 };
 use crate::post::{MSAA_SAMPLES, Post, PostSettings};
 use crate::shaders::{LINES_WGSL, SCENE_WGSL};
@@ -81,6 +86,26 @@ impl Default for FogSettings {
             enabled: true,
             density: 0.005,
             height_falloff: 0.1,
+        }
+    }
+}
+
+/// Frustum culling and level-of-detail choice for static instances; both on
+/// by default (turn them off to compare).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CullSettings {
+    /// Each pass draws only what its view (camera, cascade, spot) can see.
+    pub culling: bool,
+    /// Meshes with coarser levels draw them where the difference is under
+    /// [`crate::LOD_PIXELS`].
+    pub lod: bool,
+}
+
+impl Default for CullSettings {
+    fn default() -> Self {
+        Self {
+            culling: true,
+            lod: true,
         }
     }
 }
@@ -401,16 +426,53 @@ struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Per level of detail, full first: its (first index, index count).
+    lods: Vec<(u32, u32)>,
+    cull: MeshCull,
     /// Index into `Renderer::materials`.
     material: usize,
 }
 
 impl GpuMesh {
     fn new(device: &wgpu::Device, data: &MeshData) -> Self {
-        Self::from_parts(device, bytemuck::cast_slice(&data.vertices), &data.indices)
+        Self::with_lods(device, data, &[])
+    }
+
+    /// `data` and its coarser levels in one vertex and index buffer, the
+    /// levels' indices offset to their vertices (WebGL2 has no base vertex).
+    /// Levels past [`MAX_LODS`], empty ones, and ones whose error doesn't
+    /// rise are skipped.
+    fn with_lods(device: &wgpu::Device, data: &MeshData, lods: &[MeshLod]) -> Self {
+        let mut vertices = data.vertices.clone();
+        let mut indices = data.indices.clone();
+        let mut ranges = vec![(0, indices.len() as u32)];
+        let mut errors = vec![0.0];
+        for lod in lods {
+            let last = errors[errors.len() - 1];
+            if ranges.len() == MAX_LODS
+                || lod.data.indices.is_empty()
+                || !(lod.error.is_finite() && lod.error >= last)
+            {
+                continue;
+            }
+            let base = vertices.len() as u32;
+            ranges.push((indices.len() as u32, lod.data.indices.len() as u32));
+            vertices.extend_from_slice(&lod.data.vertices);
+            indices.extend(lod.data.indices.iter().map(|i| i + base));
+            errors.push(lod.error);
+        }
+        let mut mesh = Self::from_parts(device, bytemuck::cast_slice(&vertices), &indices);
+        mesh.cull = MeshCull {
+            bounds: Bounds::of_mesh(data),
+            errors,
+            triangles: ranges.iter().map(|r| r.1 / 3).collect(),
+        };
+        mesh.lods = ranges;
+        mesh
     }
 
     fn from_parts(device: &wgpu::Device, vertices: &[u8], indices: &[u32]) -> Self {
+        let count = indices.len() as u32;
         Self {
             vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh vertices"),
@@ -422,7 +484,16 @@ impl GpuMesh {
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             }),
-            index_count: indices.len() as u32,
+            index_count: count,
+            lods: vec![(0, count)],
+            cull: MeshCull {
+                bounds: Bounds {
+                    center: Vec3::ZERO,
+                    radius: 0.0,
+                },
+                errors: vec![0.0],
+                triangles: vec![count / 3],
+            },
             material: 0,
         }
     }
@@ -816,6 +887,8 @@ pub struct Renderer {
     light_grid: wgpu::Texture,
     show_light_clusters: bool,
     light_stats: LightStats,
+    cull_settings: CullSettings,
+    draw_stats: DrawStats,
     /// Built-in meshes first (in `MeshKind` order), then runtime-added ones.
     meshes: Vec<GpuMesh>,
     instances: Vec<GrowableBuffer>,
@@ -1342,7 +1415,7 @@ impl Renderer {
 
         let meshes: Vec<GpuMesh> = MeshKind::ALL
             .iter()
-            .map(|k| GpuMesh::new(device, &k.data()))
+            .map(|k| GpuMesh::with_lods(device, &k.data(), &k.lods()))
             .collect();
         let instances = (0..meshes.len())
             .map(|_| GrowableBuffer::new(device, "instances", INITIAL_INSTANCE_BYTES))
@@ -1399,6 +1472,8 @@ impl Renderer {
             light_grid,
             show_light_clusters: false,
             light_stats: LightStats::default(),
+            cull_settings: CullSettings::default(),
+            draw_stats: DrawStats::default(),
             meshes,
             instances,
             blend_instances: GrowableBuffer::new(device, "blend instances", INITIAL_INSTANCE_BYTES),
@@ -1550,14 +1625,37 @@ impl Renderer {
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
-        let (groups, blended) =
-            split_blended(&list.instances, self.meshes.len(), camera.eye, |mesh| {
-                self.materials[self.meshes[mesh].material].variant.alpha == 2
-            });
-        for (buffer, group) in self.instances.iter_mut().zip(&groups) {
+        let mut passes = [None; MAX_PASSES];
+        let culling = self.cull_settings.culling;
+        let view = |m: Mat4| {
+            Some(if culling {
+                Frustum::new(m)
+            } else {
+                Frustum::everything()
+            })
+        };
+        passes[CAMERA_PASS] = view(camera.view_proj);
+        for i in 0..shadows.count {
+            passes[cascade_pass(i)] = view(shadows.view_proj[i]);
+        }
+        for (i, matrix) in clustered.spot_shadows.iter().enumerate() {
+            passes[spot_pass(i)] = view(*matrix);
+        }
+        let lod = self
+            .cull_settings
+            .lod
+            .then(|| LodView::new(camera.view_proj, height));
+        let meshes: Vec<(&MeshCull, bool)> = self
+            .meshes
+            .iter()
+            .map(|m| (&m.cull, self.materials[m.material].variant.alpha == 2))
+            .collect();
+        let buckets = bucket(&list.instances, &meshes, &passes, lod.as_ref(), camera.eye);
+        self.draw_stats = buckets.stats;
+        for (buffer, group) in self.instances.iter_mut().zip(&buckets.instances) {
             buffer.write(device, queue, bytemuck::cast_slice(group));
         }
-        let blend_raws: Vec<InstanceRaw> = blended.iter().map(|(_, raw)| *raw).collect();
+        let blend_raws: Vec<InstanceRaw> = buckets.blended.iter().map(|(_, _, raw)| *raw).collect();
         self.blend_instances
             .write(device, queue, bytemuck::cast_slice(&blend_raws));
         let skinned_groups = self.prepare_skinned(gpu, list);
@@ -1588,13 +1686,17 @@ impl Renderer {
             .shadow_layers
             .iter()
             .zip(&self.casters)
-            .take(shadows.count);
+            .take(shadows.count)
+            .enumerate()
+            .map(|(i, target)| (cascade_pass(i), target));
         let spot_passes = self
             .spot_shadow_layers
             .iter()
             .zip(&self.casters[CASCADES..])
-            .take(clustered.spot_shadows.len());
-        for (layer, (_, caster)) in cascade_passes.chain(spot_passes) {
+            .take(clustered.spot_shadows.len())
+            .enumerate()
+            .map(|(i, target)| (spot_pass(i), target));
+        for (index, (layer, (_, caster))) in cascade_passes.chain(spot_passes) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[],
@@ -1614,7 +1716,7 @@ impl Renderer {
                 pass.set_bind_group(group, &self.empty_bind_group, &[]);
             }
             pass.set_bind_group(3, caster, &[]);
-            self.draw_solid(&mut pass, &groups, &self.shadow_pipelines);
+            self.draw_solid(&mut pass, &buckets, index, &self.shadow_pipelines);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.skinned_shadow_pipeline);
                 pass.set_bind_group(1, &self.empty_bind_group, &[]);
@@ -1634,7 +1736,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            self.draw_solid(&mut pass, &groups, &self.prepass_pipelines);
+            self.draw_solid(&mut pass, &buckets, CAMERA_PASS, &self.prepass_pipelines);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.skinned_prepass_pipeline);
                 pass.set_bind_group(1, &self.empty_bind_group, &[]);
@@ -1670,7 +1772,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
             pass.set_bind_group(2, &self.empty_bind_group, &[]);
             pass.set_bind_group(3, self.ao.lit_bind_group(ao_on), &[]);
-            self.draw_solid(&mut pass, &groups, &self.color.lit[..4]);
+            self.draw_solid(&mut pass, &buckets, CAMERA_PASS, &self.color.lit[..4]);
             if !skinned_groups.is_empty() {
                 pass.set_pipeline(&self.color.skinned_lit);
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
@@ -1682,13 +1784,13 @@ impl Renderer {
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
-            if !blended.is_empty() {
+            if !buckets.blended.is_empty() {
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 pass.set_bind_group(2, &self.empty_bind_group, &[]);
                 pass.set_bind_group(3, self.ao.lit_bind_group(ao_on), &[]);
                 pass.set_vertex_buffer(1, self.blend_instances.buffer.slice(..));
                 let mut bound = None;
-                for (i, (index, _)) in blended.iter().enumerate() {
+                for (i, (index, level, _)) in buckets.blended.iter().enumerate() {
                     let mesh = &self.meshes[*index];
                     let material = &self.materials[mesh.material];
                     let variant = material.variant.blended();
@@ -1699,8 +1801,9 @@ impl Renderer {
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    let (first, count) = mesh.lods[*level];
                     let i = i as u32;
-                    pass.draw_indexed(0..mesh.index_count, 0, i..i + 1);
+                    pass.draw_indexed(first..first + count, 0, i..i + 1);
                 }
             }
 
@@ -1910,6 +2013,19 @@ impl Renderer {
         self.light_stats
     }
 
+    pub fn cull_settings(&self) -> CullSettings {
+        self.cull_settings
+    }
+
+    pub fn set_cull_settings(&mut self, settings: CullSettings) {
+        self.cull_settings = settings;
+    }
+
+    /// What the last frame drew of the draw list's static instances.
+    pub fn draw_stats(&self) -> DrawStats {
+        self.draw_stats
+    }
+
     /// Uploads a mesh with the default material (e.g. a convex hull's shape).
     pub fn add_mesh(&mut self, gpu: &Gpu, data: &MeshData) -> MeshId {
         self.add_mesh_with_material(gpu, data, MaterialId::DEFAULT)
@@ -1922,7 +2038,21 @@ impl Renderer {
         data: &MeshData,
         material: MaterialId,
     ) -> MeshId {
-        let mut mesh = GpuMesh::new(gpu.device(), data);
+        self.add_mesh_with_lods(gpu, data, &[], material)
+    }
+
+    /// Uploads a mesh with coarser levels of detail, each drawn where its
+    /// error spans under [`crate::LOD_PIXELS`] on screen. Up to
+    /// [`MAX_LODS`] levels in all, the full mesh included; levels must
+    /// coarsen (errors rising), and others are skipped.
+    pub fn add_mesh_with_lods(
+        &mut self,
+        gpu: &Gpu,
+        data: &MeshData,
+        lods: &[MeshLod],
+        material: MaterialId,
+    ) -> MeshId {
+        let mut mesh = GpuMesh::with_lods(gpu.device(), data, lods);
         mesh.material = if (material.0 as usize) < self.materials.len() {
             material.0 as usize
         } else {
@@ -2041,7 +2171,8 @@ impl Renderer {
     /// Rebuilds a runtime-added mesh (from [`Renderer::add_mesh`] or
     /// [`Renderer::add_mesh_with_material`]) from new data, keeping its id and
     /// material: for geometry that changes now and then, like a terrain chunk.
-    /// Returns `false`, and changes nothing, for built-in or unknown ids.
+    /// Any levels of detail are dropped (it draws at full detail). Returns
+    /// `false`, and changes nothing, for built-in or unknown ids.
     pub fn replace_mesh(&mut self, gpu: &Gpu, id: MeshId, data: &MeshData) -> bool {
         if !is_custom(id, self.meshes.len() as u32) {
             return false;
@@ -2079,33 +2210,42 @@ impl Renderer {
         self.clear_custom_meshes();
     }
 
-    /// Draws the opaque and masked meshes, each variant with its pipeline
-    /// (`pipelines` in [`Variant::SOLID`] order); materials bind at group 1.
+    /// Draws the opaque and masked instances pass `index` sees, at their
+    /// levels of detail, each variant with its pipeline (`pipelines` in
+    /// [`Variant::SOLID`] order); materials bind at group 1.
     fn draw_solid(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
-        groups: &[Vec<InstanceRaw>],
+        buckets: &Buckets,
+        index: usize,
         pipelines: &[wgpu::RenderPipeline],
     ) {
+        let stride = size_of::<InstanceRaw>() as u64;
         for (variant, pipeline) in Variant::SOLID.iter().zip(pipelines) {
             let mut bound = false;
-            for (index, group) in groups.iter().enumerate() {
-                let count = group.len() as u32;
-                let mesh = &self.meshes[index];
+            for (m, levels) in buckets.ranges.iter().enumerate() {
+                let mesh = &self.meshes[m];
                 let material = &self.materials[mesh.material];
-                if count == 0 || material.variant != *variant {
+                if material.variant != *variant {
                     continue;
                 }
-                if !bound {
-                    pass.set_pipeline(pipeline);
-                    bound = true;
+                for (level, ranges) in levels.iter().enumerate() {
+                    let (first, count) = ranges[index];
+                    if count == 0 {
+                        continue;
+                    }
+                    if !bound {
+                        pass.set_pipeline(pipeline);
+                        bound = true;
+                    }
+                    let instances = first as u64 * stride..(first + count) as u64 * stride;
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_vertex_buffer(1, self.instances[m].buffer.slice(instances));
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    let (start, length) = mesh.lods[level];
+                    pass.draw_indexed(start..start + length, 0, 0..count);
                 }
-                let bytes = count as u64 * size_of::<InstanceRaw>() as u64;
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_vertex_buffer(1, self.instances[index].buffer.slice(..bytes));
-                pass.set_bind_group(1, &material.bind_group, &[]);
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..count);
             }
         }
     }
