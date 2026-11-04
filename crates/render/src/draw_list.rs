@@ -249,38 +249,6 @@ pub fn group_by_mesh(instances: &[Instance], mesh_count: usize) -> Vec<Vec<Insta
     groups
 }
 
-/// Splits instances into per-mesh opaque groups (as [`group_by_mesh`]) and
-/// blended ones, farthest from `eye` first. An instance blends when its
-/// colour alpha is below 1 or `blends(mesh index)` says its material does.
-pub(crate) fn split_blended(
-    instances: &[Instance],
-    mesh_count: usize,
-    eye: Vec3,
-    blends: impl Fn(usize) -> bool,
-) -> (Vec<Vec<InstanceRaw>>, Vec<(usize, InstanceRaw)>) {
-    let mut opaque = vec![Vec::new(); mesh_count];
-    let mut blended = Vec::new();
-    for instance in instances {
-        let mesh = instance.mesh.0 as usize;
-        if mesh >= mesh_count {
-            continue;
-        }
-        let raw = InstanceRaw::new(instance);
-        if instance.color[3] < 1.0 || blends(mesh) {
-            let distance = instance.transform.w_axis.truncate().distance_squared(eye);
-            blended.push((distance, mesh, raw));
-        } else {
-            opaque[mesh].push(raw);
-        }
-    }
-    blended.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let blended = blended
-        .into_iter()
-        .map(|(_, mesh, raw)| (mesh, raw))
-        .collect();
-    (opaque, blended)
-}
-
 #[cfg(test)]
 mod tests {
     use glam::Quat;
@@ -312,53 +280,6 @@ mod tests {
         assert_eq!(xs(&groups[MeshKind::Sphere.index()]), vec![1.0]);
         assert!(groups[MeshKind::Plane.index()].is_empty());
         assert!(group_by_mesh(&[], 4).iter().all(Vec::is_empty));
-    }
-
-    #[test]
-    fn translucent_instances_and_blended_meshes_split_off_far_to_near() {
-        let mut glass = at(MeshKind::Cube, 1.0);
-        glass.color[3] = 0.5;
-        let mut far_glass = at(MeshKind::Cube, 9.0);
-        far_glass.color[3] = 0.2;
-        let list = [
-            at(MeshKind::Cube, 0.0),
-            glass,
-            at(MeshKind::Sphere, 4.0), // its mesh blends
-            far_glass,
-            at(MeshKind::Cube, 2.0),
-        ];
-        let sphere = MeshKind::Sphere.index();
-        let (opaque, blended) =
-            split_blended(&list, MeshKind::ALL.len(), Vec3::ZERO, |m| m == sphere);
-        let xs = |g: &Vec<InstanceRaw>| g.iter().map(|r| r.model[3][0]).collect::<Vec<_>>();
-        assert_eq!(xs(&opaque[MeshKind::Cube.index()]), vec![0.0, 2.0]);
-        assert!(opaque[sphere].is_empty());
-        let order: Vec<_> = blended.iter().map(|(m, r)| (*m, r.model[3][0])).collect();
-        assert_eq!(
-            order,
-            vec![
-                (MeshKind::Cube.index(), 9.0),
-                (sphere, 4.0),
-                (MeshKind::Cube.index(), 1.0),
-            ]
-        );
-    }
-
-    #[test]
-    fn blending_sorts_by_distance_from_the_eye_not_the_origin() {
-        let mut a = at(MeshKind::Cube, -5.0);
-        let mut b = at(MeshKind::Cube, 5.0);
-        a.color[3] = 0.5;
-        b.color[3] = 0.5;
-        let eye = Vec3::new(6.0, 0.0, 0.0);
-        let (_, blended) = split_blended(&[a, b], MeshKind::ALL.len(), eye, |_| false);
-        let xs: Vec<_> = blended.iter().map(|(_, r)| r.model[3][0]).collect();
-        assert_eq!(xs, vec![-5.0, 5.0]);
-        // Unknown meshes are dropped, as in group_by_mesh.
-        let mut stray = at(MeshKind::Cube, 0.0);
-        stray.mesh = MeshId(99);
-        let (opaque, blended) = split_blended(&[stray], MeshKind::ALL.len(), eye, |_| true);
-        assert!(blended.is_empty() && opaque.iter().all(Vec::is_empty));
     }
 
     #[test]

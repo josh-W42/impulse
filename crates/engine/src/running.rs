@@ -3,7 +3,8 @@
 use glam::{Vec2, Vec3};
 use impulse_physics::{BodyHandle, SolverMode, SolverSettings, StepStats, World};
 use impulse_render::{
-    AoSettings, CameraData, DrawList, FogSettings, LightStats, PostSettings, backend_name,
+    AoSettings, CameraData, CullSettings, DrawList, DrawStats, FogSettings, Instance, LightStats,
+    PostSettings, backend_name,
 };
 use web_time::Instant;
 use winit::event::{MouseButton, WindowEvent};
@@ -97,6 +98,7 @@ enum Action {
     SetArena(scene_desc::Arena),
     /// Change the authored scene's sky (undoable).
     SetSky(scene_desc::SkyPreset),
+    SetScatter(Option<scene_desc::Scatter>),
     Inspector(InspectorAction),
     Save,
     /// Desktop: a scene from the `scenes/` folder.
@@ -135,6 +137,7 @@ struct Settings {
     ao: AoSettings,
     fog: FogSettings,
     show_light_clusters: bool,
+    cull: CullSettings,
 }
 
 pub struct Sandbox {
@@ -185,6 +188,11 @@ pub struct Sandbox {
     skies: crate::skies::Skies,
     /// What the renderer did with last frame's lights.
     light_stats: LightStats,
+    /// What it drew last frame.
+    draw_stats: DrawStats,
+    /// The scene's scattered props, and the scatter they were made for.
+    scatter: Vec<Instance>,
+    scatter_made: Option<scene_desc::Scatter>,
 }
 
 impl Sandbox {
@@ -235,6 +243,7 @@ impl Sandbox {
                 ao: cx.renderer.ao_settings(),
                 fog: cx.renderer.fog_settings(),
                 show_light_clusters: false,
+                cull: cx.renderer.cull_settings(),
             },
             start: Instant::now(),
             frame_ms: 0.0,
@@ -257,6 +266,9 @@ impl Sandbox {
             actions: Vec::new(),
             skies: crate::skies::Skies::default(),
             light_stats: LightStats::default(),
+            draw_stats: DrawStats::default(),
+            scatter: Vec::new(),
+            scatter_made: None,
         };
         sandbox.upload_models(cx);
         sandbox
@@ -268,6 +280,9 @@ impl Sandbox {
         cx.renderer.reset_custom_meshes();
         self.model_meshes = models::upload_models(cx.renderer, cx.gpu, &self.models);
         cx.renderer.pin_custom_meshes();
+        // Its model props name the old meshes.
+        self.scatter.clear();
+        self.scatter_made = None;
         self.sync_hull_meshes(cx);
     }
 
@@ -574,6 +589,9 @@ impl Sandbox {
             Action::SetSky(sky) => {
                 self.editor.modify(|d| d.sky = sky);
             }
+            Action::SetScatter(scatter) => {
+                self.editor.modify(|d| d.scatter = scatter);
+            }
             Action::Save => {
                 self.editor.commit();
                 let Some(stem) = scene_desc::file_stem(&self.settings.file_name) else {
@@ -869,7 +887,9 @@ impl Game for Sandbox {
             message: self.message.clone(),
             arena: self.editor.desc().arena,
             sky: self.editor.desc().sky,
+            scatter: self.editor.desc().scatter,
             light_stats: self.light_stats,
+            draw_stats: self.draw_stats,
             models: self
                 .models
                 .list()
@@ -915,6 +935,8 @@ impl Game for Sandbox {
         cx.renderer
             .set_show_light_clusters(self.settings.show_light_clusters);
         self.light_stats = cx.renderer.light_stats();
+        cx.renderer.set_cull_settings(self.settings.cull);
+        self.draw_stats = cx.renderer.draw_stats();
         if let Err(e) = self
             .skies
             .apply(cx.gpu, cx.renderer, self.editor.desc().sky)
@@ -957,6 +979,14 @@ impl Game for Sandbox {
                 show_lights: self.mode == Mode::Edit,
             },
         );
+        let scatter = self.editor.desc().scatter;
+        if scatter != self.scatter_made {
+            self.scatter = scatter.map_or_else(Vec::new, |s| {
+                scene::scatter_instances(&s, &self.models, &self.model_meshes)
+            });
+            self.scatter_made = scatter;
+        }
+        list.instances.extend_from_slice(&self.scatter);
         if let Some(drag) = &self.drag
             && let Some(body) = self.world.body(drag.body)
         {
@@ -996,7 +1026,9 @@ struct Stats {
     /// The authored scene's surroundings.
     arena: scene_desc::Arena,
     sky: scene_desc::SkyPreset,
+    scatter: Option<scene_desc::Scatter>,
     light_stats: LightStats,
+    draw_stats: DrawStats,
     /// Every model's id, name, and whether it is bundled (Model… picker).
     models: Vec<(crate::models::ModelId, String, bool)>,
 }
@@ -1072,6 +1104,18 @@ fn rendering_panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats) {
             lights.overflow
         ));
     }
+    let draws = stats.draw_stats;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut s.cull.culling, "frustum culling");
+        ui.checkbox(&mut s.cull.lod, "LOD");
+    });
+    ui.label(format!(
+        "drawn {} / {} · {} shadow casters · {:.1}k triangles",
+        draws.drawn,
+        draws.submitted,
+        draws.shadow_casters,
+        draws.triangles as f64 / 1000.0
+    ));
 }
 
 fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<Action>) {
@@ -1210,6 +1254,29 @@ fn panel(ui: &mut egui::Ui, s: &mut Settings, stats: &Stats, actions: &mut Vec<A
                         let current = stats.sky == sky;
                         if ui.selectable_label(current, sky.label()).clicked() && !current {
                             actions.push(Action::SetSky(sky));
+                        }
+                    }
+                    let scatter = stats.scatter;
+                    let mut on = scatter.is_some();
+                    if ui.checkbox(&mut on, "scatter").changed() {
+                        actions.push(Action::SetScatter(on.then_some(scene::FIELD_SCATTER)));
+                    }
+                    if let Some(mut edited) = scatter {
+                        let count = ui.add(
+                            egui::DragValue::new(&mut edited.count)
+                                .speed(50.0)
+                                .range(0..=scene_desc::MAX_SCATTER)
+                                .suffix(" props"),
+                        );
+                        let half = ui.add(
+                            egui::DragValue::new(&mut edited.half_extent)
+                                .speed(0.5)
+                                .range(1.0..=scene_desc::MAX_SCATTER_HALF)
+                                .prefix("± ")
+                                .suffix(" m"),
+                        );
+                        if (count.changed() || half.changed()) && Some(edited) != scatter {
+                            actions.push(Action::SetScatter(Some(edited)));
                         }
                     }
                     if let Arena::Pit { half } = stats.arena {

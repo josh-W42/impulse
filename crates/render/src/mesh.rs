@@ -88,12 +88,119 @@ impl MeshKind {
             MeshKind::Cylinder => cylinder(32),
         }
     }
+
+    /// Coarser levels of the round meshes, with measured errors (the flat
+    /// ones have none).
+    pub fn lods(self) -> Vec<MeshLod> {
+        let coarse = match self {
+            MeshKind::Sphere => vec![uv_sphere(16, 8), uv_sphere(8, 4)],
+            MeshKind::Cylinder => vec![cylinder(16), cylinder(8)],
+            MeshKind::Cube | MeshKind::Plane => Vec::new(),
+        };
+        let full = self.data();
+        coarse
+            .into_iter()
+            .map(|data| MeshLod {
+                error: lod_error(&full, &data),
+                data,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+}
+
+/// Most levels of detail a mesh has, its full detail included.
+pub const MAX_LODS: usize = 4;
+
+/// A coarser version of a mesh, drawn where its error is under a pixel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshLod {
+    pub data: MeshData,
+    /// How far the full mesh strays from this one, in mesh units
+    /// ([`lod_error`]).
+    pub error: f32,
+}
+
+/// Full-detail vertices tested by [`lod_error`].
+const ERROR_SAMPLES: usize = 1024;
+
+/// How far `full`'s surface lies from `coarse`'s: the farthest of its
+/// vertices (up to [`ERROR_SAMPLES`] of them, evenly strided) from the
+/// nearest `coarse` triangle. Infinite when `coarse` has no triangles.
+pub fn lod_error(full: &MeshData, coarse: &MeshData) -> f32 {
+    let triangles: Vec<[Vec3; 3]> = coarse
+        .indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .filter_map(|t| {
+            let corner = |i: u32| {
+                coarse
+                    .vertices
+                    .get(i as usize)
+                    .map(|v| Vec3::from(v.position))
+            };
+            Some([corner(t[0])?, corner(t[1])?, corner(t[2])?])
+        })
+        .collect();
+    if triangles.is_empty() {
+        return f32::INFINITY;
+    }
+    let step = full.vertices.len().div_ceil(ERROR_SAMPLES).max(1);
+    full.vertices
+        .iter()
+        .step_by(step)
+        .map(|v| {
+            let p = Vec3::from(v.position);
+            triangles
+                .iter()
+                .map(|t| closest_on_triangle(p, t).distance_squared(p))
+                .fold(f32::INFINITY, f32::min)
+        })
+        .fold(0.0, f32::max)
+        .sqrt()
+}
+
+/// The point of triangle `t` nearest `p` (Ericson, Real-Time Collision
+/// Detection, 5.1.5).
+fn closest_on_triangle(p: Vec3, [a, b, c]: &[Vec3; 3]) -> Vec3 {
+    let (ab, ac, ap) = (*b - *a, *c - *a, p - *a);
+    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return *a;
+    }
+    let bp = p - *b;
+    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return *b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return *a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - *c;
+    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return *c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return *a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return *b + (*c - *b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = va + vb + vc;
+    if denom.abs() < f32::EPSILON {
+        return *a; // degenerate: any corner
+    }
+    *a + ab * (vb / denom) + ac * (vc / denom)
 }
 
 fn vertex(position: Vec3, normal: Vec3) -> Vertex {
@@ -269,6 +376,53 @@ mod tests {
     fn plane_has_a_face_on_each_side() {
         let normals: Vec<[f32; 3]> = plane().vertices.iter().map(|v| v.normal).collect();
         assert!(normals.contains(&[0.0, 1.0, 0.0]) && normals.contains(&[0.0, -1.0, 0.0]));
+    }
+
+    #[test]
+    fn closest_points_on_a_triangle() {
+        let t = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        let cases = [
+            (Vec3::new(0.2, 0.2, 3.0), Vec3::new(0.2, 0.2, 0.0)), // face
+            (Vec3::new(-1.0, -1.0, 0.0), Vec3::ZERO),             // corner a
+            (Vec3::new(2.0, -0.1, 0.0), Vec3::X),                 // corner b
+            (Vec3::new(0.5, -1.0, 1.0), Vec3::new(0.5, 0.0, 0.0)), // edge ab
+            (Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.5, 0.5, 0.0)), // edge bc
+            (Vec3::new(-2.0, 0.5, 0.0), Vec3::new(0.0, 0.5, 0.0)), // edge ca
+        ];
+        for (p, want) in cases {
+            assert!(closest_on_triangle(p, &t).distance(want) < 1e-6, "{p}");
+        }
+    }
+
+    #[test]
+    fn built_in_lods_are_valid_coarser_and_measured_exactly() {
+        assert!(MeshKind::Cube.lods().is_empty() && MeshKind::Plane.lods().is_empty());
+        for kind in [MeshKind::Sphere, MeshKind::Cylinder] {
+            let lods = kind.lods();
+            assert!(lods.len() < MAX_LODS);
+            let mut last = (kind.data().indices.len(), 0.0);
+            for (i, lod) in lods.iter().enumerate() {
+                check_mesh(&format!("{kind:?} lod {}", i + 1), &lod.data);
+                assert!(lod.data.indices.len() < last.0 && lod.error > last.1);
+                last = (lod.data.indices.len(), lod.error);
+            }
+        }
+        assert!(lod_error(&MeshKind::Sphere.data(), &MeshKind::Sphere.data()) < 1e-6);
+        // The cylinder's error is exact: the 32-gon has a vertex over the
+        // middle of every 16-gon chord, a sagitta away from it.
+        use std::f32::consts::PI;
+        let chord = 0.5 * (1.0 - (PI / 16.0).cos());
+        assert!((MeshKind::Cylinder.lods()[0].error - chord).abs() < 1e-4);
+        // The sphere's at least a 16-gon's (its equator), and within the
+        // sagitta of a face's diagonal (π/8 across at most).
+        let sphere = MeshKind::Sphere.lods()[0].error;
+        let diagonal = 0.5 * (1.0 - (PI / 8.0).cos());
+        assert!(sphere >= chord - 1e-4 && sphere <= diagonal, "{sphere}");
+        let empty = MeshData {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+        assert_eq!(lod_error(&cube(), &empty), f32::INFINITY);
     }
 
     #[test]

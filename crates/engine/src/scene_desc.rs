@@ -29,6 +29,9 @@ pub struct SceneDesc {
     /// Daylight, dusk or night (older files: day).
     #[serde(default)]
     pub sky: SkyPreset,
+    /// Draw-only props on the ground (older files: none).
+    #[serde(default)]
+    pub scatter: Option<Scatter>,
     pub objects: Vec<ObjectDesc>,
     #[serde(default)]
     pub joints: Vec<JointSpec>,
@@ -43,6 +46,21 @@ pub enum Arena {
     Floor,
     /// No surroundings: only the scene's own objects (e.g. a floor object).
     Empty,
+}
+
+/// Most props a [`Scatter`] may place.
+pub const MAX_SCATTER: u32 = 50_000;
+/// The widest a [`Scatter`] may spread (m).
+pub const MAX_SCATTER_HALF: f32 = 500.0;
+
+/// Props scattered over the ground for looks only: no bodies, not in the
+/// object list, generated from `seed` (see `scene::scatter_instances`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Scatter {
+    pub count: u32,
+    /// They fall within ±this on x and z (m), clear of the middle.
+    pub half_extent: f32,
+    pub seed: u32,
 }
 
 /// The sky a scene is lit by: procedural (day, dusk, night) or a bundled
@@ -371,6 +389,7 @@ pub enum SceneError {
     Parse(String),
     UnsupportedVersion(u32),
     InvalidArena,
+    InvalidScatter,
     Object {
         index: usize,
         name: String,
@@ -412,6 +431,10 @@ impl fmt::Display for SceneError {
                 "scene version {v} is not supported (expected {SCENE_VERSION})"
             ),
             Self::InvalidArena => write!(f, "the pit half-width must be finite and positive"),
+            Self::InvalidScatter => write!(
+                f,
+                "a scatter places at most {MAX_SCATTER} props within 1 to {MAX_SCATTER_HALF} m"
+            ),
             Self::Object { index, name, error } => {
                 write!(f, "object {index} '{name}': ")?;
                 match error {
@@ -633,6 +656,12 @@ fn populate(
     models: &ModelRegistry,
 ) -> Result<Vec<SceneObject>, SceneError> {
     add_arena(world, desc.arena)?;
+    if let Some(scatter) = desc.scatter
+        && !(scatter.count <= MAX_SCATTER
+            && (1.0..=MAX_SCATTER_HALF).contains(&scatter.half_extent))
+    {
+        return Err(SceneError::InvalidScatter);
+    }
     let poses = world_poses(desc)?;
     let mut objects = Vec::with_capacity(desc.objects.len());
     for (index, object) in desc.objects.iter().enumerate() {
@@ -801,6 +830,7 @@ mod tests {
             name: "sampler".into(),
             arena: Arena::Pit { half: 6.0 },
             sky: Default::default(),
+            scatter: None,
             objects: vec![
                 object(None, [0.0, 5.0, 0.0], BodyType::Static),
                 object(
@@ -1100,6 +1130,7 @@ mod tests {
             name: "t".into(),
             arena: Arena::Empty,
             sky: Default::default(),
+            scatter: None,
             objects,
             joints,
         }
@@ -1330,6 +1361,20 @@ mod tests {
             err(|d| d.arena = Arena::Pit { half: 0.0 }),
             SceneError::InvalidArena
         );
+        fn scatter(count: u32, half_extent: f32) -> Option<Scatter> {
+            Some(Scatter {
+                count,
+                half_extent,
+                seed: 0,
+            })
+        }
+        for bad in [
+            err(|d| d.scatter = scatter(MAX_SCATTER + 1, 20.0)),
+            err(|d| d.scatter = scatter(10, f32::NAN)),
+            err(|d| d.scatter = scatter(10, 0.5)),
+        ] {
+            assert_eq!(bad, SceneError::InvalidScatter);
+        }
         // Messages name the culprit.
         let message = err(|d| d.objects[2].body = BodyType::Dynamic { mass: -1.0 }).to_string();
         assert!(message.starts_with("object 2 'thing':"), "{message}");

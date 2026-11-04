@@ -69,6 +69,28 @@ pub struct ModelMesh {
     pub indices: Vec<u32>,
     /// Index into [`ModelData::materials`]; `None` is the glTF default material.
     pub material: Option<usize>,
+    /// Authored coarser versions, by increasing level (from nodes named
+    /// `<node>_LOD1`, `<node>_LOD2`, ...); drawn with this mesh's material.
+    pub lods: Vec<ModelLod>,
+}
+
+/// A coarser version of a [`ModelMesh`], in the same model space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelLod {
+    pub vertices: Vec<ModelVertex>,
+    pub indices: Vec<u32>,
+}
+
+/// A node name's LOD suffix: `("barrel", 2)` for `barrel_LOD2` (any case),
+/// `("barrel", 0)` for `barrel_LOD0`; `None` without one.
+pub fn lod_suffix(name: &str) -> Option<(&str, usize)> {
+    let digits = name.bytes().rev().take_while(u8::is_ascii_digit).count();
+    let (head, number) = name.split_at(name.len() - digits);
+    let tag_at = head.len().checked_sub(4).filter(|&i| i > 0)?;
+    if number.is_empty() || !head.get(tag_at..)?.eq_ignore_ascii_case("_lod") {
+        return None;
+    }
+    Some((&head[..tag_at], number.parse().ok()?))
 }
 
 /// How a material's alpha is used (glTF `alphaMode`).
@@ -235,8 +257,7 @@ pub fn load_glb_with(bytes: &[u8], limits: &Limits) -> Result<ModelData, ModelEr
         Some(scene) => scene.nodes().collect(),
         None => Vec::new(),
     };
-    let mut meshes = Vec::new();
-    let mut vertex_count = 0;
+    let mut nodes = Vec::new();
     let mut stack: Vec<(gltf::Node, Mat4)> =
         roots.into_iter().map(|n| (n, Mat4::IDENTITY)).collect();
     while let Some((node, parent)) = stack.pop() {
@@ -244,19 +265,65 @@ pub fn load_glb_with(bytes: &[u8], limits: &Limits) -> Result<ModelData, ModelEr
         for child in node.children() {
             stack.push((child, world));
         }
-        let Some(mesh) = node.mesh() else { continue };
-        for primitive in mesh.primitives() {
-            if primitive.mode() != Mode::Triangles {
-                continue;
-            }
-            let built = read_primitive(&primitive, &bin, world)?;
+        if node.mesh().is_some() {
+            nodes.push((node, world));
+        }
+    }
+    // A `<base>_LOD<n>` node (n ≥ 1) is level n of the node named `<base>`
+    // (or `<base>_LOD0`); without such a node it is ordinary geometry.
+    let base_name = |node: &gltf::Node| -> Option<String> {
+        let name = node.name()?;
+        Some(match lod_suffix(name) {
+            Some((base, 0)) => base.to_string(),
+            Some(_) => return None,
+            None => name.to_string(),
+        })
+    };
+    let bases: Vec<String> = nodes.iter().filter_map(|(n, _)| base_name(n)).collect();
+    let lod_of = |node: &gltf::Node| -> Option<(String, usize)> {
+        let (base, level) = lod_suffix(node.name()?)?;
+        (level > 0 && bases.iter().any(|b| b == base)).then(|| (base.to_string(), level))
+    };
+
+    let mut meshes = Vec::new();
+    // Per mesh: its node's base name and its primitive's place in the node.
+    let mut keys: Vec<Option<(String, usize)>> = Vec::new();
+    let mut lods = Vec::new();
+    let mut vertex_count = 0;
+    for (node, world) in &nodes {
+        let lod = lod_of(node);
+        let triangles = node
+            .mesh()
+            .into_iter()
+            .flat_map(|m| m.primitives())
+            .filter(|p| p.mode() == Mode::Triangles);
+        for (slot, primitive) in triangles.enumerate() {
+            let built = read_primitive(&primitive, &bin, *world)?;
             vertex_count += built.vertices.len();
             if vertex_count > limits.max_vertices {
                 return Err(ModelError::TooManyVertices {
                     max: limits.max_vertices,
                 });
             }
-            meshes.push(built);
+            match &lod {
+                Some((base, level)) => lods.push((base.clone(), slot, *level, built)),
+                None => {
+                    keys.push(base_name(node).map(|name| (name, slot)));
+                    meshes.push(built);
+                }
+            }
+        }
+    }
+    // Each level joins the first mesh with its base name and slot; levels
+    // with no such primitive are dropped.
+    lods.sort_by_key(|(_, _, level, _)| *level);
+    for (base, slot, _, built) in lods {
+        let key = Some((base, slot));
+        if let Some(mesh) = keys.iter().position(|k| *k == key) {
+            meshes[mesh].lods.push(ModelLod {
+                vertices: built.vertices,
+                indices: built.indices,
+            });
         }
     }
     if meshes.iter().all(|m| m.indices.is_empty()) {
@@ -441,6 +508,7 @@ where
         vertices,
         indices,
         material: primitive.material().index(),
+        lods: Vec::new(),
     })
 }
 

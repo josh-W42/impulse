@@ -376,6 +376,7 @@ mod tests {
             name: "test".into(),
             arena: Arena::Floor,
             sky: Default::default(),
+            scatter: None,
             objects: (0..5).map(|i| ball(i as f32)).collect(),
             joints: [(0, 1), (2, 3), (1, 3)]
                 .map(|(a, b)| JointSpec::ball_socket(a, b, Vec3::ZERO))
@@ -507,6 +508,7 @@ mod tests {
             name: "tree".into(),
             arena: Arena::Empty,
             sky: Default::default(),
+            scatter: None,
             objects: vec![
                 node("A", None, [0.0, 1.0, 0.0]),
                 node("B", Some(0), [1.0, 0.0, 0.0]),

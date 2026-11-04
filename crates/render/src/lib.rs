@@ -14,6 +14,7 @@ mod backend;
 pub use backend::backend_name;
 
 mod ao;
+mod cull;
 mod draw_list;
 mod environment;
 mod gpu;
@@ -26,6 +27,7 @@ mod shadow;
 mod sky;
 
 pub use ao::AoSettings;
+pub use cull::{Bounds, DrawStats, LOD_PIXELS};
 pub use draw_list::{
     DEFAULT_METALLIC, DEFAULT_ROUGHNESS, DebugLine, DrawList, Instance, InstanceRaw,
     JOINT_TEXTURE_WIDTH, JointRange, SkinnedInstance, SkinnedInstanceRaw, group_by_mesh,
@@ -35,12 +37,13 @@ pub use environment::{ENV_FACE, ENV_MIPS, Environment};
 pub use gpu::{Frame, FrameOutcome, Gpu, GpuInitError, SceneTarget};
 pub use lights::{Light, LightKind, LightStats, MAX_LIGHTS, MAX_SPOT_SHADOWS};
 pub use mesh::{
-    MeshData, MeshId, MeshKind, SkinnedMeshData, SkinnedMeshId, SkinnedVertex, Vertex, cylinder,
-    perpendicular_tangent, uv_sphere,
+    MAX_LODS, MeshData, MeshId, MeshKind, MeshLod, SkinnedMeshData, SkinnedMeshId, SkinnedVertex,
+    Vertex, cylinder, lod_error, perpendicular_tangent, uv_sphere,
 };
 pub use post::PostSettings;
 pub use renderer::{
-    AlphaMode, CameraData, FogSettings, MaterialDesc, MaterialId, Renderer, TextureId, UiFrame,
+    AlphaMode, CameraData, CullSettings, FogSettings, MaterialDesc, MaterialId, Renderer,
+    TextureId, UiFrame,
 };
 pub use shadow::ShadowRange;
 pub use sky::{Sky, eval_sh, project_irradiance, sh_basis};

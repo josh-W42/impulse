@@ -490,3 +490,100 @@ fn the_bundled_models_load() {
         );
     }
 }
+
+#[test]
+fn lod_suffixes_parse_in_any_case() {
+    assert_eq!(lod_suffix("barrel_LOD2"), Some(("barrel", 2)));
+    assert_eq!(lod_suffix("Barrel_lod1"), Some(("Barrel", 1)));
+    assert_eq!(lod_suffix("rock_LOD0"), Some(("rock", 0)));
+    assert_eq!(lod_suffix("café_Lod12"), Some(("café", 12)));
+    for none in [
+        "barrel",
+        "barrel_LOD",
+        "barrel_LODx",
+        "_LOD1",
+        "LOD1",
+        "barrelLOD1",
+        "",
+    ] {
+        assert_eq!(lod_suffix(none), None, "{none:?}");
+    }
+}
+
+/// A node using mesh `mesh`, moved along X by `x` so its vertices tell it apart.
+fn node(name: &str, mesh: usize, x: f32) -> String {
+    format!(r#"{{"name":"{name}","mesh":{mesh},"translation":[{x:?},0.0,0.0]}}"#)
+}
+
+fn scene(glb: &mut Glb, meshes: &[usize], nodes: &[String]) -> ModelData {
+    let meshes: Vec<String> = meshes
+        .iter()
+        .map(|&count| {
+            let prims: Vec<String> = (0..count).map(|_| triangle(glb, true)).collect();
+            format!(r#"{{"primitives":[{}]}}"#, prims.join(","))
+        })
+        .collect();
+    let roots: Vec<String> = (0..nodes.len()).map(|i| i.to_string()).collect();
+    let bytes = glb.build(&format!(
+        r#""meshes":[{}],"nodes":[{}],"scenes":[{{"nodes":[{}]}}],"scene":0"#,
+        meshes.join(","),
+        nodes.join(","),
+        roots.join(",")
+    ));
+    load_glb(&bytes).unwrap()
+}
+
+fn x_of(vertices: &[ModelVertex]) -> f32 {
+    vertices[0].position[0]
+}
+
+#[test]
+fn lod_nodes_join_their_base_in_level_order() {
+    let mut glb = Glb::default();
+    let model = scene(
+        &mut glb,
+        &[1],
+        &[
+            node("tri", 0, 0.0),
+            node("tri_LOD2", 0, 20.0),
+            node("tri_LOD1", 0, 10.0),
+            node("orphan_LOD1", 0, 5.0),
+        ],
+    );
+    // The orphan has no base node: it's ordinary geometry.
+    assert_eq!(model.meshes.len(), 2);
+    let tri = model
+        .meshes
+        .iter()
+        .find(|m| x_of(&m.vertices) == 0.0)
+        .unwrap();
+    let levels: Vec<f32> = tri.lods.iter().map(|l| x_of(&l.vertices)).collect();
+    assert_eq!(levels, vec![10.0, 20.0]);
+    let orphan = model
+        .meshes
+        .iter()
+        .find(|m| x_of(&m.vertices) == 5.0)
+        .unwrap();
+    assert!(orphan.lods.is_empty());
+    // Bounds and positions cover the base meshes only.
+    assert_eq!(model.max.x, 6.0);
+    assert_eq!(model.vertex_count(), 6);
+}
+
+#[test]
+fn lods_match_primitives_by_order_and_extras_are_dropped() {
+    let mut glb = Glb::default();
+    let model = scene(
+        &mut glb,
+        &[2, 3],
+        &[node("rock_LOD0", 0, 0.0), node("rock_LOD1", 1, 10.0)],
+    );
+    assert_eq!(model.meshes.len(), 2, "the third LOD primitive has no base");
+    assert!(model.meshes.iter().all(|m| m.lods.len() == 1));
+    assert!(
+        model
+            .meshes
+            .iter()
+            .all(|m| x_of(&m.vertices) == 0.0 && x_of(&m.lods[0].vertices) == 10.0)
+    );
+}

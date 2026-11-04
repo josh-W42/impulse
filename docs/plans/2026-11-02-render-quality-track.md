@@ -1,6 +1,6 @@
 # Render Quality Track — Roadmap
 
-**Date:** 2026-11-02 · **Status:** in progress (R1–R5 merged) · **Goal:** raise the image quality
+**Date:** 2026-11-02 · **Status:** in progress (R1–R6 merged) · **Goal:** raise the image quality
 and the amount of detail impulse can draw, in milestones that each ship a
 deployed demo, like every milestone before.
 

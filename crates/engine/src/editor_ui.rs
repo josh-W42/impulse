@@ -816,6 +816,7 @@ mod tests {
             name: "pick".into(),
             arena: Arena::Pit { half: 6.0 },
             sky: Default::default(),
+            scatter: None,
             objects: vec![
                 new_object(NewShape::Box, Vec3::new(-2.0, 1.0, 0.0), 0),
                 new_object(NewShape::Sphere, Vec3::new(2.0, 1.0, 0.0), 1),
@@ -850,6 +851,7 @@ mod tests {
             name: "pick".into(),
             arena: Arena::Floor,
             sky: Default::default(),
+            scatter: None,
             objects: vec![
                 light(0.0),
                 new_object(NewShape::Box, Vec3::new(3.0, 1.0, 0.0), 1),
@@ -976,6 +978,7 @@ mod tests {
             name: "t".into(),
             arena: Arena::Empty,
             sky: Default::default(),
+            scatter: None,
             // Children listed before their parents too: tree order comes from
             // the links, not the list.
             objects: vec![
